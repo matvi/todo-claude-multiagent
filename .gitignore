@@ -1,0 +1,31 @@
+# .NET
+bin/
+obj/
+*.user
+
+# Node
+node_modules/
+dist/
+frontend/dist/
+
+# Env files with secrets (examples are tracked, real ones are not)
+.env
+!.env.example
+frontend/.env
+frontend/.env.local
+!frontend/.env.example
+!frontend/.env.development
+
+# OS / editor
+.vs/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test results
+TestResults/
+coverage/
