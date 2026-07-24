@@ -249,3 +249,121 @@ cycle-1 environment note):
 
 Frontend and Azure deployment artifacts were not touched (reviewer confirmed
 they are fine). No spec deviations introduced by this fix.
+
+---
+
+# 2026-07-24 — CI/CD-readiness pass for the app code (specs §11 extension)
+
+## Summary
+
+The spec gained a §11 "CI/CD & Infrastructure-as-Code" section and an
+`architecture-memory.md`. IaC/workflow authoring (Bicep, GitHub Actions,
+`azure-pipelines.yml`) belongs to the downstream `devops` subagent and was
+deliberately **not** touched here. This pass was a narrow audit of the
+**existing application code** to confirm it can be built, tested, and deployed
+by an automated pipeline with no local Postgres and no interactive steps.
+
+**Result: no application code changes were required.** Every §11 CI/CD-readiness
+concern was already satisfied by the app as built in the prior cycles. The five
+items requested were each verified rather than modified. Details below so the
+reviewer can see what was checked (and why nothing needed fixing).
+
+## What was checked and verified (no changes made)
+
+1. **`dotnet test` runs headlessly with no Postgres.** `TodoApiFactory`
+   (`backend/tests/TodoApi.Tests/TodoApiFactory.cs`) swaps the Npgsql-backed
+   `TodoDbContext` for EF Core **InMemory** and injects a dummy (never-dialled)
+   connection string purely to satisfy `Program.cs`'s startup guard. No test
+   opens a real DB connection at build or test time. Verified:
+   `dotnet test TodoApi.sln -c Release` → **29 passed, 0 failed** on a machine
+   with no Postgres running.
+
+2. **`npm run build` and the frontend suite run headlessly in CI.** `build` is
+   `tsc && vite build` (non-interactive) and `test` is `vitest run` (single-run,
+   not watch). Verified: `npm run build` produces `dist/` cleanly and
+   `npm test` → **37 passed, 6 files**. `npm ci` also verified to exit 0, so the
+   committed `package-lock.json` is in sync (a stale lockfile would hard-fail
+   the CI `npm ci` step).
+
+3. **Connection string and CORS origin come from config/env, not hardcode.**
+   `Program.cs` reads `ConnectionStrings:TodoDb` via `GetConnectionString` and
+   `Cors:AllowedOrigins` via `GetSection(...).Get<string[]>()`. Both bind from
+   the `ConnectionStrings__TodoDb` / `Cors__AllowedOrigins__0` env vars that the
+   CD workflow (§11.5) and Bicep (§11.3) inject as Container Apps secrets/env
+   vars. `appsettings.json` ships **empty** placeholders (no secrets committed);
+   real localhost values live only in `appsettings.Development.json`. Confirmed
+   no origins/connection strings are string-literal in code.
+
+4. **`/health` is fast and dependency-free.** `Program.cs` maps
+   `GET /health` → `Results.Ok(new { status = "ok" })`. It does **not** touch
+   the DB, is registered after `UseCors` but CORS only adds response headers
+   (it never blocks a non-browser smoke-check `curl`), and there is **no auth
+   middleware** gating it. The startup `db.Database.Migrate()` is separate,
+   spec-mandated (§3.4), and already wrapped in try/catch-and-log so a DB outage
+   never crashes the process or the `/health` path. So Container Apps probes and
+   the CD post-deploy smoke check will not flake on the endpoint itself.
+
+5. **Other automation gaps — none found. Specifically confirmed OK:**
+   - **No `UseHttpsRedirection`** in the pipeline. Correct for Container Apps
+     (TLS terminates at ingress; the container serves plain HTTP on :8080).
+     Had it been present, an HTTP `/health` probe would 307-redirect and the
+     smoke check could flake — verified absent.
+   - **`.gitignore` is comprehensive** (`bin/`, `obj/`, `node_modules/`,
+     `dist/`, real `.env` files) and `git ls-files` shows **zero** tracked build
+     artifacts, so a fresh CI checkout builds from clean sources.
+   - **Backend Docker build does not depend on the test project** — the
+     Dockerfile restores/publishes only `src/TodoApi/TodoApi.csproj`, and
+     `backend/.dockerignore` excludes `tests/`, `bin/`, `obj/`. The frontend
+     `.dockerignore` excludes `node_modules`/`dist`, so `COPY . .` after
+     `npm ci` won't clobber the installed deps.
+   - **No localhost URL leaks into the production frontend bundle.** Only
+     `.env.development` and `.env.example` exist; `vite build` runs in
+     `production` mode and does not load `.env.development`, so the baked
+     `VITE_API_BASE_URL` comes solely from the Docker `--build-arg` (or is empty
+     in a credential-free CI build-check, which `api.ts` tolerates via `?? ''`).
+
+## Deviations from specs.md
+
+None. No code was changed, so no new deviations were introduced.
+
+## Assumptions made
+
+- Interpreted "make the app CI/CD-ready" as *verify and fix only concrete gaps*,
+  not add new features. Since no gap was found, the correct action was to change
+  nothing and document the verification, rather than invent work (e.g. I did not
+  add ASP.NET Core Health Checks middleware, a `HEALTHCHECK` Docker instruction,
+  or a `npm run lint` script — the spec's §11.4 CI jobs don't require them and
+  the current `/health` + `tsc` typecheck already satisfy the stated needs).
+
+## Known limitations / notes for the devops stage
+
+- `npm audit` reports dev-toolchain advisories (esbuild/vite 5), carried over
+  from prior cycles. They affect only the Vite dev server, not the nginx-served
+  production bundle, and the §11.4 CI frontend job (`npm ci` + `npm run build`)
+  does **not** run `npm audit`, so they will not fail CI. If the devops agent
+  adds an `npm audit --audit-level=high` gate, it must set the level to avoid
+  failing on these known dev-only advisories (or accept the Vite 5→newer bump).
+- Scale-to-zero backend (min replicas 0) means the CD smoke check triggers a
+  cold start that includes the synchronous startup migration; the `/health`
+  endpoint itself is instant once the app is listening. This is inherent to the
+  spec's migrate-at-startup design (§3.4) and was intentionally left unchanged.
+
+## How to verify
+
+```bash
+# prepend the .NET 10 SDK, per prior-cycle env note
+export PATH="/c/Users/ingda/dotnet10:$PATH"
+cd backend && dotnet build TodoApi.sln -c Release && dotnet test TodoApi.sln -c Release
+cd ../frontend && npm ci && npm run build && npm test
+```
+
+## Security & PCI DSS scope
+
+Unchanged from prior cycles. This is a no-auth Todo demo that processes **no
+payment or cardholder data** — PCI DSS is not in scope for any part of the
+system. The only security-relevant items this pass confirmed remain intact:
+secrets are injected via env/Container Apps secrets (never committed — verified
+no tracked `.env`/connection strings), CORS stays restricted to the configured
+frontend origin, TLS-to-Postgres is enforced by the deploy-time connection
+string (`Ssl Mode=Require`), and EF Core parameterizes all queries. No new
+attack surface was introduced because no code changed.

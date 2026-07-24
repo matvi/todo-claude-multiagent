@@ -1,0 +1,92 @@
+# CI — build / test / lint validation only. NO Azure login, NO image push,
+# NO deploy. Credential-free so it runs safely on any PR (incl. forks).
+# This is the REQUIRED status check for branch protection on `main` (specs §11.7).
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Cancel superseded runs on the same PR/branch.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (.NET 10 build + test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Restore
+        run: dotnet restore TodoApi.sln
+      - name: Build
+        run: dotnet build TodoApi.sln -c Release --no-restore
+      # Tests swap in EF Core InMemory (TodoApiFactory) — no Postgres required.
+      - name: Test
+        run: dotnet test TodoApi.sln -c Release --no-build --verbosity normal
+
+  frontend:
+    name: Frontend (Vite build + vitest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install (clean)
+        run: npm ci
+      # A placeholder VITE_API_BASE_URL is fine for a build-check; the real value
+      # is baked by the CD workflow at deploy time.
+      - name: Build (tsc + vite build)
+        run: npm run build
+        env:
+          VITE_API_BASE_URL: https://todo-api.placeholder.local
+      - name: Test (vitest run)
+        run: npm test
+      # NOTE: no `npm audit` gate here — the known esbuild/vite 5 dev-toolchain
+      # advisories (changes.md) are dev-only and would fail a naive high gate.
+
+  docker:
+    name: Docker build (both images, no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image
+        run: docker build -f backend/src/TodoApi/Dockerfile -t todo-api:ci ./backend
+      - name: Build frontend image (dummy build-arg)
+        run: |
+          docker build -f frontend/Dockerfile \
+            --build-arg VITE_API_BASE_URL=https://todo-api.placeholder.local \
+            -t todo-web:ci ./frontend
+
+  iac:
+    name: IaC (bicep build + lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # azure/setup-azcli is preinstalled on ubuntu-latest runners; ensure bicep.
+      - name: Install Bicep CLI
+        run: az bicep install
+      - name: Bicep build (compile check)
+        run: az bicep build --file infra/main.bicep --stdout > /dev/null
+      - name: Bicep lint
+        run: az bicep lint --file infra/main.bicep

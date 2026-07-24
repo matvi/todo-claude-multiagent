@@ -1,0 +1,144 @@
+# CD — deploy to Azure Container Apps on merge to `main` (specs §11.5).
+# Auth: OIDC / workload identity federation via azure/login@v2 — NO stored
+# client secret. Uses GitHub *variables* AZURE_CLIENT_ID / AZURE_TENANT_ID /
+# AZURE_SUBSCRIPTION_ID (no credential material) and the *secret* PGADMIN_PASSWORD.
+#
+# Honors the backend-before-frontend ordering constraint (specs §4.4 / §11.5):
+# the frontend image bakes the backend FQDN at build time, so the backend is
+# built + deployed FIRST, its FQDN read back, then the frontend is built with
+# --build-arg VITE_API_BASE_URL=<backend FQDN>.
+
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# One deploy at a time; never let overlapping merges race a Container App revision.
+concurrency:
+  group: cd-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # required for OIDC federated login — no secret stored
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-todo-demo
+  LOCATION: eastus
+  PLACEHOLDER_IMAGE: mcr.microsoft.com/k8se/quickstart:latest
+
+jobs:
+  deploy:
+    name: Deploy infra + images to Azure Container Apps
+    runs-on: ubuntu-latest
+    # A GitHub Environment lets deployments show in history and lets a
+    # required-reviewer rule be added later without editing this workflow.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC, no secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # ------------------------------------------------------------------
+      # 1. Provision / update infra (idempotent). We read back the CURRENTLY
+      #    running images and feed them into the deploy so the infra pass does
+      #    NOT reset the apps to the placeholder image (no revision flap). On
+      #    the very first deploy the apps don't exist yet, so we fall back to
+      #    the public placeholder image.
+      # ------------------------------------------------------------------
+      - name: Read current images (avoid resetting apps during infra deploy)
+        id: current
+        run: |
+          set -euo pipefail
+          API_IMAGE=$(az containerapp show -n todo-api -g "$RESOURCE_GROUP" \
+            --query "properties.template.containers[0].image" -o tsv 2>/dev/null || echo "$PLACEHOLDER_IMAGE")
+          WEB_IMAGE=$(az containerapp show -n todo-web -g "$RESOURCE_GROUP" \
+            --query "properties.template.containers[0].image" -o tsv 2>/dev/null || echo "$PLACEHOLDER_IMAGE")
+          echo "api_image=${API_IMAGE:-$PLACEHOLDER_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "web_image=${WEB_IMAGE:-$PLACEHOLDER_IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy Bicep (infra)
+        id: infra
+        run: |
+          set -euo pipefail
+          OUT=$(az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infra/main.bicep \
+            --parameters infra/main.parameters.json \
+            --parameters \
+              postgresAdminPassword="$PGADMIN_PASSWORD" \
+              todoApiImage="${{ steps.current.outputs.api_image }}" \
+              todoWebImage="${{ steps.current.outputs.web_image }}" \
+            --query properties.outputs -o json)
+          echo "acr_name=$(echo "$OUT" | jq -r '.acrName.value')" >> "$GITHUB_OUTPUT"
+          echo "acr_login_server=$(echo "$OUT" | jq -r '.acrLoginServer.value')" >> "$GITHUB_OUTPUT"
+        env:
+          PGADMIN_PASSWORD: ${{ secrets.PGADMIN_PASSWORD }}
+
+      # ------------------------------------------------------------------
+      # 2. Backend FIRST — build + push, deploy, read back its FQDN.
+      # ------------------------------------------------------------------
+      - name: Build & push backend image (todo-api)
+        run: |
+          az acr build \
+            --registry "${{ steps.infra.outputs.acr_name }}" \
+            --image "todo-api:${{ github.sha }}" \
+            --file backend/src/TodoApi/Dockerfile \
+            ./backend
+
+      - name: Update backend Container App
+        id: api
+        run: |
+          set -euo pipefail
+          az containerapp update -n todo-api -g "$RESOURCE_GROUP" \
+            --image "${{ steps.infra.outputs.acr_login_server }}/todo-api:${{ github.sha }}"
+          FQDN=$(az containerapp show -n todo-api -g "$RESOURCE_GROUP" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # 3. Frontend SECOND — bake the backend FQDN at build time, then deploy.
+      # ------------------------------------------------------------------
+      - name: Build & push frontend image (todo-web) with backend FQDN baked
+        run: |
+          az acr build \
+            --registry "${{ steps.infra.outputs.acr_name }}" \
+            --image "todo-web:${{ github.sha }}" \
+            --file frontend/Dockerfile \
+            --build-arg VITE_API_BASE_URL="https://${{ steps.api.outputs.fqdn }}" \
+            ./frontend
+
+      - name: Update frontend Container App
+        id: web
+        run: |
+          set -euo pipefail
+          az containerapp update -n todo-web -g "$RESOURCE_GROUP" \
+            --image "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}"
+          FQDN=$(az containerapp show -n todo-web -g "$RESOURCE_GROUP" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # 4. Reconcile CORS — ensure the backend allows the frontend origin.
+      #    (Bicep already sets this, but re-assert in case the web FQDN changed.)
+      # ------------------------------------------------------------------
+      - name: Reconcile backend CORS allow-list
+        run: |
+          az containerapp update -n todo-api -g "$RESOURCE_GROUP" \
+            --set-env-vars "Cors__AllowedOrigins__0=https://${{ steps.web.outputs.fqdn }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Deploy complete"
+            echo "- Backend  (todo-api): https://${{ steps.api.outputs.fqdn }}"
+            echo "- Frontend (todo-web): https://${{ steps.web.outputs.fqdn }}"
+            echo "- Image tag: \`${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

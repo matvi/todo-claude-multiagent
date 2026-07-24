@@ -405,3 +405,130 @@ independently by direct code reading (not just trusting `changes.md`), by
 reproducing the engineer's test results exactly, and by adding new edge-case
 tests that also pass. No regressions in either backend or frontend. Nothing
 else to report for the reviewer to re-check beyond this single fix.
+
+---
+
+# CI/CD cycle (2026-07-24) — verification of the §11 CI/CD & IaC extension pass
+
+## Verdict: PASS
+
+This cycle's engineer pass made **no application code changes** — it was a
+CI/CD-readiness audit against the newly-added spec §11 (CI/CD & Infrastructure-
+as-Code) and `.pipeline/architecture-memory.md`, both authored this cycle. The
+audit's own claim ("nothing needed fixing") was independently re-verified here
+by re-running the full existing test suites from a clean invocation, rather
+than trusting the prior report.
+
+### What changed this cycle (confirmed via `git diff --stat` / `git status`)
+
+- `.pipeline/specs.md` — gained §11 (CI/CD & IaC) and a few in-place edits to
+  §6/§8 pulling CI/CD into scope. 355 insertions / 9 deletions.
+- `.pipeline/changes.md` — gained the dated "CI/CD-readiness pass" section
+  documenting the audit (no code diff).
+- `.pipeline/architecture-memory.md` — new file (140 lines), not previously
+  tracked.
+- **No changes under `backend/`, `frontend/`, `infra/`, `.github/workflows/`,
+  or `azure-pipelines.yml`.** Confirmed `infra/`, `.github/workflows/`, and
+  `azure-pipelines.yml` do not exist yet in the working tree — the `devops`
+  subagent described in §11 has not run yet this cycle. This is expected: this
+  cycle's engineer pass was explicitly scoped to auditing existing app code
+  for CI/CD-readiness, not authoring the IaC/pipeline artifacts themselves.
+
+Since no application source changed, no new test files were needed or added.
+Padding the suite with redundant tests for unchanged code would not have
+added signal.
+
+### Independent re-run of both existing suites
+
+**Backend** (`C:\Users\ingda\Documents\bankClaude\backend`):
+
+```
+export PATH="/c/Users/ingda/dotnet10:$PATH"
+dotnet --version          # 10.0.302
+dotnet test TodoApi.sln -c Release
+```
+
+Result: **Passed! - Failed: 0, Passed: 29, Skipped: 0, Total: 29**, duration
+~2s. Matches the prior cycle's reported 29/29 exactly — independently
+reproduced, not just trusted.
+
+**Frontend** (`C:\Users\ingda\Documents\bankClaude\frontend`):
+
+```
+npm test        # vitest run
+npm run build   # tsc && vite build
+```
+
+- `npm test` → **37 passed, 0 failed, across 6 test files**
+  (`api.test.ts` 7, `TodoList.test.tsx` 3, `useTodos.test.ts` 8,
+  `App.test.tsx` 9, `TodoForm.test.tsx` 4, `TodoItem.test.tsx` 6). Matches the
+  prior cycle's reported 37/37 exactly.
+- `npm run build` → succeeded, 0 TypeScript errors, production bundle emitted
+  to `dist/` (`index.html`, CSS, JS chunk, gzip sizes reported), confirming
+  the app still builds cleanly for a containerized/CI build step.
+
+### Coverage summary against specs.md §11 (CI/CD-readiness properties)
+
+§11 itself defines infrastructure/pipeline deliverables (Bicep, GitHub
+Actions, Azure Pipelines) that are explicitly out of scope for this cycle's
+app-code pass and for the tester agent — they belong to the `devops` subagent
+and cannot be meaningfully unit/integration-tested by this agent (they require
+`az bicep build/lint`, workflow-syntax validation, or a live Azure
+subscription, none of which exist here yet). What **is** testable from the
+existing suites, and was already covered by them:
+
+| §11 CI/CD-readiness property (as audited in changes.md) | Existing coverage | Status |
+|---|---|---|
+| `dotnet test` runs headlessly with no Postgres | `TodoApiFactory` swaps in EF Core InMemory (all 29 backend tests run without a live DB) | Re-confirmed — 29/29 pass with no Postgres running |
+| `npm test` / `npm run build` run headlessly, non-interactively | `vitest run` (not watch) + `tsc && vite build` | Re-confirmed — 37/37 pass, build succeeds |
+| Connection string / CORS origin come from config/env, not hardcoded | Not independently re-tested this cycle (no code changed); previously verified by direct source reading in `changes.md`, consistent with `appsettings.json` having empty placeholders | Not re-verified (code unchanged since last audit) |
+| `/health` is dependency-free, no auth gate | Covered by `Health_ReturnsOkWithStatusOk` backend test | Still passing |
+| No build artifacts tracked in git / Dockerfiles don't depend on test project | Not independently re-checked this cycle (audit-only claim, code unchanged) | Not re-verified — see Gaps |
+
+### Gaps (not testable this cycle)
+
+- **§11.3–§11.10 (Bicep IaC, GitHub Actions CI/CD workflows, Azure Pipelines
+  equivalent) have not been authored yet** — `infra/`, `.github/workflows/`,
+  and `azure-pipelines.yml` do not exist in the working tree. These cannot be
+  tested until the `devops` subagent produces them (a future pipeline stage).
+  This is not a regression or a failure of this cycle — §11 explicitly assigns
+  that authoring to a separate `devops` subagent, and per its PROPOSE-mode
+  rules (§11.8) it hasn't run yet.
+- **No live Azure resources / OIDC identity** exist to smoke-test the deploy
+  path described in §11.5–§11.6 — this is intentional per spec (§11.6 is a
+  manual, human, one-time bootstrap; §11.8 forbids the devops agent from
+  provisioning anything).
+- The three "not re-verified" rows above (config-from-env, `/health`
+  dependency-freedom source claims, Dockerfile/`.dockerignore` hygiene) were
+  not re-audited by direct source reading in this cycle, since no source
+  changed since the prior cycle's audit already did that reading and this
+  cycle's job was to independently confirm the test suites still pass, not to
+  redo a full source audit with no diff to review. If a reviewer wants this
+  re-confirmed line-by-line, it would need a targeted read of
+  `Program.cs`/`appsettings.json`, which was not repeated here since it was
+  unchanged.
+
+### Result totals
+
+- Backend: **29/29 passed** (independently re-run, matches prior report).
+- Frontend: **37/37 passed** across 6 files (independently re-run, matches
+  prior report); `npm run build` also succeeds.
+
+## Git / PR status for this cycle — IMPORTANT environment limitation
+
+This environment has **no git remote configured** (`git remote -v` returns
+empty) and **no `gh` CLI installed**. As a result:
+
+- Changes were committed **locally only** on branch
+  `pipeline/todo-app-azure-cicd` (no push was attempted — it would fail with
+  no remote configured).
+- **No PR was created or updated** — `gh pr create`/`gh pr list` are
+  unavailable in this environment. No PR URL is being fabricated; none exists.
+- This is a **one-time environment setup gap for a human** (add a git remote,
+  e.g. `git remote add origin <url>`, and install/authenticate the `gh` CLI),
+  not a defect in the app, the spec, or this cycle's work, and it should not
+  be routed back through the pipeline as a rejection or engineering task.
+- Once a remote and `gh` are configured, a human (or a future cycle running in
+  an environment that has them) can push `pipeline/todo-app-azure-cicd` and
+  open the PR against `main` using `.pipeline/specs.md`'s overview and
+  `.pipeline/changes.md`'s summary as the PR body.

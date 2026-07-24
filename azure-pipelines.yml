@@ -1,0 +1,166 @@
+# Azure DevOps equivalent of the GitHub Actions CI + CD (specs §11.10).
+#
+# TRIGGERS ARE DISABLED ON PURPOSE. GitHub Actions is the primary/auto-triggering
+# system for this repo (specs §9.8 / §11.10). Leaving BOTH systems auto-triggering
+# would double every build and, worse, race two deploys onto the same Container
+# App revision. This file is kept behavior-equivalent and ready to flip on if the
+# team standardizes on Azure DevOps later: change `trigger`/`pr` below to
+# `trigger: { branches: { include: [main] } }` and `pr: { branches: { include:
+# [main] } }`, and disable the GitHub Actions workflows.
+trigger: none
+pr: none
+
+variables:
+  # Azure Resource Manager service connection using WORKLOAD IDENTITY FEDERATION
+  # (the Azure DevOps analogue of OIDC — secretless). Created MANUALLY by a human
+  # (see infra/README.md); never provisioned by an agent.
+  azureServiceConnection: 'todo-demo-arm'
+  resourceGroup: 'rg-todo-demo'
+  location: 'eastus'
+  placeholderImage: 'mcr.microsoft.com/k8se/quickstart:latest'
+  # PGADMIN_PASSWORD must be defined as a SECRET pipeline variable / variable group
+  # value (never committed). Referenced as $(PGADMIN_PASSWORD).
+
+stages:
+  # ======================= CI (build / test / lint) =======================
+  - stage: CI
+    displayName: CI - build, test, lint (no deploy)
+    jobs:
+      - job: backend
+        displayName: Backend (.NET 10)
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UseDotNet@2
+            inputs:
+              packageType: sdk
+              version: '10.0.x'
+          - script: dotnet restore TodoApi.sln
+            workingDirectory: backend
+            displayName: Restore
+          - script: dotnet build TodoApi.sln -c Release --no-restore
+            workingDirectory: backend
+            displayName: Build
+          - script: dotnet test TodoApi.sln -c Release --no-build --verbosity normal
+            workingDirectory: backend
+            displayName: Test
+
+      - job: frontend
+        displayName: Frontend (Vite + vitest)
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '22.x'
+          - script: npm ci
+            workingDirectory: frontend
+            displayName: Install (clean)
+          - script: npm run build
+            workingDirectory: frontend
+            displayName: Build (tsc + vite build)
+            env:
+              VITE_API_BASE_URL: https://todo-api.placeholder.local
+          - script: npm test
+            workingDirectory: frontend
+            displayName: Test (vitest run)
+
+      - job: docker
+        displayName: Docker build (both images, no push)
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - script: docker build -f backend/src/TodoApi/Dockerfile -t todo-api:ci ./backend
+            displayName: Build backend image
+          - script: >
+              docker build -f frontend/Dockerfile
+              --build-arg VITE_API_BASE_URL=https://todo-api.placeholder.local
+              -t todo-web:ci ./frontend
+            displayName: Build frontend image
+
+      - job: iac
+        displayName: IaC (bicep build + lint)
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                az bicep build --file infra/main.bicep --stdout > /dev/null
+                az bicep lint --file infra/main.bicep
+
+  # ======================= CD (deploy to Container Apps) =======================
+  # Runs ONLY for main (equivalent to the GitHub CD "push to main" gate).
+  - stage: CD
+    displayName: CD - deploy to Azure Container Apps
+    dependsOn: CI
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: deploy
+        displayName: Deploy infra + images
+        pool:
+          vmImage: ubuntu-latest
+        # The `production` environment mirrors the GitHub Environment and is
+        # where an approval check can be attached later.
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  displayName: Deploy Bicep + build/push images + update apps
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      SHA="$(Build.SourceVersion)"
+
+                      # 1. Read current images so the infra deploy doesn't reset apps.
+                      API_IMAGE=$(az containerapp show -n todo-api -g "$(resourceGroup)" \
+                        --query "properties.template.containers[0].image" -o tsv 2>/dev/null || echo "$(placeholderImage)")
+                      WEB_IMAGE=$(az containerapp show -n todo-web -g "$(resourceGroup)" \
+                        --query "properties.template.containers[0].image" -o tsv 2>/dev/null || echo "$(placeholderImage)")
+
+                      # 2. Infra (idempotent). Postgres password from a SECRET variable.
+                      OUT=$(az deployment group create \
+                        --resource-group "$(resourceGroup)" \
+                        --template-file infra/main.bicep \
+                        --parameters infra/main.parameters.json \
+                        --parameters \
+                          postgresAdminPassword="$(PGADMIN_PASSWORD)" \
+                          todoApiImage="$API_IMAGE" \
+                          todoWebImage="$WEB_IMAGE" \
+                        --query properties.outputs -o json)
+                      ACR_NAME=$(echo "$OUT" | jq -r '.acrName.value')
+                      ACR_LOGIN=$(echo "$OUT" | jq -r '.acrLoginServer.value')
+
+                      # 3. Backend FIRST: build/push, deploy, read FQDN.
+                      az acr build --registry "$ACR_NAME" --image "todo-api:$SHA" \
+                        --file backend/src/TodoApi/Dockerfile ./backend
+                      az containerapp update -n todo-api -g "$(resourceGroup)" \
+                        --image "$ACR_LOGIN/todo-api:$SHA"
+                      API_FQDN=$(az containerapp show -n todo-api -g "$(resourceGroup)" \
+                        --query "properties.configuration.ingress.fqdn" -o tsv)
+
+                      # 4. Frontend SECOND: bake backend FQDN, deploy, read FQDN.
+                      az acr build --registry "$ACR_NAME" --image "todo-web:$SHA" \
+                        --file frontend/Dockerfile \
+                        --build-arg VITE_API_BASE_URL="https://$API_FQDN" ./frontend
+                      az containerapp update -n todo-web -g "$(resourceGroup)" \
+                        --image "$ACR_LOGIN/todo-web:$SHA"
+                      WEB_FQDN=$(az containerapp show -n todo-web -g "$(resourceGroup)" \
+                        --query "properties.configuration.ingress.fqdn" -o tsv)
+
+                      # 5. Reconcile backend CORS to the frontend origin.
+                      az containerapp update -n todo-api -g "$(resourceGroup)" \
+                        --set-env-vars "Cors__AllowedOrigins__0=https://$WEB_FQDN"
+
+                      echo "Backend:  https://$API_FQDN"
+                      echo "Frontend: https://$WEB_FQDN"
