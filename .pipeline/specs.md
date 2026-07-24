@@ -1,8 +1,12 @@
 # Technical Specification — Todo Application
 
-Cycle: 1 of 3 (initial pass, no reviewer feedback yet)
+Original app spec: Cycle 1 of 3 (approved after fix — see review history).
+This document also covers the **CI/CD + Infrastructure-as-Code extension**
+(added 2026-07-24, review cycle 1 of up to 3 for the extended scope). The
+extension lives in **§11**; §1–§10 describe the already-implemented app and are
+unchanged except for the two items in §8 that this cycle moves **into** scope.
 Author: Architect agent
-Date: 2026-07-23
+Date: 2026-07-24 (extension); app spec 2026-07-23
 
 ---
 
@@ -319,6 +323,7 @@ server {
 **Important:** because `VITE_API_BASE_URL` is baked at build time, the backend
 FQDN must be known before building the frontend image. Deployment order in §5.7
 reflects this (deploy backend first, then build/deploy frontend with its FQDN).
+The CI/CD pipeline (§11) MUST honor this same ordering.
 
 ---
 
@@ -450,10 +455,13 @@ Because the frontend bakes the backend URL at build time (§4.4), order matters:
    the `todo-web` FQDN and revision-restart `todo-api`.
 
 The engineer must write these as concrete, runnable `az` commands in
-`changes.md` (parameterized by RG/location/names). **Do not auto-provision** —
-the architect and engineer only document commands; a human runs them.
+`changes.md` (parameterized by RG/location/names). For the manual bootstrap path
+these remain reference commands; the **repeatable** path is now the Bicep + CI/CD
+in §11. **Do not auto-provision** — the architect and engineer only document
+commands; a human (or the CD pipeline, once its identity is set up) runs them.
 
-Reference command sketch (illustrative — engineer to finalize):
+Reference command sketch (illustrative — engineer/devops to finalize; the Bicep
+in §11 supersedes this for repeatable deploys):
 ```bash
 az group create -n rg-todo-demo -l eastus
 az acr create -g rg-todo-demo -n <acrname> --sku Basic
@@ -479,6 +487,9 @@ az containerapp create -g rg-todo-demo -n todo-api --environment cae-todo-demo \
 /                         (repo root = C:\Users\ingda\Documents\bankClaude)
   backend/                (see §3.2)
   frontend/               (see §4.2)
+  infra/                  (Bicep IaC — added this cycle, see §11.3)
+  .github/workflows/      (GitHub Actions CI/CD — added this cycle, see §11.4)
+  azure-pipelines.yml     (Azure DevOps pipeline — added this cycle, see §11.5)
   docker-compose.yml      (local Postgres only)
   .env.example            (local env var template)
   README.dev.md           (optional quickstart the engineer may add)
@@ -558,11 +569,20 @@ used.
 - VNet-integrated / private-endpoint networking; the demo uses public access +
   firewall + TLS.
 - Azure Key Vault (Container Apps secrets are used instead).
-- CI/CD pipelines (GitHub Actions / Azure DevOps). Deployment is manual `az`
-  commands documented in `changes.md`.
-- Infrastructure-as-Code (Bicep/Terraform). CLI commands only for the demo.
 - Static Web Apps hosting for the frontend (frontend is containerized on ACA).
 - Rate limiting, WAF, custom domains, CDN.
+- **Multi-environment promotion** (dev/staging/prod). CI/CD (§11) targets a
+  **single environment** deployed from `main`. Adding staging is a future cycle.
+- **Automated creation of cloud identities / credentials / RBAC.** The CI/CD
+  OIDC identity and role assignments are a **manual one-time human step**
+  (§11.6); agents never create them.
+- **Database migration as a separate pipeline stage.** Migrations still run at
+  app startup (§3.4); CD does not run `dotnet ef database update` as its own
+  job.
+
+> **Moved INTO scope this cycle** (previously listed here as out of scope):
+> CI/CD pipelines (GitHub Actions + Azure Pipelines) and Infrastructure-as-Code.
+> Both are now specified in **§11**.
 
 ---
 
@@ -586,10 +606,327 @@ used.
    be bumped to the latest GA the region offers.
 7. **Migrations run automatically at startup** for demo convenience; acceptable
    given the single-instance, single-developer nature of the app.
+8. **Repository is hosted on GitHub** and GitHub Actions is the primary CI/CD
+   system; the `azure-pipelines.yml` is provided as a functional equivalent for
+   teams on Azure DevOps but is not expected to be the default runner (§11.5).
+9. **The target Azure subscription already exists** and a human with Owner (or
+   User Access Administrator + Contributor) rights is available to perform the
+   one-time identity/RBAC bootstrap in §11.6.
 
 ## 10. Open questions
 
 None blocking. All ambiguities were resolved with the documented assumptions in
 §9. If a reviewer disagrees with the "both on Container Apps" decision (§5.2) or
 the "public-access Postgres" decision (§5.4), those are the two most likely
-points to revisit in a later cycle.
+points to revisit in a later cycle. For the CI/CD extension, the two decisions
+most open to reviewer challenge are the **Bicep-over-Terraform** choice (§11.2)
+and running **CD from `main` into a single environment** (no staging, §11.7).
+
+---
+
+## 11. CI/CD & Infrastructure-as-Code (extension — this cycle's scope)
+
+This section defines the delivery layer for the app. It is authored by the
+architect for a downstream **`devops` subagent** to implement. The devops agent
+operates in **PROPOSE mode** (§11.8): it *authors* IaC and pipeline YAML and
+*documents* commands, but never provisions, deploys, or creates
+credentials/identities itself.
+
+### 11.1 Goals & non-goals
+
+**Goals**
+- Reproducible, reviewable infrastructure via IaC (no more click-ops / ad-hoc
+  `az create` as the source of truth).
+- PR-gated delivery: every change is validated by CI before it can merge.
+- Automated deploy to Azure Container Apps on merge to `main`.
+- Secretless CI→Azure authentication (OIDC / workload identity federation).
+- Cheap by default — demo-grade SKUs everywhere (§11.9).
+
+**Non-goals** (see also §8)
+- Multi-environment promotion (single environment from `main`).
+- Blue/green or canary rollouts (single-revision replace is fine).
+- Automated identity/RBAC/GitHub-secret creation (manual bootstrap, §11.6).
+- A dedicated DB-migration pipeline stage (migrations run at app startup).
+
+### 11.2 IaC tool decision — **Bicep** (with rationale)
+
+**Decision: use Bicep**, not Terraform.
+
+Rationale:
+- **No state backend to manage.** Terraform would require provisioning and
+  securing a remote state backend (storage account + blob container + state
+  locking) before it can run in CI — extra resources and a chicken-and-egg
+  bootstrap. Bicep uses Azure Resource Manager's server-side deployment state,
+  so there is nothing extra to stand up.
+- **Azure-native, first-class ACA + Postgres Flexible Server support**, and it
+  ships with the `az` CLI already present in this environment (verified: az
+  2.63.0). No provider/plugin download step.
+- **Lowest ceremony for a single-cloud, single-subscription demo.** The whole
+  point of this app is Azure containers; Bicep keeps the toolchain to one thing.
+
+Terraform is the documented alternative and would be preferred if the project
+ever went multi-cloud, wanted an explicit `plan` artifact for review, or needed
+Terraform-specific module ecosystems. If a reviewer insists on Terraform, the
+module boundaries in §11.3 map 1:1 to Terraform resources; only the state-backend
+bootstrap and the `what-if`→`plan` step change.
+
+### 11.3 What the devops agent must produce — Bicep IaC
+
+Directory: **`infra/`** at the repo root.
+
+```
+infra/
+  main.bicep                 # subscription- or RG-scoped entry point
+  main.parameters.json       # default (non-secret) parameter values
+  modules/
+    registry.bicep           # ACR (Basic)
+    loganalytics.bicep       # Log Analytics workspace
+    acaEnvironment.bicep     # Container Apps managed environment
+    postgres.bicep           # Postgres Flexible Server + tododb + firewall rule
+    containerApp.bicep       # reusable module for one Container App (params: name,
+                             #   image, targetPort, external ingress, env vars,
+                             #   secrets, min/max replicas, cpu/memory)
+  README.md                  # how to deploy manually + how CD consumes it
+```
+
+Requirements the Bicep must satisfy:
+- **Scope:** `main.bicep` targets `resourceGroup` scope; the resource group
+  itself is created out-of-band (documented `az group create` in §11.6) OR
+  `main.bicep` is `subscription`-scoped and creates the RG. Devops agent picks
+  one and documents it; **RG name `rg-todo-demo`, region `eastus`** are the
+  defaults and must match §5.3.
+- **Parameters** (all with demo-safe defaults): `location`, `resourcePrefix`/
+  names, `acrName` (with uniqueness suffix via `uniqueString(resourceGroup().id)`),
+  `postgresAdminUser`, image tags for `todo-api` and `todo-web`, and the
+  frontend/backend replica + resource sizing from §5.6.
+- **Secrets are NOT hard-coded in Bicep or parameter files.** The Postgres admin
+  password and the assembled connection string are passed as **secure
+  parameters** (`@secure()`), supplied at deploy time from a GitHub Actions
+  secret / pipeline secret (§11.6). Parameter files in git contain only
+  non-secret values.
+- **Resources produced** (matches §5.3): ACR (Basic), Log Analytics, ACA
+  environment, Postgres Flexible Server + `tododb` + the `0.0.0.0` "allow Azure
+  services" firewall rule, and the two Container Apps (`todo-api`, `todo-web`).
+- **Identity / ACR pull:** enable a **system-assigned managed identity** on each
+  Container App and grant it `AcrPull` on the registry (role assignment in
+  Bicep). This is the preferred ACR-pull mechanism from §5.5; the admin-user
+  fallback should not be used in the IaC path.
+- **Backend Container App** gets the DB connection string as a Container Apps
+  **secret** `todo-db-connection`, surfaced as env `ConnectionStrings__TodoDb`,
+  plus `Cors__AllowedOrigins__0` set to the frontend FQDN. Because the frontend
+  FQDN and the frontend image both depend on ordering (§4.4/§5.7), see §11.7 for
+  how the pipeline sequences this within a single Bicep deployment vs. a two-step
+  deploy.
+- **Outputs:** `acrLoginServer`, `todoApiFqdn`, `todoWebFqdn`, ACA env id —
+  consumed by the CD pipeline and printed for humans.
+- Must pass `az bicep build` and `az bicep lint` with no errors (CI enforces
+  this, §11.4).
+
+### 11.4 GitHub Actions — CI workflow (`.github/workflows/ci.yml`)
+
+**Trigger:** `pull_request` targeting `main` (and `workflow_dispatch` for manual
+runs). This is the **required status check** for the branch protection in §11.7.
+
+**Jobs (build/validate only — NO push, NO deploy, NO Azure login required):**
+1. **backend** — set up .NET 10, `dotnet restore`, `dotnet build -c Release`,
+   `dotnet test` (runs the tester agent's xUnit suite). Fail on any test failure.
+2. **frontend** — set up Node 22, `npm ci`, `npm run build`, and lint/typecheck
+   if configured. (`VITE_API_BASE_URL` can be a placeholder for the build-check.)
+3. **docker** — `docker build` both images (backend context `backend/`, frontend
+   context `frontend/` with a dummy `--build-arg VITE_API_BASE_URL`) to prove the
+   Dockerfiles build. Do **not** push.
+4. **iac** — `az bicep build infra/main.bicep` + `az bicep lint`. Optionally a
+   `what-if` against the target RG **only if** OIDC is wired for PRs; default is
+   lint-only so CI needs no cloud credentials and is safe on fork PRs.
+
+CI must be fast and credential-free by default so it can run on any PR safely.
+
+### 11.5 GitHub Actions — CD workflow (`.github/workflows/cd.yml`)
+
+**Trigger:** `push` to `main` (i.e., on merge) + `workflow_dispatch`.
+**Concurrency:** a single `cd-main` concurrency group so overlapping merges
+don't race a deploy.
+**Permissions:** `id-token: write` (OIDC) + `contents: read`.
+
+**Steps (in order — honors the §4.4/§5.7 backend-before-frontend constraint):**
+1. `azure/login@v2` using OIDC (`client-id`, `tenant-id`, `subscription-id` from
+   GitHub **variables/secrets** — see §11.6). No client secret.
+2. **Provision/update infra:** `az deployment group create` (or `sub` scope)
+   with `infra/main.bicep`, passing the secure Postgres password + assembled
+   connection string from GitHub secrets. This is idempotent — safe to run every
+   deploy. Capture outputs (`acrLoginServer`, `todoApiFqdn`).
+3. **Build & push backend image** to ACR (`az acr build -r <acr> -t todo-api:${{ github.sha }} ./backend`,
+   or docker build + `az acr login` + push). Tag with the commit SHA (and
+   optionally `latest`).
+4. **Update backend Container App** to the new image
+   (`az containerapp update ... --image <acr>/todo-api:<sha>`); read back its
+   FQDN.
+5. **Build & push frontend image** with `--build-arg VITE_API_BASE_URL=https://<todoApiFqdn>`.
+6. **Update frontend Container App** to the new image; read back its FQDN.
+7. **Reconcile CORS:** ensure backend `Cors__AllowedOrigins__0` = frontend FQDN
+   (set via the Bicep deploy in step 2 on subsequent runs, or an
+   `az containerapp update` here on first deploy). Document which approach is
+   used.
+8. Print final FQDNs in the job summary.
+
+Note the ordering rationale: the frontend image must bake the backend FQDN, and
+the backend must allow the frontend origin via CORS — a two-phase apply. The
+devops agent may either (a) run Bicep once for infra then imperatively update
+images (recommended — simplest), or (b) parameterize images into Bicep and run
+it twice. Document the chosen approach in `infra/README.md` and `changes.md`.
+
+### 11.6 Identity & credential strategy — **OIDC federated credentials**
+
+**Decision: GitHub Actions authenticates to Azure via OpenID Connect (workload
+identity federation), NOT a service-principal client secret.**
+
+Rationale: no long-lived secret stored in GitHub to leak or rotate; Azure mints
+a short-lived token scoped to a specific repo/branch/environment per run. This is
+the current Microsoft-recommended pattern for GitHub→Azure.
+
+**What the pipelines reference (never create):**
+- GitHub repository (or environment) **variables**: `AZURE_CLIENT_ID`,
+  `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`.
+- GitHub **secrets**: `PGADMIN_PASSWORD` (Postgres admin password) and, if the
+  connection string is assembled outside Bicep, `TODO_DB_CONNECTION`. These feed
+  the `@secure()` Bicep params (§11.3).
+
+**One-time human bootstrap (MANUAL — never run by any agent).** The devops agent
+must WRITE these exact commands into `infra/README.md` / `changes.md` for a human
+to execute, and must explicitly label them "manual, run once, by a human":
+
+```bash
+# 1. Create an Entra app registration (or user-assigned managed identity) for CI.
+az ad app create --display-name "gh-todo-demo-cicd"
+#    → capture appId (this becomes AZURE_CLIENT_ID) and create a service principal:
+az ad sp create --id <appId>
+
+# 2. Add a federated credential binding the app to this repo's main branch
+#    (repeat with subject for pull_request / environment as needed).
+az ad app federated-credential create --id <appId> --parameters '{
+  "name": "gh-todo-demo-main",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:<org>/<repo>:ref:refs/heads/main",
+  "audiences": ["api://AzureADTokenExchange"]
+}'
+
+# 3. Grant the SP least-privilege RBAC on the target resource group.
+az role assignment create --assignee <appId> --role Contributor \
+  --scope /subscriptions/<subId>/resourceGroups/rg-todo-demo
+az role assignment create --assignee <appId> --role AcrPush \
+  --scope /subscriptions/<subId>/resourceGroups/rg-todo-demo/providers/Microsoft.ContainerRegistry/registries/<acrName>
+
+# 4. Set the GitHub variables/secrets (human, via gh CLI or the UI).
+gh variable set AZURE_CLIENT_ID --body <appId>
+gh variable set AZURE_TENANT_ID --body <tenantId>
+gh variable set AZURE_SUBSCRIPTION_ID --body <subId>
+gh secret set PGADMIN_PASSWORD    # prompts for value
+```
+
+Notes:
+- RBAC is scoped to the **resource group**, not the whole subscription
+  (least privilege). `Contributor` on the RG is the pragmatic demo choice; a
+  reviewer may tighten to specific resource-type roles.
+- If the RG is created by a `subscription`-scoped Bicep deploy, the SP also needs
+  `Contributor` at subscription scope OR the RG must be pre-created by the human
+  (recommended: pre-create the RG, keep the SP scoped to the RG).
+- **The agents must not run any command in this subsection.** They only author
+  and document it.
+
+### 11.7 Branch / PR workflow & branch protection
+
+- **Trunk = `main`.** It is the only deployable branch; CD (§11.5) triggers on
+  push to `main`.
+- **Feature work happens on branches off `main`**, named `pipeline/*` (this
+  cycle: `pipeline/todo-app-azure-cicd`) or `feature/*`.
+- **No direct pushes to `main`.** All changes land via **Pull Request**.
+- **Branch protection rules on `main`** (documented for a human/`gh` to apply —
+  configuring branch protection is a repo-admin action, not something agents
+  provision):
+  - Require a pull request before merging.
+  - Require the **CI workflow (§11.4) to pass** as a required status check.
+  - Require the branch to be up to date before merging.
+  - Dismiss stale approvals / require at least one review (the pipeline's own
+    review gate counts).
+  - Disallow force-pushes and deletion of `main`.
+  - **Squash merge** preferred (linear history).
+- **Single environment:** merges to `main` deploy straight to the one demo
+  environment. There is no staging/prod split this cycle (§8, §11.1). Adding a
+  GitHub `production` Environment with required reviewers is the natural next
+  step and is called out as a future enhancement.
+
+### 11.8 PROPOSE mode — what the devops agent may and may not do
+
+The `devops` subagent runs in **PROPOSE mode**:
+
+- **MAY:** author files under `infra/`, `.github/workflows/`, and
+  `azure-pipelines.yml`; run read-only `az`/`bicep` validation
+  (`az bicep build/lint`, `az ... show/list`, `az deployment ... what-if`);
+  document exact commands for humans.
+- **MUST NOT:** run any `az ... create/update/delete`, `az deployment ... create`,
+  `az containerapp update`, `az acr build/push`, or any provisioning; create or
+  modify Entra app registrations, federated credentials, RBAC role assignments,
+  or GitHub secrets/variables; push to `main`; alter this spec, CLAUDE.md, or
+  permission/config files.
+- Deployment happens only when a **human** (or the CD pipeline, once a human has
+  completed the §11.6 bootstrap) runs it. The pipelines the agent writes are the
+  automation; the agent itself never fires them.
+
+### 11.9 Cost-consciousness guidance for PROPOSE mode (SKU guardrails)
+
+This is a **demo**. The devops agent's proposed IaC/pipelines MUST default to the
+cheapest reasonable SKUs. Concretely:
+
+- **Azure Container Apps:** **Consumption** workload profile (the default
+  Consumption plan — pay-per-use, scale-to-zero). Do NOT propose a Dedicated
+  workload profile. Backend min replicas **0**; frontend min **1** (per §5.6).
+  0.25 vCPU / 0.5 GiB per replica.
+- **PostgreSQL Flexible Server:** **Burstable** tier, **`Standard_B1ms`**, smallest
+  storage (32 GiB), **no** high-availability, **no** read replicas, geo-redundant
+  backup **disabled** (locally-redundant, minimal retention). PostgreSQL 16.
+- **Azure Container Registry:** **Basic** SKU. No geo-replication, no Premium
+  features.
+- **Log Analytics:** pay-as-you-go, **30-day retention** (do not raise it),
+  daily cap optional. Reuse the single workspace for the ACA environment.
+- **No extra cost centers:** no NAT Gateway, no VNet/private endpoints, no
+  Application Gateway/WAF, no Front Door/CDN, no Key Vault, no Bastion — all
+  explicitly out of scope (§8) and each avoids monthly cost.
+- **Single region, single environment, single of everything** (one ACR, one ACA
+  env, one Postgres server).
+- If the devops agent believes a costlier SKU is genuinely required, it must NOT
+  silently choose it — it must call it out as an explicit note in `changes.md`
+  with the cost rationale for reviewer sign-off.
+
+Target: idle cost in the low single-digit USD/month, dominated by the Burstable
+Postgres server (the only always-on component).
+
+### 11.10 Azure DevOps equivalent (`azure-pipelines.yml`)
+
+A functional parity pipeline for teams on Azure DevOps, at the repo root:
+
+- **PR trigger** → the same CI stages as §11.4 (build/test backend, build
+  frontend, docker build, `bicep build`/lint).
+- **`main` trigger** → the same CD steps as §11.5.
+- **Auth:** an **Azure Resource Manager service connection using workload
+  identity federation** (the Azure DevOps analogue of OIDC — again, secretless;
+  created manually by a human, §11.6-style, never by an agent).
+- Uses `AzureCLI@2` tasks to run the identical `az`/`bicep` commands so the two
+  systems stay behavior-equivalent and neither becomes the sole source of truth.
+- GitHub Actions is the primary/default system (assumption §9.8); this file is
+  provided for portability and is not required to be actively wired unless the
+  project moves to Azure DevOps.
+
+### 11.11 Acceptance criteria for the devops stage
+
+The devops output is complete when:
+1. `infra/` contains valid Bicep (`az bicep build` + `lint` clean) producing all
+   §5.3 resources at the §11.9 SKUs, with secrets as `@secure()` params only.
+2. `.github/workflows/ci.yml` runs credential-free build/test/lint on PRs.
+3. `.github/workflows/cd.yml` deploys on merge to `main` via OIDC, honoring the
+   backend→frontend ordering and CORS reconciliation.
+4. `azure-pipelines.yml` provides equivalent CI+CD via a WIF service connection.
+5. `infra/README.md` + `changes.md` document the **manual one-time human**
+   identity/RBAC/branch-protection bootstrap (§11.6/§11.7) verbatim, clearly
+   labeled as human-run.
+6. No agent has provisioned anything, created any credential, or pushed to
+   `main` (PROPOSE mode, §11.8).
