@@ -203,3 +203,210 @@ None.
    run` once against real Postgres before production use. Unchanged from cycle 1.
 2. Frontend `npm audit` reports 2 dev-server-only advisories (esbuild/vite),
    correctly scoped out of the nginx-served production bundle. Fine to defer.
+
+---
+
+# CI/CD cycle review — CI/CD + Infrastructure-as-Code extension (specs §11)
+
+Reviewer: Review agent (read-only gate)
+Date: 2026-07-24
+Branch: `pipeline/todo-app-azure-cicd` (off `main`). Review cycle 1 of up to 3
+for the extended CI/CD + IaC scope.
+
+## VERDICT: APPROVED
+
+The delivery layer (Bicep IaC + GitHub Actions CI/CD + Azure Pipelines equivalent)
+is complete, correct, and independently verified against spec §11 and the four
+human-approved decisions. I read every Bicep module, both workflows, and
+`azure-pipelines.yml` in full rather than trusting `infra.md`/`infra-proposal.md`;
+the self-reports match the authored artifacts. No secrets are committed, no
+provisioning was performed by any agent, and exactly one CI/CD system
+auto-triggers. The known environment limitation (no git remote / no `gh` CLI, so
+no PR exists yet) is an environment constraint, not a deliverable defect, and per
+the review brief is noted rather than penalized.
+
+---
+
+## Compliance with the four human-approved decisions (all followed)
+
+1. **Postgres tier `Standard_B1ms` (not B2s).** `infra/modules/postgres.bicep`
+   line 29 defaults `skuName = 'Standard_B1ms'` with `tier: 'Burstable'`
+   (line 41); `main.parameters.json` does not override it. No `B2s`/`D`-series
+   anywhere (grep clean). Correct.
+2. **ACA Consumption, ACR Basic, frontend min 1, backend min 0/max 3.**
+   - ACA: `acaEnvironment.bicep` has no `workloadProfiles` block → default
+     Consumption (comment lines 30-31); no Dedicated. Correct.
+   - ACR: `registry.bicep` defaults `sku = 'Basic'`, `main.bicep` passes
+     `sku: 'Basic'`. Correct.
+   - Replicas: `main.parameters.json` sets `webMinReplicas=1/webMaxReplicas=2`
+     and `apiMinReplicas=0/apiMaxReplicas=3`, matching §5.6 / the approved table.
+     Correct.
+   - Sizing: `containerApp.bicep` invoked with `cpu:'0.25'`, `memory:'0.5Gi'`
+     for both apps. Correct.
+3. **Bicep is resource-group-scoped; human pre-creates the RG.**
+   `main.bicep` line 23 `targetScope = 'resourceGroup'`; no
+   `Microsoft.Resources/resourceGroups` resource exists. `infra/README.md`
+   Phase 1 step 1 documents `az group create` as a manual human action. Correct.
+4. **`AcrPull` role assignments are a manual bootstrap step, NOT in the CD Bicep.**
+   Grepping the entire `infra/*.bicep` tree for `roleAssignment` /
+   `Microsoft.Authorization/roleAssignments` returns only explanatory comments —
+   there is no role-assignment resource. `containerApp.bicep` enables the
+   system-assigned identity and wires ACR pull via `registries[].identity:
+   'system'` (lines 79-84) but does not create the grant. `infra/README.md`
+   Phase 3 places the `AcrPull` grants (and the CI SP's `AcrPush`) after the
+   first infra deploy, run by a human with User Access Administrator/Owner.
+   Correct — and this exactly resolves the `Contributor`-cannot-write-role-
+   assignments friction the PROPOSE-mode Open Q2 raised.
+
+## Secrets: none committed (verified)
+
+- `main.bicep` takes `postgresAdminPassword` as an `@secure()` param (lines
+  58-60); it is threaded into `postgres.bicep` (also `@secure()`) and into the
+  assembled connection string (line 118), which is surfaced only as the backend
+  Container Apps secret `todo-db-connection` → env `ConnectionStrings__TodoDb`.
+  It is never emitted as an output.
+- `main.parameters.json` contains only non-secret values and an explicit comment
+  that the password is supplied at deploy time; the password is absent.
+- `cd.yml` sources the password from `secrets.PGADMIN_PASSWORD`, scoped as a
+  step-level `env:` only on the Bicep-deploy step (lines 82-83). `azure-pipelines.yml`
+  references it as `$(PGADMIN_PASSWORD)` (documented as a secret pipeline
+  variable). OIDC client/tenant/subscription IDs are GitHub **variables**, not
+  secrets (no credential material) — matches §11.6.
+- A repo-wide grep for `Password=`/secret-like literals found only: the local
+  throwaway dev credential `todo` (in `.env.example`,
+  `appsettings.Development.json`, the design-time and test DbContext factories —
+  all documented local-dev values per §6.3), the spec's `<PWD>` placeholder, and
+  variable references (`$PGPWD`, `$PGADMIN_PASSWORD`). No production secret,
+  connection string, or key is committed. `git ls-files` shows no `.env`,
+  `.tfstate`, `.pem`/`.pfx`, or key material tracked.
+
+## No agent provisioning / credential creation (verified as far as possible)
+
+`infra.md` and `infra-proposal.md` both state that only read-only validation
+(`az bicep build`/`lint`, YAML parse) was run and nothing was provisioned. This
+is consistent with: no Azure credentials in the environment, no deployment/state
+artifacts on disk, no role-assignment resources in the Bicep, and the identity/
+RBAC/ACR-grant/GitHub-secret steps all living as human-run scripts in
+`infra/README.md`. PROPOSE→APPLY mode boundaries (§11.8) were respected — the
+agent authored files and documented commands but created no app registration,
+federated credential, role assignment, or GitHub secret/variable.
+
+## CD backend-then-frontend ordering (correctly encoded, not just claimed)
+
+`.github/workflows/cd.yml` sequences: (2) idempotent Bicep infra deploy → (3)
+`az acr build` backend `todo-api:<sha>` → (4) `az containerapp update` backend +
+read back its FQDN into `steps.api.outputs.fqdn` → (5) `az acr build` frontend
+with `--build-arg VITE_API_BASE_URL="https://${{ steps.api.outputs.fqdn }}"`
+(lines 109-116) → (6) update frontend → (7) reconcile backend CORS to the
+frontend FQDN. The backend FQDN is genuinely produced before and consumed by the
+frontend build — the §4.4/§5.7 build-time-bake constraint is honored, not merely
+asserted. `azure-pipelines.yml` encodes the identical order (lines 144-163).
+Within Bicep, `todo-web` is declared before `todo-api` so the backend's
+`Cors__AllowedOrigins__0` can reference `todoWeb.outputs.fqdn` (main.bicep lines
+120-172), resolving the CORS chicken-and-egg inside a single deploy.
+
+## CI is credential-free on PRs (verified)
+
+`.github/workflows/ci.yml` triggers on `pull_request` → `main` +
+`workflow_dispatch`, declares `permissions: contents: read` only, and contains
+**no** `azure/login`, OIDC token request, or secret reference. The `iac` job runs
+`az bicep install` + `az bicep build`/`lint`, none of which require Azure auth.
+Jobs run the real build/test commands (`dotnet restore/build/test` on
+`TodoApi.sln`; `npm ci` + `npm run build` + `npm test`; `docker build` of both
+images with a dummy `--build-arg`). Safe on fork PRs, per §11.4.
+
+## Exactly one system auto-triggers (verified)
+
+GitHub Actions is the auto-triggering system: `ci.yml` on PR, `cd.yml` on push to
+`main`. `azure-pipelines.yml` is `trigger: none` / `pr: none` (manual-only) with
+an inline comment explaining it is kept behavior-equivalent to avoid double-builds
+and racing two deploys onto the same Container App revision. So exactly one of
+{GitHub Actions, Azure Pipelines} fires automatically — neither both nor neither.
+
+## Flagged deviations from the §11.6 draft — all reasonable, none need re-architecture
+
+`infra/README.md` lists four deliberate differences from the specs §11.6 draft; I
+assessed each:
+1. **Adds `az group create rg-todo-demo`** — required because the Bicep is
+   RG-scoped (approved Open Q1). Consistent with the human decision.
+2. **Adds a federated credential for the `environment:production` subject** (and
+   optionally `pull_request`), not just `main` — this is technically *necessary*,
+   not merely reasonable: `cd.yml` runs its deploy job under
+   `environment: production`, so the GitHub OIDC token's `sub` claim becomes
+   `repo:<org>/<repo>:environment:production`. Without that federated-credential
+   subject, `azure/login` would fail. Good catch by devops. The `pull_request`
+   subject is correctly marked optional (only if what-if on PRs is later enabled).
+3. **Moves the ACR role grants to after the first infra deploy** — necessary
+   because ACR and the app managed identities do not exist until the template is
+   deployed once; the draft's ordering (granting `AcrPush` before ACR existed)
+   was not runnable. Correct.
+4. **Adds `AcrPull` grants for each app's managed identity as a manual step** —
+   the approved Open Q2 resolution; excluded from the repeatable CD Bicep because
+   the CD SP holds only `Contributor`.
+
+None of these contradict anything the human approved; two directly implement the
+approved Open Q1/Q2 resolutions, and the other two are technical necessities.
+They do not need to go back to the architect.
+
+## Other cross-checks
+
+- **Bicep validity:** `infra.md` reports `az bicep build` + `az bicep lint` clean
+  (Bicep 0.45.15). The templates read as valid — module wiring, `items()`-based
+  secret array, `existing` LA reference with inline `listKeys()` (so the shared
+  key is never a param/output), `@secure()` on the secrets object, and all
+  outputs (`acrLoginServer`, `todoApiFqdn`, `todoWebFqdn`, principalIds, etc.)
+  are consistent with what `cd.yml` consumes (`.acrName.value`,
+  `.acrLoginServer.value`). I could not re-run `az bicep build` here (no Azure
+  CLI/Bicep in this review environment), so I relied on source inspection plus
+  the reported validation; nothing in the source contradicts a clean build.
+- **Resource inventory** matches §5.3/§11.9: ACR Basic (admin user disabled),
+  Log Analytics PerGB2018 30-day, ACA Consumption env, Postgres B1ms/PG16/32 GiB/
+  no HA/LRS backup/public access + `0.0.0.0` firewall + required TLS, `tododb`,
+  and the two Container Apps with system-assigned identities and external ingress
+  on 8080. No Key Vault, VNet, private endpoint, NAT, or Dedicated profile.
+- **Security posture:** connection string uses `SslMode=Require;Trust Server
+  Certificate=true` — Npgsql accepts `SslMode` as an alias for `SSL Mode`, and
+  this matches the spec §5.4/§5.5 example verbatim (TLS required; cert trust is
+  the documented demo simplification). No injection/auth-bypass surface (auth
+  out of scope). ACR admin user is disabled in favor of managed-identity pull.
+- **PCI DSS:** not in scope — this is a no-auth Todo demo that processes no
+  payment or cardholder data. No PAN/CVV/track data is stored, logged, or handled
+  anywhere. No payment flow exists. Nothing to flag.
+
+## Blocking issues
+
+None.
+
+## Non-blocking suggestions (do not block approval)
+
+1. **Production Environment approval gate is not yet enforced.** `cd.yml` and
+   `azure-pipelines.yml` both target a `production` environment specifically so a
+   required-reviewer rule can be attached, but that rule is a GitHub/ADO
+   Environment setting a human must configure — currently the only pre-deploy
+   gate is branch protection + PR review (also not yet enforced; see #2). This
+   matches spec §11.7 (single-environment demo; approval gate called out as a
+   future enhancement), so it is not blocking, but a human should add required
+   reviewers on the `production` environment before this deploys anything real.
+2. **Branch protection on `main` is documented but not enforced** (no remote/`gh`
+   in this environment; `infra.md` and `infra/README.md` both disclose this). The
+   "human reviews the PR" gate is currently only a convention. A human must apply
+   the documented branch-protection rules (require PR + CI status check + ≥1
+   approval, no force-push/delete) once a GitHub remote exists. Environment
+   limitation, not a deliverable defect — noted, not penalized.
+3. **The new artifacts are authored on disk but not yet committed** (`git status`
+   shows `infra/`, `.github/`, `azure-pipelines.yml`, and the two new
+   `.pipeline/*.md` as untracked). They must be committed and pushed for CI/CD to
+   run — expected to happen when a remote/`gh` is available. Not a defect.
+4. **`Trust Server Certificate=true`** encrypts but skips server-cert
+   verification (MITM-susceptible). It matches the approved spec for the demo;
+   production should move to `SslMode=VerifyFull` with the Azure Postgres CA, as
+   the spec already notes under production hardening. Defer.
+
+## Which stage (if any) needs to redo work
+
+None. The CI/CD + IaC deliverable satisfies every §11 acceptance criterion
+(§11.11) and all four human-approved decisions. This cycle is APPROVED. The
+outstanding items (branch protection, production approval reviewers, committing/
+pushing the artifacts, first human bootstrap of the OIDC identity + ACR grants)
+are human one-time actions explicitly assigned to humans by spec §11.6/§11.7 and
+gated by the no-remote/no-`gh` environment limitation — not agent rework.
