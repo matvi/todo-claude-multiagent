@@ -1,10 +1,16 @@
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
   "contentVersion": "1.0.0.0",
-  "_comment": "Dev/demo NON-SECRET parameters only. postgresAdminPassword is @secure() and is supplied at deploy time from a GitHub Actions secret / Azure Pipelines secret variable (PGADMIN_PASSWORD) via -p postgresAdminPassword=... — NEVER committed here. Image tags default to a public placeholder and are overridden by CD with the real ACR image (todo-api:<sha> / todo-web:<sha>).",
+  "_comment": "Dev/demo NON-SECRET parameters only. postgresAdminPassword is @secure() and is supplied at deploy time from a GitHub Actions secret / Azure Pipelines secret variable (PGADMIN_PASSWORD) via -p postgresAdminPassword=... — NEVER committed here. Image tags default to a public placeholder and are overridden by CD with the real ACR image (todo-api:<sha> / todo-web:<sha>). postgresLocation/postgresServerName are pinned to where Postgres was actually bootstrapped (see infra/README.md and the bootstrap-deploy-fixes commit) — Postgres location and name are immutable after creation, so these must stay fixed for every future deploy (including CD) or it will conflict with the existing server.",
   "parameters": {
     "location": {
       "value": "eastus"
+    },
+    "postgresLocation": {
+      "value": "centralus"
+    },
+    "postgresServerName": {
+      "value": "pg-todo-demo-cus01"
     },
     "namePrefix": {
       "value": "todo-demo"

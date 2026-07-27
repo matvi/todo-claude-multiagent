@@ -25,6 +25,9 @@ targetScope = 'resourceGroup'
 @description('Azure region for all resources. Defaults to the RG location.')
 param location string = resourceGroup().location
 
+@description('Azure region for the Postgres Flexible Server specifically. Defaults to `location`, but can be overridden independently — some subscriptions have Postgres Flexible Server offer restrictions in certain regions (e.g. eastus) that do not affect the other resource types here. Cross-region access is fine since Postgres is reached over its public endpoint with required TLS, not a VNet.')
+param postgresLocation string = location
+
 @description('Base name token used in non-unique resource names.')
 param namePrefix string = 'todo-demo'
 
@@ -58,6 +61,9 @@ param todoWebImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 @description('PostgreSQL administrator password. Secure — supplied at deploy time from a GitHub/pipeline secret, never committed.')
 @secure()
 param postgresAdminPassword string
+
+@description('Container ingress target port. Defaults to 8080, matching the real app images (nginx/Kestrel per the Dockerfiles). Override to 80 only for a bootstrap deploy still using the mcr.microsoft.com/k8se/quickstart placeholder, which listens on 80 — otherwise the revision never passes its health probe and provisioning times out.')
+param containerTargetPort int = 8080
 
 @description('Backend (todo-api) minimum replicas.')
 param apiMinReplicas int = 0
@@ -106,7 +112,7 @@ module postgres 'modules/postgres.bicep' = {
   name: 'postgres'
   params: {
     name: postgresServerName
-    location: location
+    location: postgresLocation
     administratorLogin: postgresAdminUser
     administratorPassword: postgresAdminPassword
     databaseName: databaseName
@@ -117,6 +123,17 @@ module postgres 'modules/postgres.bicep' = {
 // secret on the backend. Built from the secure password param — never output.
 var todoDbConnectionString = 'Host=${postgres.outputs.fqdn};Port=5432;Database=${databaseName};Username=${postgresAdminUser};Password=${postgresAdminPassword};SslMode=Require;Trust Server Certificate=true'
 
+// Only wire an ACR registry credential when the image actually comes from
+// that ACR. On the bootstrap deploy both images default to a public MCR
+// placeholder — attaching an ACR `registries` entry with `identity: system`
+// for an image ACA never pulls from that registry still makes ACA try to
+// resolve the managed identity's AcrPull access during provisioning. That
+// role assignment is deliberately granted AFTER this deploy (Phase 3, using
+// its own outputs — see infra/README.md), so on a placeholder-image deploy
+// it doesn't exist yet, and the revision hangs until "Operation expired".
+var todoWebUsesAcr = startsWith(todoWebImage, registry.outputs.loginServer)
+var todoApiUsesAcr = startsWith(todoApiImage, registry.outputs.loginServer)
+
 // --- 6. Frontend Container App (todo-web) — deployed first so its FQDN is ---
 //        known when the backend's CORS allow-list is set below.
 module todoWeb 'modules/containerApp.bicep' = {
@@ -126,13 +143,13 @@ module todoWeb 'modules/containerApp.bicep' = {
     location: location
     environmentId: acaEnv.outputs.id
     image: todoWebImage
-    targetPort: 8080
+    targetPort: containerTargetPort
     externalIngress: true
     minReplicas: webMinReplicas
     maxReplicas: webMaxReplicas
     cpu: '0.25'
     memory: '0.5Gi'
-    registryServer: registry.outputs.loginServer
+    registryServer: todoWebUsesAcr ? registry.outputs.loginServer : ''
   }
 }
 
@@ -146,13 +163,13 @@ module todoApi 'modules/containerApp.bicep' = {
     location: location
     environmentId: acaEnv.outputs.id
     image: todoApiImage
-    targetPort: 8080
+    targetPort: containerTargetPort
     externalIngress: true
     minReplicas: apiMinReplicas
     maxReplicas: apiMaxReplicas
     cpu: '0.25'
     memory: '0.5Gi'
-    registryServer: registry.outputs.loginServer
+    registryServer: todoApiUsesAcr ? registry.outputs.loginServer : ''
     secrets: {
       'todo-db-connection': todoDbConnectionString
     }
