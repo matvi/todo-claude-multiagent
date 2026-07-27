@@ -69,14 +69,25 @@ jobs:
 
       # ------------------------------------------------------------------
       # 1. Backend FIRST — build + push, deploy, read back its FQDN.
+      #
+      #    NOTE: this uses `docker build` + `docker push` instead of the
+      #    simpler `az acr build`. `az acr build` runs as an ACR Tasks cloud
+      #    build, and ACR Tasks is paused on free-trial / free-credit
+      #    subscriptions (TasksOperationsNotAllowed). If/when this
+      #    subscription is upgraded to Pay-As-You-Go, ACR Tasks should work
+      #    normally again — at that point this can be simplified back to:
+      #      az acr build --registry <name> --image todo-api:<tag> \
+      #        --file backend/src/TodoApi/Dockerfile ./backend
       # ------------------------------------------------------------------
       - name: Build & push backend image (todo-api)
         run: |
-          az acr build \
-            --registry "${{ steps.infra.outputs.acr_name }}" \
-            --image "todo-api:${{ github.sha }}" \
-            --file backend/src/TodoApi/Dockerfile \
+          set -euo pipefail
+          az acr login --name "${{ steps.infra.outputs.acr_name }}"
+          docker build \
+            -f backend/src/TodoApi/Dockerfile \
+            -t "${{ steps.infra.outputs.acr_login_server }}/todo-api:${{ github.sha }}" \
             ./backend
+          docker push "${{ steps.infra.outputs.acr_login_server }}/todo-api:${{ github.sha }}"
 
       - name: Update backend Container App
         id: api
@@ -90,15 +101,21 @@ jobs:
 
       # ------------------------------------------------------------------
       # 2. Frontend SECOND — bake the backend FQDN at build time, then deploy.
+      #
+      #    Same `docker build`/`docker push` workaround as the backend step
+      #    above (ACR Tasks / `az acr build` is disallowed on this
+      #    subscription) — revert to `az acr build` once upgraded.
       # ------------------------------------------------------------------
       - name: Build & push frontend image (todo-web) with backend FQDN baked
         run: |
-          az acr build \
-            --registry "${{ steps.infra.outputs.acr_name }}" \
-            --image "todo-web:${{ github.sha }}" \
-            --file frontend/Dockerfile \
+          set -euo pipefail
+          az acr login --name "${{ steps.infra.outputs.acr_name }}"
+          docker build \
+            -f frontend/Dockerfile \
             --build-arg VITE_API_BASE_URL="https://${{ steps.api.outputs.fqdn }}" \
+            -t "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}" \
             ./frontend
+          docker push "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}"
 
       - name: Update frontend Container App
         id: web

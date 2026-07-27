@@ -128,18 +128,28 @@ stages:
                       fi
                       ACR_LOGIN=$(az acr show -n "$ACR_NAME" -g "$(resourceGroup)" --query loginServer -o tsv)
 
+                      # NOTE: uses `docker build`/`docker push` instead of the
+                      # simpler `az acr build`, because `az acr build` runs as
+                      # an ACR Tasks cloud build, and ACR Tasks is paused on
+                      # free-trial / free-credit subscriptions
+                      # (TasksOperationsNotAllowed). Revert to `az acr build`
+                      # once this subscription is upgraded to Pay-As-You-Go.
+                      az acr login --name "$ACR_NAME"
+
                       # 2. Backend FIRST: build/push, deploy, read FQDN.
-                      az acr build --registry "$ACR_NAME" --image "todo-api:$SHA" \
-                        --file backend/src/TodoApi/Dockerfile ./backend
+                      docker build -f backend/src/TodoApi/Dockerfile \
+                        -t "$ACR_LOGIN/todo-api:$SHA" ./backend
+                      docker push "$ACR_LOGIN/todo-api:$SHA"
                       az containerapp update -n todo-api -g "$(resourceGroup)" \
                         --image "$ACR_LOGIN/todo-api:$SHA"
                       API_FQDN=$(az containerapp show -n todo-api -g "$(resourceGroup)" \
                         --query "properties.configuration.ingress.fqdn" -o tsv)
 
                       # 3. Frontend SECOND: bake backend FQDN, deploy, read FQDN.
-                      az acr build --registry "$ACR_NAME" --image "todo-web:$SHA" \
-                        --file frontend/Dockerfile \
-                        --build-arg VITE_API_BASE_URL="https://$API_FQDN" ./frontend
+                      docker build -f frontend/Dockerfile \
+                        --build-arg VITE_API_BASE_URL="https://$API_FQDN" \
+                        -t "$ACR_LOGIN/todo-web:$SHA" ./frontend
+                      docker push "$ACR_LOGIN/todo-web:$SHA"
                       az containerapp update -n todo-web -g "$(resourceGroup)" \
                         --image "$ACR_LOGIN/todo-web:$SHA"
                       WEB_FQDN=$(az containerapp show -n todo-web -g "$(resourceGroup)" \
