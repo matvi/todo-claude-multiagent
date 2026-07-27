@@ -128,6 +128,17 @@ stages:
                       fi
                       ACR_LOGIN=$(az acr show -n "$ACR_NAME" -g "$(resourceGroup)" --query loginServer -o tsv)
 
+                      # 1b. Wire each app's system-assigned identity as its ACR
+                      # credential. The bootstrap Bicep deploy deliberately left
+                      # this unset (placeholder image, not ACR), and CD no
+                      # longer runs Bicep, so nothing else configures it.
+                      # Idempotent. Requires the AcrPull grant from Phase 3
+                      # (infra/README.md) to actually pull.
+                      az containerapp registry set -n todo-api -g "$(resourceGroup)" \
+                        --server "$ACR_LOGIN" --identity system
+                      az containerapp registry set -n todo-web -g "$(resourceGroup)" \
+                        --server "$ACR_LOGIN" --identity system
+
                       # NOTE: uses `docker build`/`docker push` instead of the
                       # simpler `az acr build`, because `az acr build` runs as
                       # an ACR Tasks cloud build, and ACR Tasks is paused on
