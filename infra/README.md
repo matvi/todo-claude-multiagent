@@ -23,13 +23,21 @@ Postgres **Standard_B1ms** · ACA **Consumption** · ACR **Basic** ·
 ## Image / ordering model
 
 `main.bicep`'s `todoApiImage` / `todoWebImage` default to a **public placeholder**
-(`mcr.microsoft.com/k8se/quickstart:latest`) so the first deploy succeeds before
-any app image exists in ACR. The CD pipeline then builds the real images and rolls
-the apps imperatively, honoring the backend-before-frontend ordering (the frontend
-bakes `VITE_API_BASE_URL=<backend FQDN>` at build time). This is approach **(a)**
-from specs §11.5 (run Bicep once for infra, then imperative image updates). The CD
-pipeline reads the currently-running images and passes them back into the infra
-deploy so re-running Bicep never resets the apps to the placeholder.
+(`mcr.microsoft.com/k8se/quickstart:latest`) so the one-time bootstrap deploy
+(Phase 2 below) succeeds before any app image exists in ACR.
+
+**CD does not deploy Bicep at all.** Infra is provisioned once, by hand (Phases
+1–3 below), and only re-applied manually — via `az deployment group create`, see
+"Deploy the infra yourself" below — if the infra itself actually changes (a SKU,
+a scale setting, a new resource). Every `cd.yml` / `azure-pipelines.yml` run just
+looks up the already-existing ACR (`az acr list -g rg-todo-demo`), builds the real
+images, and imperatively updates the two Container Apps in place, honoring the
+backend-before-frontend ordering (the frontend bakes `VITE_API_BASE_URL=<backend
+FQDN>` at build time). This is approach **(a)** from specs §11.5, minus the
+Bicep-on-every-deploy part — running the same infra deploy on every merge added no
+value once the apps exist, and it was also the thing that made the bootstrap
+deploy fragile (see the "bootstrap deploy fixes" and "OIDC immutable subject
+claims" commits for what that fragility actually looked like in practice).
 
 ---
 

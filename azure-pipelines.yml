@@ -17,9 +17,6 @@ variables:
   azureServiceConnection: 'todo-demo-arm'
   resourceGroup: 'rg-todo-demo'
   location: 'eastus'
-  placeholderImage: 'mcr.microsoft.com/k8se/quickstart:latest'
-  # PGADMIN_PASSWORD must be defined as a SECRET pipeline variable / variable group
-  # value (never committed). Referenced as $(PGADMIN_PASSWORD).
 
 stages:
   # ======================= CI (build / test / lint) =======================
@@ -101,7 +98,7 @@ stages:
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
     jobs:
       - deployment: deploy
-        displayName: Deploy infra + images
+        displayName: Build & deploy images
         pool:
           vmImage: ubuntu-latest
         # The `production` environment mirrors the GitHub Environment and is
@@ -113,7 +110,7 @@ stages:
               steps:
                 - checkout: self
                 - task: AzureCLI@2
-                  displayName: Deploy Bicep + build/push images + update apps
+                  displayName: Build/push images + update apps (infra deployed manually — see infra/README.md)
                   inputs:
                     azureSubscription: $(azureServiceConnection)
                     scriptType: bash
@@ -122,26 +119,16 @@ stages:
                       set -euo pipefail
                       SHA="$(Build.SourceVersion)"
 
-                      # 1. Read current images so the infra deploy doesn't reset apps.
-                      API_IMAGE=$(az containerapp show -n todo-api -g "$(resourceGroup)" \
-                        --query "properties.template.containers[0].image" -o tsv 2>/dev/null || echo "$(placeholderImage)")
-                      WEB_IMAGE=$(az containerapp show -n todo-web -g "$(resourceGroup)" \
-                        --query "properties.template.containers[0].image" -o tsv 2>/dev/null || echo "$(placeholderImage)")
+                      # 1. Look up the already-provisioned ACR (infra is deployed
+                      #    manually, once — see infra/README.md).
+                      ACR_NAME=$(az acr list -g "$(resourceGroup)" --query "[0].name" -o tsv)
+                      if [ -z "$ACR_NAME" ]; then
+                        echo "##vso[task.logissue type=error]No ACR found in $(resourceGroup). Run the one-time infra deploy first (infra/README.md)."
+                        exit 1
+                      fi
+                      ACR_LOGIN=$(az acr show -n "$ACR_NAME" -g "$(resourceGroup)" --query loginServer -o tsv)
 
-                      # 2. Infra (idempotent). Postgres password from a SECRET variable.
-                      OUT=$(az deployment group create \
-                        --resource-group "$(resourceGroup)" \
-                        --template-file infra/main.bicep \
-                        --parameters infra/main.parameters.json \
-                        --parameters \
-                          postgresAdminPassword="$(PGADMIN_PASSWORD)" \
-                          todoApiImage="$API_IMAGE" \
-                          todoWebImage="$WEB_IMAGE" \
-                        --query properties.outputs -o json)
-                      ACR_NAME=$(echo "$OUT" | jq -r '.acrName.value')
-                      ACR_LOGIN=$(echo "$OUT" | jq -r '.acrLoginServer.value')
-
-                      # 3. Backend FIRST: build/push, deploy, read FQDN.
+                      # 2. Backend FIRST: build/push, deploy, read FQDN.
                       az acr build --registry "$ACR_NAME" --image "todo-api:$SHA" \
                         --file backend/src/TodoApi/Dockerfile ./backend
                       az containerapp update -n todo-api -g "$(resourceGroup)" \
@@ -149,7 +136,7 @@ stages:
                       API_FQDN=$(az containerapp show -n todo-api -g "$(resourceGroup)" \
                         --query "properties.configuration.ingress.fqdn" -o tsv)
 
-                      # 4. Frontend SECOND: bake backend FQDN, deploy, read FQDN.
+                      # 3. Frontend SECOND: bake backend FQDN, deploy, read FQDN.
                       az acr build --registry "$ACR_NAME" --image "todo-web:$SHA" \
                         --file frontend/Dockerfile \
                         --build-arg VITE_API_BASE_URL="https://$API_FQDN" ./frontend
@@ -158,7 +145,7 @@ stages:
                       WEB_FQDN=$(az containerapp show -n todo-web -g "$(resourceGroup)" \
                         --query "properties.configuration.ingress.fqdn" -o tsv)
 
-                      # 5. Reconcile backend CORS to the frontend origin.
+                      # 4. Reconcile backend CORS to the frontend origin.
                       az containerapp update -n todo-api -g "$(resourceGroup)" \
                         --set-env-vars "Cors__AllowedOrigins__0=https://$WEB_FQDN"
 
