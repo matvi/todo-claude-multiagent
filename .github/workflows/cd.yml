@@ -68,6 +68,23 @@ jobs:
           echo "acr_login_server=$ACR_LOGIN_SERVER" >> "$GITHUB_OUTPUT"
 
       # ------------------------------------------------------------------
+      # 0b. Wire each app's system-assigned identity as its ACR credential.
+      #     The bootstrap Bicep deploy deliberately left this unset (it used
+      #     the public placeholder image, not ACR — see infra/main.bicep's
+      #     todoApiUsesAcr/todoWebUsesAcr), and CD no longer runs Bicep at
+      #     all, so nothing else ever configures it. Idempotent — safe to
+      #     run on every deploy. Requires the AcrPull grant from the
+      #     Phase 3 manual bootstrap (infra/README.md) to actually pull.
+      # ------------------------------------------------------------------
+      - name: Configure Container Apps to pull from ACR via managed identity
+        run: |
+          set -euo pipefail
+          az containerapp registry set -n todo-api -g "$RESOURCE_GROUP" \
+            --server "${{ steps.infra.outputs.acr_login_server }}" --identity system
+          az containerapp registry set -n todo-web -g "$RESOURCE_GROUP" \
+            --server "${{ steps.infra.outputs.acr_login_server }}" --identity system
+
+      # ------------------------------------------------------------------
       # 1. Backend FIRST — build + push, deploy, read back its FQDN.
       #
       #    NOTE: this uses `docker build` + `docker push` instead of the
