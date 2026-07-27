@@ -47,6 +47,13 @@ deploy so re-running Bicep never resets the apps to the placeholder.
 > 4. adds the `AcrPull` grants for each Container App's system-assigned managed
 >    identity — these are excluded from the repeatable CD Bicep on purpose (the
 >    CD service principal only holds `Contributor` and cannot write role assignments).
+> 5. uses GitHub's **immutable OIDC subject claim** format
+>    (`repo:<owner>@<ownerId>/<repo>@<repoId>:...`), not the legacy name-only
+>    format (`repo:<owner>/<repo>:...`). GitHub switched new repositories to
+>    the immutable format by default; a federated credential created with the
+>    legacy format will fail Azure login with `AADSTS700213: No matching
+>    federated identity record found`, because Azure matches the subject as an
+>    exact string. See step 3 below for how to get the numeric IDs.
 
 Set these shell variables once:
 
@@ -69,25 +76,36 @@ APP_ID=$(az ad app create --display-name "gh-todo-demo-cicd" --query appId -o ts
 az ad sp create --id "$APP_ID"
 
 # 3. Federated credentials — one subject per trust context. No client secret.
+#    GitHub's newer repos use the IMMUTABLE subject format, which embeds the
+#    numeric owner/repo IDs: repo:<owner>@<ownerId>/<repo>@<repoId>:...
+#    Get those IDs (needs `gh` with repo read access, or use the GitHub API/UI):
+OWNER_ID=$(gh api "users/$(echo "$GH_ORG_REPO" | cut -d/ -f1)" --jq .id)
+REPO_ID=$(gh api "repos/$GH_ORG_REPO" --jq .id)
+GH_SUBJECT_REPO="$(echo "$GH_ORG_REPO" | cut -d/ -f1)@${OWNER_ID}/$(echo "$GH_ORG_REPO" | cut -d/ -f2)@${REPO_ID}"
+# If unsure whether your repo is on the legacy or immutable format, the fastest
+# check is to just trigger cd.yml once — a subject mismatch fails fast at the
+# azure/login step and the error message includes the EXACT subject GitHub
+# presented, which you can paste directly into the federated-credential below.
+
 #    (a) deploys from main
 az ad app federated-credential create --id "$APP_ID" --parameters '{
   "name": "gh-todo-demo-main",
   "issuer": "https://token.actions.githubusercontent.com",
-  "subject": "repo:'"$GH_ORG_REPO"':ref:refs/heads/main",
+  "subject": "repo:'"$GH_SUBJECT_REPO"':ref:refs/heads/main",
   "audiences": ["api://AzureADTokenExchange"]
 }'
 #    (b) the `production` GitHub Environment used by cd.yml
 az ad app federated-credential create --id "$APP_ID" --parameters '{
   "name": "gh-todo-demo-env-production",
   "issuer": "https://token.actions.githubusercontent.com",
-  "subject": "repo:'"$GH_ORG_REPO"':environment:production",
+  "subject": "repo:'"$GH_SUBJECT_REPO"':environment:production",
   "audiences": ["api://AzureADTokenExchange"]
 }'
 #    (c) OPTIONAL — only if you later enable what-if on PRs in ci.yml
 az ad app federated-credential create --id "$APP_ID" --parameters '{
   "name": "gh-todo-demo-pr",
   "issuer": "https://token.actions.githubusercontent.com",
-  "subject": "repo:'"$GH_ORG_REPO"':pull_request",
+  "subject": "repo:'"$GH_SUBJECT_REPO"':pull_request",
   "audiences": ["api://AzureADTokenExchange"]
 }'
 
