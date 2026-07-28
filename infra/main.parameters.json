@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
   "contentVersion": "1.0.0.0",
-  "_comment": "Dev/demo NON-SECRET parameters only. postgresAdminPassword is @secure() and is supplied at deploy time from a GitHub Actions secret / Azure Pipelines secret variable (PGADMIN_PASSWORD) via -p postgresAdminPassword=... — NEVER committed here. Image tags default to a public placeholder and are overridden by CD with the real ACR image (todo-api:<sha> / todo-web:<sha>). postgresLocation/postgresServerName are pinned to where Postgres was actually bootstrapped (see infra/README.md and the bootstrap-deploy-fixes commit) — Postgres location and name are immutable after creation, so these must stay fixed for every future deploy (including CD) or it will conflict with the existing server.",
+  "_comment": "Dev/demo NON-SECRET parameters only. postgresAdminPassword is @secure() and is supplied at deploy time from a GitHub Actions secret / Azure Pipelines secret variable (PGADMIN_PASSWORD) via -p postgresAdminPassword=... — NEVER committed here. Image tags default to a public placeholder and are overridden by CD with the real ACR image (todo-api:<sha> / todo-web:<sha>). postgresLocation/postgresServerName are pinned to where Postgres was actually bootstrapped (see infra/README.md and the bootstrap-deploy-fixes commit) — Postgres location and name are immutable after creation, so these must stay fixed for every future deploy (including CD) or it will conflict with the existing server. The postgresEntraAdmin* values are NON-SECRET identity metadata (an object ID and a UPN are not credentials, so they belong here) approved by the user in chat 2026-07-28; they set the Postgres Microsoft Entra administrator for managed-identity DB auth (§13.4).",
   "parameters": {
     "location": {
       "value": "eastus"
@@ -17,6 +17,18 @@
     },
     "postgresAdminUser": {
       "value": "todoadmin"
+    },
+    "postgresEntraAdminObjectId": {
+      "value": "ee31140f-3164-439c-8fa9-9f7e5dbd1b2c"
+    },
+    "postgresEntraAdminPrincipalName": {
+      "value": "ing.david.mata.az_outlook.com#EXT#@ingdavidmataazoutlook.onmicrosoft.com"
+    },
+    "postgresEntraAdminPrincipalType": {
+      "value": "User"
+    },
+    "postgresEntraAdminTenantId": {
+      "value": "6ce2ff72-209a-447d-bf53-9579c52c03f5"
     },
     "databaseName": {
       "value": "tododb"

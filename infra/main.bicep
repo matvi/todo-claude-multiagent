@@ -43,11 +43,36 @@ param postgresServerName string = toLower('pg-todo-demo-${uniqueSuffix}')
 @description('Log Analytics workspace name.')
 param logAnalyticsName string = 'log-${namePrefix}'
 
+@description('Application Insights component name (workspace-based, reuses log-todo-demo).')
+param appInsightsName string = 'appi-${namePrefix}'
+
 @description('Container Apps managed environment name.')
 param acaEnvironmentName string = 'cae-${namePrefix}'
 
 @description('PostgreSQL administrator login.')
 param postgresAdminUser string = 'todoadmin'
+
+// --- Postgres Microsoft Entra administrator (dual-auth, §13.4) --------------
+// Non-secret identity metadata (an object ID and a UPN are not credentials).
+// Supplied via main.parameters.json with the values approved by the user in
+// chat on 2026-07-28. This identity is the Entra admin that runs the in-DB
+// pgaadauth_create_principal bootstrap (infra/README.md Phase 4).
+@description('Object ID of the Postgres Entra administrator (user or group).')
+param postgresEntraAdminObjectId string
+
+@description('Principal name of the Postgres Entra administrator (UPN for a user).')
+param postgresEntraAdminPrincipalName string
+
+@description('Postgres Entra administrator principal type.')
+@allowed([
+  'User'
+  'Group'
+  'ServicePrincipal'
+])
+param postgresEntraAdminPrincipalType string = 'User'
+
+@description('Tenant ID hosting the Postgres Entra administrator.')
+param postgresEntraAdminTenantId string
 
 @description('Logical database name.')
 param databaseName string = 'tododb'
@@ -97,6 +122,19 @@ module logAnalytics 'modules/loganalytics.bicep' = {
   }
 }
 
+// --- 2b. Application Insights (workspace-based; reuses log-todo-demo) -------
+//        NEW this cycle (§12.6). No second Log Analytics workspace. Local auth
+//        disabled — ingestion requires the todo-api MI + "Monitoring Metrics
+//        Publisher" (manual grant, infra/README.md Phase 4).
+module appinsights 'modules/appinsights.bicep' = {
+  name: 'appinsights'
+  params: {
+    name: appInsightsName
+    location: location
+    workspaceResourceId: logAnalytics.outputs.id
+  }
+}
+
 // --- 3. Container Apps managed environment (Consumption) --------------------
 module acaEnv 'modules/acaEnvironment.bicep' = {
   name: 'acaEnvironment'
@@ -116,12 +154,23 @@ module postgres 'modules/postgres.bicep' = {
     administratorLogin: postgresAdminUser
     administratorPassword: postgresAdminPassword
     databaseName: databaseName
+    entraAdminObjectId: postgresEntraAdminObjectId
+    entraAdminPrincipalName: postgresEntraAdminPrincipalName
+    entraAdminPrincipalType: postgresEntraAdminPrincipalType
+    entraAdminTenantId: postgresEntraAdminTenantId
   }
 }
 
-// Assembled Postgres connection string, surfaced only as a Container Apps
-// secret on the backend. Built from the secure password param — never output.
-var todoDbConnectionString = 'Host=${postgres.outputs.fqdn};Port=5432;Database=${databaseName};Username=${postgresAdminUser};Password=${postgresAdminPassword};SslMode=Require;Trust Server Certificate=true'
+// The todo-api Container App name is also its system-assigned managed identity's
+// name — i.e. the Postgres role created by pgaadauth_create_principal (Phase 4)
+// and the Username= in the passwordless connection string below MUST match it.
+var todoApiName = 'todo-api'
+
+// PASSWORDLESS, NON-SECRET connection string (§13.4). No Password= — todo-api
+// authenticates with an Entra token from its managed identity at runtime. Because
+// it holds no credential it is delivered as a PLAIN env var (not a Container Apps
+// secret, not Key Vault). Username = the MI's Postgres role name (= todoApiName).
+var todoDbConnectionString = 'Host=${postgres.outputs.fqdn};Port=5432;Database=${databaseName};Username=${todoApiName};Ssl Mode=Require;Trust Server Certificate=true'
 
 // Only wire an ACR registry credential when the image actually comes from
 // that ACR. On the bootstrap deploy both images default to a public MCR
@@ -154,12 +203,17 @@ module todoWeb 'modules/containerApp.bicep' = {
 }
 
 // --- 5. Backend Container App (todo-api) -----------------------------------
-//        DB connection string as a secret -> env ConnectionStrings__TodoDb.
+//        Managed-identity-first (§13): ZERO Container Apps secrets. All three
+//        config values below are NON-SECRET plain env vars:
+//          - ConnectionStrings__TodoDb: passwordless (Entra-token auth at runtime)
+//          - Postgres__UseEntraAuth=true: backend takes its Entra-token DB path
+//          - APPLICATIONINSIGHTS_CONNECTION_STRING: non-secret (local auth disabled)
+//        The old `todo-db-connection` secret is intentionally DROPPED.
 //        CORS allow-list origin 0 = the frontend FQDN from todoWeb above.
 module todoApi 'modules/containerApp.bicep' = {
   name: 'todoApi'
   params: {
-    name: 'todo-api'
+    name: todoApiName
     location: location
     environmentId: acaEnv.outputs.id
     image: todoApiImage
@@ -170,19 +224,22 @@ module todoApi 'modules/containerApp.bicep' = {
     cpu: '0.25'
     memory: '0.5Gi'
     registryServer: todoApiUsesAcr ? registry.outputs.loginServer : ''
-    secrets: {
-      'todo-db-connection': todoDbConnectionString
-    }
-    secretEnvVars: [
-      {
-        name: 'ConnectionStrings__TodoDb'
-        secretRef: 'todo-db-connection'
-      }
-    ]
     envVars: [
       {
         name: 'Cors__AllowedOrigins__0'
         value: 'https://${todoWeb.outputs.fqdn}'
+      }
+      {
+        name: 'ConnectionStrings__TodoDb'
+        value: todoDbConnectionString
+      }
+      {
+        name: 'Postgres__UseEntraAuth'
+        value: 'true'
+      }
+      {
+        name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
+        value: appinsights.outputs.connectionString
       }
     ]
   }
@@ -199,3 +256,7 @@ output todoWebName string = todoWeb.outputs.name
 output todoApiPrincipalId string = todoApi.outputs.principalId
 output todoWebPrincipalId string = todoWeb.outputs.principalId
 output postgresServerName string = postgres.outputs.serverName
+// App Insights identifiers — used by the Phase 4 manual "Monitoring Metrics
+// Publisher" role grant (needs the component's resource id as the scope).
+output appInsightsName string = appinsights.outputs.name
+output appInsightsId string = appinsights.outputs.id

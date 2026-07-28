@@ -12,6 +12,9 @@ param location string
 @maxValue(730)
 param retentionInDays int = 30
 
+@description('Daily ingestion cap in GB — a hard cost circuit-breaker (approved by user in chat 2026-07-28, OVERRIDING the proposal §3e "no cap" default). Once the cap is hit on a given UTC day, further ingestion (including App Insights telemetry) is SILENTLY DROPPED until the next day. This is the accepted tradeoff for a guaranteed cost ceiling against unexpected charges. Set to -1 to disable the cap.')
+param dailyQuotaGb int = 1
+
 resource law 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: name
   location: location
@@ -20,6 +23,11 @@ resource law 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
       name: 'PerGB2018'
     }
     retentionInDays: retentionInDays
+    // Hard daily ingestion ceiling (cost circuit-breaker). Telemetry is dropped
+    // for the rest of the UTC day once this is exceeded — accepted tradeoff.
+    workspaceCapping: {
+      dailyQuotaGb: dailyQuotaGb
+    }
     features: {
       searchVersion: 1
     }
