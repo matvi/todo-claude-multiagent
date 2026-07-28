@@ -160,3 +160,24 @@ Dominated by the always-on Burstable Postgres. Region/usage-dependent, not a quo
 | `todo-web` (min 1) | ~$4–12 (one always-on 0.25 vCPU replica) |
 | Postgres B1ms + 32 GiB | ~$16–18 |
 | **Total** | **~$25–37 / month** (idle floor ~$21–25) |
+
+## Live cutover status — 2026-07-28 (IMPORTANT: do not assume Entra auth is active)
+
+Phases A–C of the App Insights + managed-identity Postgres cutover (`infra/README.md`
+Phase 4) were executed live and are genuinely in place: Postgres has Entra auth +
+admin enabled, `todo-api`'s database role is created and granted, the
+`appi-todo-demo` Application Insights component exists, and `Monitoring Metrics
+Publisher` is granted.
+
+**Phase D (flipping `todo-api` to Entra-token Postgres auth) was attempted, hit a
+real code bug, and was rolled back.** The backend's `TodoDbContextRegistration.cs`
+periodic-password-provider path did not supply a password on the very first
+connection, breaking the startup DB migration and every DB-backed endpoint. `todo-api`
+is currently running on the **original password-based** `todo-db-connection` secret
+(`Postgres__UseEntraAuth=false`), which is fully healthy. `APPLICATIONINSIGHTS_CONNECTION_STRING`
+remains set and tracing is live and unaffected by this rollback.
+
+Full root-cause writeup and the exact rollback commands are in
+`.pipeline/deployment-lessons-learned.md` §5a. **Do not re-attempt the env-var flip to
+`Postgres__UseEntraAuth=true` until that code path has a real fix and has been
+verified against this live server** — steps A–C do not need to be redone.
