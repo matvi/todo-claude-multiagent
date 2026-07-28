@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using TodoApi.Data;
+using TodoApi.Observability;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -8,16 +9,13 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-var connectionString = builder.Configuration.GetConnectionString("TodoDb");
-if (string.IsNullOrWhiteSpace(connectionString))
-{
-    throw new InvalidOperationException(
-        "Connection string 'TodoDb' is not configured. Set ConnectionStrings:TodoDb " +
-        "(or the ConnectionStrings__TodoDb environment variable).");
-}
+// Distributed tracing → Application Insights (OpenTelemetry). No-ops cleanly when
+// APPLICATIONINSIGHTS_CONNECTION_STRING is unset (local dev / CI). See specs §12/§13.5.
+builder.Services.AddTodoTelemetry(builder.Configuration);
 
-builder.Services.AddDbContext<TodoDbContext>(options =>
-    options.UseNpgsql(connectionString));
+// PostgreSQL DbContext. Uses password auth by default; managed-identity (Entra) auth
+// when Postgres__UseEntraAuth=true (Azure). See specs §13.4.
+builder.Services.AddTodoDbContext(builder.Configuration);
 
 // CORS: restrict to the configured frontend origin(s).
 const string CorsPolicyName = "frontend";

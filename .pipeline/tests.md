@@ -532,3 +532,234 @@ empty) and **no `gh` CLI installed**. As a result:
   an environment that has them) can push `pipeline/todo-app-azure-cicd` and
   open the PR against `main` using `.pipeline/specs.md`'s overview and
   `.pipeline/changes.md`'s summary as the PR body.
+
+---
+
+# Observability + Identity Policy cycle (2026-07-28) — verification of specs.md §12/§13
+
+Branch: `pipeline/appinsights-tracing` (off `main`). Cycle 1 of up to 3 for this
+feature. Backend-only scope (distributed tracing + managed-identity Postgres
+auth); no frontend/Bicep/pipeline-YAML changes to verify this cycle.
+
+## Verdict: PASS
+
+## What was independently verified (code read, not just changes.md trusted)
+
+Read in full: `.pipeline/specs.md` §12 (Observability / Distributed Tracing) and
+§13 (Identity & Secrets Policy), and the actual implementation:
+
+- `backend/src/TodoApi/Observability/TelemetryRegistration.cs`
+- `backend/src/TodoApi/Data/TodoDbContextRegistration.cs`
+- `backend/src/TodoApi/Program.cs`
+- `backend/src/TodoApi/TodoApi.csproj`
+- `backend/src/TodoApi/appsettings.json` / `appsettings.Development.json`
+- `backend/src/TodoApi/Data/TodoDbContextFactory.cs` (confirmed correctly left
+  untouched — design-time only, never used at Azure runtime)
+
+Findings, matched against the spec:
+
+1. **§12 tracing wiring is real, not just declared.** `AddTodoTelemetry`
+   registers OpenTelemetry tracing **unconditionally** (ASP.NET Core +
+   HttpClient instrumentation when no AI connection string; the Azure Monitor
+   distro's own instrumentation when a connection string is present), and
+   **always** adds `AddNpgsql()` exactly once regardless of branch, satisfying
+   "one correlated trace across request + HttpClient + DB calls" (§12.2) and
+   the "no-op cleanly when unset" requirement (§12.5) — confirmed both by
+   reading the code and by the new tests below, which prove it produces real
+   `Activity`/`traceId` data, not merely that registration doesn't throw.
+2. **Deviation from the literal §12.3 snippet is intentional and documented**
+   in `changes.md`: `UseAzureMonitor()` is called only when
+   `APPLICATIONINSIGHTS_CONNECTION_STRING` is present, rather than
+   unconditionally. This is a legitimate, spec-compatible refinement — §12.5
+   explicitly requires "no-op cleanly... does not throw" when unset, and
+   §13.5 requires the managed-identity credential to never be constructed
+   locally. Verified: `DefaultAzureCredential` is only `new`'d inside the
+   `appInsightsConfigured` branch.
+3. **§12.4 (coexist with console logging, automatic `TraceId`/`SpanId`
+   correlation, no manual enrichment)** — confirmed empirically (not just by
+   reading code): ASP.NET Core's default logging config already stamps
+   `TraceId`/`SpanId` onto `Activity.Current` for every `ILogger` call once an
+   `ActivitySource` listener exists (added by `AddAspNetCoreInstrumentation`);
+   no Serilog or custom enricher was introduced, matching the spec's
+   "keep it simple" principle. Proven end-to-end by the new
+   `Request_ProducesValidTraceId_AndCorrelatesLogRecordToSameTrace` test.
+4. **§13.4 (Postgres managed-identity path)** — `TodoDbContextRegistration`
+   correctly branches on `Postgres:UseEntraAuth`: false/unset uses the
+   original `UseNpgsql(connectionString)` password path unchanged (regression
+   confirmed by tests); true builds an `NpgsqlDataSource` via
+   `NpgsqlDataSourceBuilder.UsePeriodicPasswordProvider` (not a one-shot
+   fetch, per spec) using `DefaultAzureCredential` and the exact token scope
+   `https://ossrdbms-aad.database.windows.net/.default` specified in §13.4.
+   Registered as a DI singleton (correct — shared pool/token cache, disposed
+   by the container).
+5. **§13.5 (App Insights Entra auth, connection string demoted to non-secret
+   config)** — `options.Credential = new DefaultAzureCredential()` is only set
+   inside the `appInsightsConfigured` branch (never invoked locally); the
+   connection string is read only from the flat env var
+   `APPLICATIONINSIGHTS_CONNECTION_STRING` (confirmed: absent from
+   `appsettings*.json`, no `__` section syntax, matching §12.5's explicit
+   note). §13.5 permits `DefaultAzureCredential` as an alternative to
+   `ManagedIdentityCredential`; the engineer's stated rationale (avoids a
+   CS0618 obsolete-constructor warning, keeps the build 0-warning) checks out
+   against the build result below.
+6. **§13.3 zero-app-secret claim** — confirmed no Container Apps secret name,
+   no Key Vault reference, and no hardcoded credential appears anywhere in the
+   backend source; the only committed password is the throwaway local Docker
+   value in `appsettings.Development.json` (spec-sanctioned, §6.3).
+7. **`Postgres:UseEntraAuth: false` default** is explicit in
+   `appsettings.json`, so local dev / CI is unaffected unless the env var
+   `Postgres__UseEntraAuth=true` is set — confirmed this is exactly the flag
+   the existing `TodoApiFactory` test host leaves unset, i.e. all 29
+   pre-existing tests exercise the **unchanged password branch**, not a new
+   code path (see below — this was verified, not assumed).
+
+No application source files were modified by this test pass — only test files
+and this report, per the tester agent's mandate.
+
+## Independent build + existing-suite re-run
+
+```
+cd backend
+export PATH="/c/Users/ingda/dotnet10:$PATH"   # .NET SDK 10.0.302
+dotnet build TodoApi.sln -c Release
+dotnet test  TodoApi.sln -c Release
+```
+
+- **Clean build (removed `bin/`/`obj/` first, restored from scratch):
+  succeeded, 0 Warning(s), 0 Error(s).** Matches the engineer's claim, verified
+  independently rather than trusted.
+- **Pre-existing 29 tests: still 29/29 passing**, confirmed run in isolation
+  before any new test files were added, and again after. `TodoApiFactory`
+  (`backend/tests/TodoApi.Tests/TodoApiFactory.cs`) does not set
+  `Postgres:UseEntraAuth` or `APPLICATIONINSIGHTS_CONNECTION_STRING`, so these
+  29 tests exercise exactly the pre-existing password-auth /
+  no-telemetry-exporter code paths — confirmed by direct code reading, not
+  assumed. **No regression**: the refactor of the inline `AddDbContext` call
+  in `Program.cs` into `TodoDbContextRegistration.AddTodoDbContext` preserves
+  identical behavior for the default configuration.
+
+## New tests added this cycle (all backend, `backend/tests/TodoApi.Tests/`)
+
+**Total suite after this cycle: 44/44 passing** (29 pre-existing + 15 new),
+stable across 4 repeated full-suite runs (no flakiness).
+
+### `ObservabilityTests.cs` (5 tests) — in-process trace/log correlation, §12.8
+
+Uses a dedicated `ObservabilityTestFactory : WebApplicationFactory<Program>`
+that (a) swaps the DbContext to EF Core InMemory (same technique as the
+existing `TodoApiFactory`, no real Postgres needed), (b) hooks a small custom
+`BaseProcessor<Activity>` into the app's **own** `TracerProviderBuilder` via
+`IServiceCollection.ConfigureOpenTelemetryTracerProvider` (the same
+accumulation mechanism `TelemetryRegistration` itself relies on to add Npgsql
+instrumentation on top of ASP.NET Core/HttpClient instrumentation — so this is
+a real test of the app's own wiring, not a bypass), and (c) injects a
+deterministic marker `ILogger` call into the middleware pipeline via
+`IStartupFilter` (without touching `Program.cs`) so there is a known in-request
+log line to check for correlation.
+
+| Test | What it proves | Result |
+|---|---|---|
+| `TracerProvider_IsRegisteredInServiceCollection` | §12.8 DI/wiring smoke test — `AddOpenTelemetry()` actually registers a resolvable `TracerProvider` | PASS |
+| `Request_ProducesValidTraceId_AndCorrelatesLogRecordToSameTrace` | The core §12.8 assertion: an in-request `ILogger` record carries a valid 32-hex, non-default W3C `TraceId`, and a `Server`-kind `Activity` exported from the app's tracer provider carries the **same** `TraceId` — proving automatic log↔trace correlation with zero manual enrichment | PASS |
+| `MultipleRequests_ProduceDifferentTraceIds` | Each inbound request gets its own trace (not a shared/static one) | PASS |
+| `AppStartsAndServesRequests_WhenAppInsightsConnectionStringUnset` | §12.5/§12.8 no-op requirement: app boots and serves `/health` normally with no AI connection string configured | PASS |
+| `AppStartsAndServesRequests_WhenAppInsightsConnectionStringIsSet` | The `UseAzureMonitor()` + managed-identity-credential branch is exercised (syntactically valid but non-routable connection string) without requiring network egress to start | PASS |
+
+**Notable debugging finding, documented for future test authors:** an initial
+version of this test used the `OpenTelemetry.Exporter.InMemory` NuGet
+package's `AddInMemoryExporter`, and separately a naive process-wide
+`ActivityListener`. Both were rejected:
+- `AddInMemoryExporter` intermittently returned zero captured activities in
+  this SDK/version combination even after `TracerProvider.ForceFlush()`
+  (root-caused to the packaged exporter, not the app code — a custom
+  `BaseProcessor<Activity>` that simply appends to a list works reliably and
+  was used instead).
+- **A real flakiness root cause was found and fixed**: `System.Diagnostics.
+  ActivitySource` listeners registered by OpenTelemetry are **process-wide
+  (static)**, not scoped per `WebApplicationFactory`/`TestServer` instance.
+  When xUnit runs different test classes in parallel (its default), every
+  test class's own `WebApplicationFactory<Program>` host independently wires
+  `AddAspNetCoreInstrumentation()` against the **same static**
+  `"Microsoft.AspNetCore.Hosting"` `ActivitySource`, so one test's in-memory
+  processor can observe **another concurrently-running test's** request
+  activity. This caused a real, reproducible failure (captured trace ID did
+  not match the expected one) when running the full suite, while the same
+  test passed in isolation. Fixed by (a) `[assembly:
+  CollectionBehavior(DisableTestParallelization = true)]` and (b) making the
+  assertion match the specific known-correct `TraceId` (from the
+  log-provider-scoped-per-host marker log) rather than blindly taking "the
+  first Server-kind activity" — defense in depth. Verified stable across 4
+  consecutive full-suite runs after the fix.
+
+### `TelemetryRegistrationTests.cs` (4 tests) — DI-level unit tests, no host
+
+| Test | What it proves | Result |
+|---|---|---|
+| `ConnectionStringKey_IsTheStandardAppInsightsEnvVarName` | The constant is exactly `APPLICATIONINSIGHTS_CONNECTION_STRING` (§12.5's flat, no-`__` name) | PASS |
+| `AddTodoTelemetry_WithNoConnectionString_DoesNotThrow_AndRegistersTracerProvider` | Registration + `TracerProvider` build succeed with the var absent | PASS |
+| `AddTodoTelemetry_WithConnectionStringConfigured_DoesNotThrow_AndRegistersTracerProvider` | Same, with a syntactically valid dummy AI connection string (exercises the `UseAzureMonitor` branch) | PASS |
+| `AddTodoTelemetry_WithBlankConnectionString_TreatedAsUnset` | Whitespace-only value is treated as absent (matches the `IsNullOrWhiteSpace` guard in the source) | PASS |
+
+### `TodoDbContextRegistrationTests.cs` (6 tests) — §13.4 branching/wiring, no live DB
+
+| Test | What it proves | Result |
+|---|---|---|
+| `AddTodoDbContext_WithEntraAuthNotEnabled_UsesPasswordConnection_NoDataSourceRegistered` (theory: flag absent / flag `false`) | The default/false path takes the **original** `UseNpgsql(connectionString)` route: no `NpgsqlDataSource` singleton is registered, and the resolved `TodoDbContext`'s connection string is exactly the configured password-based string (regression proof, not just "didn't throw") | PASS (both cases) |
+| `AddTodoDbContext_WithEntraAuthTrue_RegistersNpgsqlDataSourceSingleton_ConstructsWithoutThrowing` | `Postgres:UseEntraAuth=true` registers and successfully **constructs** (not just declares) an `NpgsqlDataSource` via `DefaultAzureCredential` + `UsePeriodicPasswordProvider`, and a `TodoDbContext` resolves over it — all without any network I/O (token acquisition is lazy, only triggered by opening a real connection, which this test never does) | PASS |
+| `AddTodoDbContext_EntraAuthTrue_DoesNotRegisterAPlainPasswordDbContext` | Exactly one `NpgsqlDataSource` registration exists in the Entra branch (no conflicting dual-provider registration) | PASS |
+| `AddTodoDbContext_MissingConnectionString_ThrowsInvalidOperationException` | The pre-existing "connection string must be configured" guard survived the `Program.cs` → `TodoDbContextRegistration` refactor | PASS |
+| `AddTodoDbContext_BlankConnectionString_ThrowsInvalidOperationException` | Whitespace-only connection string is also rejected | PASS |
+
+## Gaps — what could NOT be tested in this environment, and why
+
+Called out explicitly per the task brief, distinguishing "automated test
+coverage" from "can only be verified against the real deployed environment":
+
+1. **No live Entra-auth-enabled Postgres Flexible Server exists here.** The
+   `AddTodoDbContext_WithEntraAuthTrue_...` test proves the **branching logic
+   and object construction** are correct (right code path taken, no exception
+   constructing the data source/token-provider wiring), but it does **not**
+   open a real connection or acquire a real Entra token — Npgsql's periodic
+   password provider only calls the token callback lazily on first connection
+   open, which none of these tests trigger. **End-to-end verification (a real
+   token successfully authenticating to a real Entra-enabled Postgres server)
+   can only be done by a human/devops against the deployed environment**,
+   after the §13.4 manual `pgaadauth_create_principal` bootstrap and the
+   devops Bicep changes (Entra admin, role assignment) are in place. This
+   matches what `changes.md` already flags as a known limitation — confirmed
+   independently, not just restated.
+2. **No live Application Insights resource.** All tracing tests run with
+   either no connection string or a syntactically-valid-but-fake one; actual
+   ingestion into Azure Monitor, the `Monitoring Metrics Publisher` role
+   grant, and `DisableLocalAuth` on the AI component (§13.5/§13.10) are devops
+   /infra work for a later stage and cannot be exercised from this backend
+   test suite. Per §12.8, this is explicitly not required — "no live-Azure
+   integration test is required or expected."
+3. **Frontend, Bicep/IaC, and pipeline YAML are unchanged and out of scope**
+   for this cycle (confirmed via `git status` — no diffs under `frontend/`,
+   `infra/`, or `.github/workflows/`), so nothing new to test there.
+4. **`Trust Server Certificate=true` (cert-verification skipped) and the
+   devops-owned AI `DisableLocalAuth`/role-assignment items** flagged as
+   residual risk in `changes.md` are infra/Bicep concerns for the devops
+   stage, not testable from this backend test suite.
+
+## Result totals
+
+- **Backend build**: 0 Warning(s), 0 Error(s) (clean, from-scratch rebuild).
+- **Backend tests**: **44/44 passed** (29 pre-existing + 15 new this cycle),
+  stable across 4 repeated full-suite runs.
+- Frontend: unchanged this cycle, not re-run (no diff to verify).
+
+## Commit / push status for this cycle
+
+This environment **does** have a git remote (`origin` →
+`git@github.com:matvi/todo-claude-multiagent.git`) but **`gh` CLI is not
+installed**, so per this cycle's explicit instructions:
+
+- Changes were committed on `pipeline/appinsights-tracing` and pushed to
+  `origin/pipeline/appinsights-tracing`.
+- **No PR was created via `gh`** (unavailable). The PR-creation URL GitHub
+  prints on push (or, equivalently,
+  `https://github.com/matvi/todo-claude-multiagent/pull/new/pipeline/appinsights-tracing`)
+  is provided for a human to open the PR — none was fabricated as already
+  open.
