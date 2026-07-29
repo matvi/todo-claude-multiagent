@@ -17,8 +17,20 @@ namespace TodoApi.Data;
 ///  - <b>Managed-identity (Entra) auth (flag true):</b> the connection string is
 ///    passwordless (Username = the managed identity's Postgres role name). An Entra
 ///    access token is acquired via the Container App's managed identity and handed to
-///    Npgsql as a rotating password through the periodic password provider, so the
-///    ~60-minute token is refreshed automatically (not fetched once at startup).
+///    Npgsql as the password through <c>UsePasswordProvider</c>, which invokes the
+///    callback on the connection-open path so the token is present before the very
+///    first connection's auth handshake. The <see cref="TokenCredential"/> caches the
+///    token in-memory and refreshes it near expiry, so the ~60-minute rotation is
+///    handled automatically without a background timer.
+///
+///    <para>
+///    NOTE: this deliberately does NOT use <c>UsePeriodicPasswordProvider</c>. That
+///    API fetches the token on a background timer ("invoked in a timer, and not when
+///    opening connections" per Npgsql's docs), which raced the app's startup
+///    <c>Migrate()</c> connection and yielded an empty password
+///    ("No password has been provided ... in cleartext") — a live outage documented
+///    in <c>.pipeline/deployment-lessons-learned.md</c> §5a.
+///    </para>
 /// </summary>
 public static class TodoDbContextRegistration
 {
@@ -30,11 +42,6 @@ public static class TodoDbContextRegistration
     /// </summary>
     private const string PostgresEntraTokenScope =
         "https://ossrdbms-aad.database.windows.net/.default";
-
-    // Tokens live ~60 minutes; refresh comfortably ahead of expiry, and retry quickly
-    // on a transient acquisition failure (spec §13.4 example values).
-    private static readonly TimeSpan TokenRefreshPeriod = TimeSpan.FromMinutes(50);
-    private static readonly TimeSpan TokenRefreshFailureRetry = TimeSpan.FromSeconds(5);
 
     public static IServiceCollection AddTodoDbContext(
         this IServiceCollection services,
@@ -68,27 +75,40 @@ public static class TodoDbContextRegistration
 
     /// <summary>
     /// Builds an <see cref="NpgsqlDataSource"/> whose password is supplied by an Entra
-    /// access token obtained via the app's managed identity, refreshed periodically.
+    /// access token obtained via the app's managed identity. Uses the app's
+    /// <c>DefaultAzureCredential</c>, which resolves to <c>ManagedIdentityCredential</c>
+    /// inside Azure Container Apps and requires no secret (spec §13.4).
     /// The <paramref name="baseConnectionString"/> must NOT contain a <c>Password=</c>.
-    /// Registered as a singleton so it is reused across requests and disposed by DI.
     /// </summary>
     private static NpgsqlDataSource BuildEntraAuthenticatedDataSource(string baseConnectionString)
+        => BuildEntraAuthenticatedDataSource(baseConnectionString, new DefaultAzureCredential());
+
+    /// <summary>
+    /// Core builder with the <see cref="TokenCredential"/> injected, so the
+    /// token-acquisition seam is testable without a live Entra endpoint or Postgres
+    /// server. Registered as a singleton so it is reused across requests and disposed
+    /// by DI.
+    ///
+    /// <para>
+    /// The token is supplied via <see cref="NpgsqlDataSourceBuilder.UsePasswordProvider"/>,
+    /// which invokes the provider on the connection-open path (both the synchronous
+    /// <c>Open()</c> used by startup <c>Migrate()</c> and the async
+    /// <c>OpenAsync()</c> used at request time). This guarantees the password is
+    /// present before the first connection authenticates — unlike
+    /// <c>UsePeriodicPasswordProvider</c>, whose background-timer fetch raced the first
+    /// connection (deployment-lessons-learned §5a).
+    /// </para>
+    /// </summary>
+    internal static NpgsqlDataSource BuildEntraAuthenticatedDataSource(
+        string baseConnectionString,
+        TokenCredential credential)
     {
-        // DefaultAzureCredential resolves to ManagedIdentityCredential inside Azure
-        // Container Apps; it requires no secret. (spec §13.4)
-        var credential = new DefaultAzureCredential();
+        var passwordProvider = new EntraTokenPasswordProvider(credential, PostgresEntraTokenScope);
 
         var dataSourceBuilder = new NpgsqlDataSourceBuilder(baseConnectionString);
-        dataSourceBuilder.UsePeriodicPasswordProvider(
-            async (_, cancellationToken) =>
-            {
-                var token = await credential.GetTokenAsync(
-                    new TokenRequestContext(new[] { PostgresEntraTokenScope }),
-                    cancellationToken).ConfigureAwait(false);
-                return token.Token;
-            },
-            TokenRefreshPeriod,
-            TokenRefreshFailureRetry);
+        dataSourceBuilder.UsePasswordProvider(
+            passwordProvider.GetPassword,
+            passwordProvider.GetPasswordAsync);
 
         return dataSourceBuilder.Build();
     }

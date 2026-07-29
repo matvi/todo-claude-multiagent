@@ -10,6 +10,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Exposes internal Entra-auth data-source seams (EntraTokenPasswordProvider,
+         the credential-injecting BuildEntraAuthenticatedDataSource overload) to the
+         test project so token acquisition is verifiable without a live server. -->
+    <InternalsVisibleTo Include="TodoApi.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Azure.Identity" Version="1.21.0" />
     <PackageReference Include="Azure.Monitor.OpenTelemetry.AspNetCore" Version="1.6.0" />
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.0" />

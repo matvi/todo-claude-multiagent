@@ -89,7 +89,7 @@ public class TodoDbContextRegistrationTests
         using var provider = services.BuildServiceProvider();
 
         // Resolving the NpgsqlDataSource exercises DefaultAzureCredential construction
-        // + NpgsqlDataSourceBuilder.UsePeriodicPasswordProvider(...).Build() — none of
+        // + NpgsqlDataSourceBuilder.UsePasswordProvider(...).Build() — none of
         // which perform network I/O or token acquisition until a connection is opened.
         var buildException = Record.Exception(() => provider.GetRequiredService<NpgsqlDataSource>());
         Assert.Null(buildException);
