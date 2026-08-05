@@ -33,6 +33,30 @@ param skuName string = 'Standard_B1ms'
 @maxValue(35)
 param backupRetentionDays int = 7
 
+// --- Microsoft Entra (Azure AD) administrator -------------------------------
+// Dual-auth (§13.4, approved 2026-07-28): Entra auth is ENABLED alongside
+// password auth. The password stays as a break-glass path; it is NOT disabled.
+// The Entra admin below is the identity that then runs the in-database
+// `pgaadauth_create_principal` bootstrap for todo-api's managed identity
+// (a manual human step — see infra/README.md Phase 4; cannot live in Bicep).
+
+@description('Object ID of the Microsoft Entra administrator (a user or a group).')
+param entraAdminObjectId string
+
+@description('Principal name of the Entra administrator — the UPN for a user, or the display name for a group.')
+param entraAdminPrincipalName string
+
+@description('Entra administrator principal type.')
+@allowed([
+  'User'
+  'Group'
+  'ServicePrincipal'
+])
+param entraAdminPrincipalType string = 'User'
+
+@description('Tenant ID that hosts the Entra administrator identity.')
+param entraAdminTenantId string
+
 resource pg 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
   name: name
   location: location
@@ -44,6 +68,13 @@ resource pg 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
     administratorLogin: administratorLogin
     administratorLoginPassword: administratorPassword
     version: postgresVersion
+    // Dual-auth (§13.4): Entra tokens (todo-api managed identity) AND the
+    // break-glass admin password both accepted. passwordAuth stays Enabled.
+    authConfig: {
+      activeDirectoryAuth: 'Enabled'
+      passwordAuth: 'Enabled'
+      tenantId: entraAdminTenantId
+    }
     storage: {
       storageSizeGB: storageSizeGB
     }
@@ -57,6 +88,18 @@ resource pg 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
     network: {
       publicNetworkAccess: 'Enabled'
     }
+  }
+}
+
+// Entra administrator. The resource NAME must be the admin's object ID.
+// Requires activeDirectoryAuth: 'Enabled' above (implicit parent dependency).
+resource entraAdmin 'Microsoft.DBforPostgreSQL/flexibleServers/administrators@2024-08-01' = {
+  parent: pg
+  name: entraAdminObjectId
+  properties: {
+    principalType: entraAdminPrincipalType
+    principalName: entraAdminPrincipalName
+    tenantId: entraAdminTenantId
   }
 }
 

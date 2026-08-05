@@ -930,3 +930,551 @@ The devops output is complete when:
    labeled as human-run.
 6. No agent has provisioned anything, created any credential, or pushed to
    `main` (PROPOSE mode, §11.8).
+
+---
+
+## 12. Observability / Distributed Tracing (extension — this cycle's scope)
+
+Added 2026-07-27 on branch `pipeline/appinsights-tracing` (off `main`), review
+cycle 1 of up to 3. This section is **additive**: it does not change §1–§11.
+It introduces end-to-end distributed tracing for the **.NET 10 backend**,
+correlated by a `traceId` and exported to **Azure Application Insights**.
+
+### 12.1 Requirement (verbatim)
+
+> "The application should be able to trace an entire request response. The .net
+> application should be able to log in AppInsights using traceId."
+
+### 12.2 Goal
+
+- Every inbound HTTP request to `todo-api` produces a **single, correlated
+  distributed trace** covering the full request/response lifecycle: the ASP.NET
+  Core request (server span), any outbound `HttpClient` calls, and the
+  **EF Core / Npgsql database calls** made while handling that request — all
+  under one W3C `traceId`.
+- All application log lines (`ILogger`) emitted while handling a request are
+  **stamped with that same `TraceId` (and `SpanId`)**, so logs in Application
+  Insights (and in the console / Log Analytics) can be pivoted by `traceId` to
+  reconstruct exactly what happened for one request.
+- The trace + correlated logs are queryable in Application Insights
+  (`requests`, `dependencies`, `traces` tables; end-to-end transaction view).
+
+### 12.3 Technical approach — `Azure.Monitor.OpenTelemetry.AspNetCore`
+
+**Decision: use the `Azure.Monitor.OpenTelemetry.AspNetCore` NuGet package** —
+Microsoft's current (2024+) recommended "one-liner" Application Insights
+integration for ASP.NET Core, built on **OpenTelemetry** and emitting **W3C
+Trace Context** by default. This supersedes the legacy
+`Microsoft.ApplicationInsights.AspNetCore` classic SDK, which must **not** be
+used here.
+
+Rationale:
+- It bundles and auto-configures the OpenTelemetry tracing, metrics, and logging
+  providers and points them at Application Insights via a single call. Out of the
+  box it instruments **ASP.NET Core incoming requests**, **`HttpClient` outgoing
+  calls**, and (with the Npgsql/EF Core instrumentation it enables) **database
+  calls**, producing one correlated trace — exactly the "trace an entire
+  request/response" requirement.
+- It is the forward-looking, vendor-neutral path (OpenTelemetry) while still
+  being first-party Microsoft-supported for App Insights.
+- Correlation uses W3C `traceparent`, so traces propagate correctly across the
+  SPA-to-API boundary if/when the frontend ever participates (see §12.7).
+
+**Wiring (engineer guidance — do not implement in this cycle, spec only).**
+In `Program.cs`, after `var builder = WebApplication.CreateBuilder(args);` and
+alongside the existing service registrations (Program.cs currently registers
+controllers, Swagger, `DbContext`, CORS — none of which change):
+
+```csharp
+// Add Azure Monitor (Application Insights) via OpenTelemetry.
+// Reads APPLICATIONINSIGHTS_CONNECTION_STRING from configuration/env automatically.
+builder.Services.AddOpenTelemetry().UseAzureMonitor();
+
+// Ensure EF Core / Npgsql database calls are captured as trace dependencies.
+builder.Services.ConfigureOpenTelemetryTracerProvider(tracing =>
+    tracing.AddNpgsql());   // from Npgsql.OpenTelemetry
+```
+
+Package additions to `backend/src/TodoApi/TodoApi.csproj`:
+- `Azure.Monitor.OpenTelemetry.AspNetCore` (latest stable compatible with
+  `net10.0`; engineer pins the exact version and records it in `changes.md`).
+- `Npgsql.OpenTelemetry` (Npgsql's OpenTelemetry integration, so Postgres
+  queries appear as `dependencies` spans within the trace). If the installed
+  Npgsql version emits its `ActivitySource` without this helper, the engineer
+  documents the actual mechanism used; the requirement is simply that DB calls
+  show up as child spans of the request.
+
+If the exact package versions for `net10.0` are unavailable at build time, the
+engineer uses the nearest compatible stable release and notes the substitution
+in `changes.md` (consistent with §9.5).
+
+### 12.4 Relationship to existing logging — COEXIST, do not replace
+
+The current app (`Program.cs`) uses **default ASP.NET Core `ILogger` / console
+logging** only, with **no telemetry** (confirmed: no OpenTelemetry or App
+Insights packages in `TodoApi.csproj` today; §7 "Logging" describes exactly
+this). This tracing feature **augments** that setup; it does **not** rip it out:
+
+- **Console logging stays.** `UseAzureMonitor()` **adds** an OpenTelemetry
+  logging provider to the existing logging pipeline; it does not remove the
+  console provider. Container Apps to Log Analytics console capture (§7) keeps
+  working unchanged, so nothing is lost if App Insights is misconfigured.
+- **`traceId` on every log line is automatic — no manual enrichment needed.**
+  ASP.NET Core sets `Activity.Current` per request (the ambient `Activity`
+  carries the W3C `TraceId`/`SpanId`). `Microsoft.Extensions.Logging` already
+  attaches the current `Activity`'s `TraceId` and `SpanId` to every `ILogger`
+  record. Once the OpenTelemetry/Azure Monitor logging provider is registered,
+  those log records are exported to App Insights `traces` **already correlated**
+  to the request's `traceId`. Existing `logger.LogInformation(...)` /
+  `logger.LogError(...)` calls (e.g. the migration logs in `Program.cs`) require
+  **no code change** to become trace-correlated.
+- **No structured-logging library swap.** We do **not** introduce Serilog or a
+  custom enricher — the built-in `Activity`-to-`ILogger` scope correlation is
+  sufficient for the requirement. Keeping the default logging stack is
+  consistent with the project's "keep it simple" principle (§1).
+- **Confirmed behavior to document for the engineer:** the correlation works
+  because of `Activity.Current`; the engineer should **not** disable activity
+  tracking and should leave the default `TraceId`/`SpanId` activity tracking
+  enabled.
+
+### 12.5 Configuration — connection string via env var / Container Apps secret
+
+- The Application Insights **connection string** is read from the standard env
+  var **`APPLICATIONINSIGHTS_CONNECTION_STRING`**, which
+  `Azure.Monitor.OpenTelemetry.AspNetCore` reads **automatically** (no code
+  needs to reference it). It is **never hardcoded** and never committed.
+- This mirrors exactly how the Postgres connection string is handled today
+  (§3.3 / §5.5): a **Container Apps secret** whose value is injected as an
+  environment variable on the `todo-api` Container App.
+  - Secret name (suggested): **`appinsights-connection`**.
+  - Env var surfaced to the app: **`APPLICATIONINSIGHTS_CONNECTION_STRING`**
+    (`secretref:appinsights-connection`).
+  - Note: unlike the Postgres var, this env var name has **no** `__` section
+    syntax — it is a flat SDK-recognized name, so use it verbatim.
+- **Local development:** the connection string is simply left **unset** locally.
+  When `APPLICATIONINSIGHTS_CONNECTION_STRING` is absent the exporter has no
+  endpoint and quietly does not export to Azure — the app still runs and console
+  logs still work. Tracing itself (the `Activity`/`traceId` flow) is still
+  active in-process, which is what the tests in §12.8 assert. Do **not** put a
+  real connection string in `appsettings*.json`.
+- Config precedence is the standard .NET one (env var overrides `appsettings`);
+  the value only ever comes from the environment in Azure.
+
+### 12.6 Azure architecture — one workspace-based Application Insights resource
+
+**One new Azure resource is required: an Application Insights component,
+workspace-based, backed by the EXISTING Log Analytics workspace
+`log-todo-demo`.** Do **not** create a second Log Analytics workspace.
+
+- **Type:** `Microsoft.Insights/components`, `kind: web`, `Application_Type:
+  web`, with `WorkspaceResourceId` pointing at the existing `log-todo-demo`
+  workspace (provisioned per §5.3 / §11.9 as the ACA environment's workspace).
+  Classic (non-workspace) Application Insights is retired and must not be used.
+- **Suggested name:** `appi-todo-demo` (follows the `<type-abbrev>-todo-demo`
+  convention from architecture-memory; `appi-` is the standard abbreviation for
+  Application Insights).
+- **Why reuse `log-todo-demo`:** workspace-based App Insights stores its data in
+  a Log Analytics workspace. Reusing the single existing workspace keeps the
+  "single of everything" posture (§11.9), keeps all telemetry queryable in one
+  place, and avoids a second cost center / second retention setting.
+- **Region:** same region as the workspace / ACA environment. App Insights
+  follows the **workspace's** region — this is independent of any Postgres
+  region-restriction decision recorded in architecture-memory. The devops agent
+  must place `appi-todo-demo` in the same region as `log-todo-demo`.
+- **Output wiring:** the resource's **connection string** is what feeds the
+  Container Apps secret in §12.5. In the Bicep path (§11.3) this is an
+  additional module output consumed when composing the `todo-api` secret.
+
+**This is a specification only.** Per the established PROPOSE-mode split
+(§11.8), the **devops agent PROPOSES** this resource — the Bicep module, its
+SKU/retention posture, and the connection-string secret wiring — in a later
+stage. This section does **not** author Bicep. What the devops agent must add,
+when it runs:
+1. A new Bicep module (e.g. `infra/modules/appinsights.bicep`) creating the
+   workspace-based component wired to the existing `log-todo-demo` workspace,
+   with the connection string as a module **output**.
+2. Extend the backend Container App definition (`containerApp.bicep` usage for
+   `todo-api`) with the `appinsights-connection` secret and the
+   `APPLICATIONINSIGHTS_CONNECTION_STRING` env var (`secretref:`), exactly
+   parallel to the existing `todo-db-connection` / `ConnectionStrings__TodoDb`
+   wiring.
+3. Add the same wiring to `azure-pipelines.yml` parity if images/env are set
+   imperatively there.
+4. No change to the frontend Container App (§12.7).
+5. Respect PROPOSE mode — author/validate only, never provision.
+
+### 12.7 Frontend scope — OUT of required scope (optional, human decides)
+
+The requirement is explicitly about the **.NET backend** ("The .net application
+should be able to log in AppInsights using traceId"). Therefore:
+
+- **In scope:** backend distributed tracing + log correlation only.
+- **OUT of scope (not silently added):** browser-side **Real User Monitoring
+  (RUM)** via the Application Insights JavaScript SDK / OpenTelemetry web, and
+  propagating the SPA's `traceparent` into the API so a trace begins in the
+  browser. This is a *reasonable adjacent enhancement* but changes frontend
+  scope, adds a JS dependency + CORS/`traceparent` header handling, and is not
+  what the requirement asked for.
+
+**Optional note for the human (not this cycle's work):** if end-to-end
+browser-to-API-to-DB correlation is later desired, the clean follow-up is to add
+the App Insights Web SDK to the React app, enable distributed tracing there, and
+add the `traceparent`/`Request-Id` headers to the CORS allowed headers. Flagged
+here as a future option only — it must be an explicit, separately-approved
+scope decision, not assumed.
+
+### 12.8 Testability — verify correlation without a live App Insights resource
+
+Automated tests must **not** require a real Application Insights ingestion
+endpoint or connection string (CI is credential-free by default, §11.4). The
+tester agent verifies the wiring **in-process**:
+
+- **Wiring / DI smoke test:** boot the app with `WebApplicationFactory<Program>`
+  (the app already exposes `public partial class Program` for exactly this,
+  per `Program.cs`) and assert that the OpenTelemetry tracer provider is
+  registered in the service collection (e.g. `TracerProvider` /
+  the exporter hosted service resolves). This proves
+  `AddOpenTelemetry().UseAzureMonitor()` is wired without exporting anything.
+- **Trace-context flow test (the core assertion):** capture the request's
+  `Activity` and assert a valid W3C `traceId` exists and flows through a request:
+  - Register an in-test `ActivityListener` (or an in-memory OpenTelemetry
+    exporter via `AddInMemoryExporter` on the tracer provider in the test host)
+    that records `Activity` objects.
+  - Issue a request (e.g. `GET /api/todos` or `GET /health`) through the test
+    `HttpClient`.
+  - Assert that: (a) a server `Activity` was produced with a non-default 32-hex
+    `TraceId`; (b) a log record emitted during the request carries the **same**
+    `TraceId`/`SpanId` (assert via an in-memory `ILogger` capture) — proving the
+    log-to-trace correlation the requirement needs; and, if DB instrumentation
+    is active in the test, (c) a child `dependency`/DB span shares that
+    `TraceId`.
+  - This runs with **no** `APPLICATIONINSIGHTS_CONNECTION_STRING` set — the
+    in-memory exporter/listener stands in for Azure Monitor, so no cloud
+    dependency and no network calls.
+- **Env-var absence test:** assert the app **starts and serves requests
+  normally when `APPLICATIONINSIGHTS_CONNECTION_STRING` is unset** (the local /
+  CI default), i.e. missing App Insights config must not break the app (§12.5).
+- The tester keeps this proportionate (§7 "do not over-invest"): the assertions
+  above are sufficient. No live-Azure integration test is required or expected.
+
+### 12.9 Cost-consciousness note for the devops stage
+
+Flag for the devops agent's PROPOSE-mode SKU review (extends §11.9):
+
+- **Workspace-based Application Insights bills on ingestion (pay-as-you-go)**
+  through its backing Log Analytics workspace, at the Log Analytics per-GB
+  rate. There is a standard **free allocation of ~5 GB/month per billing
+  account/workspace** before charges apply; a low-traffic demo is expected to
+  stay well within it.
+- **Cost controls the devops agent should default to:** rely on the existing
+  workspace's **30-day retention** (do not raise it, §11.9); consider a
+  **daily ingestion cap** on the workspace and/or **adaptive/fixed sampling** on
+  the Azure Monitor exporter if trace volume ever becomes non-trivial (not
+  required at demo traffic, but note it as the lever). Do **not** enable
+  continuous export, do **not** add a second workspace, do **not** move to a
+  Standard/commitment-tier workspace.
+- This adds a **potential** small ingestion cost on top of the §11.9 target;
+  because it reuses `log-todo-demo` and inherits its retention, it introduces no
+  fixed monthly charge — only usage-based ingestion beyond the free grant. If
+  the devops agent projects meaningful ingestion cost, it must call it out in
+  `changes.md` per the §11.9 rule (no silent costlier choices).
+
+### 12.10 Acceptance criteria for this feature
+
+Complete when:
+1. `TodoApi.csproj` references `Azure.Monitor.OpenTelemetry.AspNetCore` (+ the
+   Npgsql OpenTelemetry integration) at `net10.0`-compatible versions.
+2. `Program.cs` calls `AddOpenTelemetry().UseAzureMonitor()` (and enables Npgsql
+   DB-span instrumentation), leaving existing console logging, controllers,
+   `DbContext`, CORS, health, and startup-migration logic unchanged.
+3. The App Insights connection string is sourced **only** from
+   `APPLICATIONINSIGHTS_CONNECTION_STRING` (Container Apps secret to
+   env var); it is nowhere hardcoded or committed.
+4. Existing `ILogger` calls are automatically correlated by `TraceId`/`SpanId`
+   with no manual enrichment.
+5. Tests prove trace-context flow + log correlation in-process with **no** live
+   App Insights endpoint, and prove the app runs with the env var unset.
+6. The spec (this §12) leaves the actual Azure resource + Bicep + secret wiring
+   as a **PROPOSE-mode** task for the devops stage (§12.6), targeting the
+   existing `log-todo-demo` workspace.
+7. Frontend RUM is **not** added (§12.7).
+
+---
+
+## 13. Identity & Secrets Policy — managed-identity-first (extension — this cycle's scope)
+
+Added 2026-07-27 on branch `pipeline/appinsights-tracing`, same cycle as §12.
+This section encodes a **project-wide policy** from the human and applies it
+critically to every trust boundary in the app. It **supersedes** the "Container
+Apps secrets, not Key Vault" default stated in **§5.5**, and **revises the
+connection-string-as-secret approach in §12.5** (see §13.4). §5.5 and §12.5
+remain in the document for history; where they conflict with this section, **this
+section wins.**
+
+### 13.1 The policy (verbatim)
+
+> "Applications that can use identity manager [managed identity] to authenticate
+> should use it. If applications can not use it, then it should use KeyVault to
+> store secrets or connection strings."
+
+### 13.2 Interpretation & decision hierarchy
+
+For **every** credential/secret an application component needs, apply this order:
+
+1. **Managed identity (Entra) auth — REQUIRED if the target service supports it.**
+   No secret is stored at all; the Container App's system-assigned managed
+   identity (already enabled per §11.3) authenticates directly.
+2. **Azure Key Vault — only if (1) is genuinely impossible** for that target.
+   The secret lives in Key Vault; the Container App's managed identity is granted
+   `Key Vault Secrets User` (RBAC, not legacy access policies) and the value is
+   surfaced via a **Container Apps Key Vault reference** (see §13.6).
+3. **Container Apps secret (raw value) — deprecated / last resort only**, allowed
+   solely for values that are neither an Azure-service credential nor storable in
+   Key Vault (none remain after this cycle — see §13.3).
+
+Applying this hierarchy to the app **eliminates every runtime application secret**
+(§13.3–§13.5). As a result **no Key Vault resource is provisioned this cycle** —
+the "cannot use managed identity" branch of the policy is not triggered by any
+current secret. The Key Vault pattern is still specified (§13.6) as the standing
+rule for any *future* secret that cannot use managed identity, so future cycles
+don't re-derive it.
+
+### 13.3 Per-secret classification (the authoritative table)
+
+| # | Trust boundary | Secret today | Policy outcome | Mechanism |
+|---|----------------|--------------|----------------|-----------|
+| 1 | `todo-api` → PostgreSQL Flexible Server | Password in `todo-db-connection` Container Apps secret (§5.5) | **Managed identity (Entra) — password secret DROPPED** | §13.4 |
+| 2 | `todo-api` → Application Insights | AI connection string as Container Apps secret (§12.5) | **Managed identity (Entra) for auth; connection string demoted to non-secret env var** | §13.5 |
+| 3 | `todo-api`/`todo-web` → ACR (image pull) | none (AcrPull via MI) | **Already compliant** — no change | §13.7 |
+| 4 | GitHub Actions / Azure DevOps → Azure subscription | none (OIDC federation) | **Compliant in spirit** (external workload → federated identity, the MI-equivalent) | §13.8 |
+| 5 | Postgres **admin** login (deploy-time only) | `PGADMIN_PASSWORD` GitHub secret / `@secure()` Bicep param (§11.6) | **Out of app-secret scope** — CI/CD deploy-time secret, not an application runtime secret; not used by the running app | §13.9 |
+
+**Result: zero application runtime secrets remain.** No component falls to the
+Key Vault branch. `todo-web` (nginx SPA) holds no credentials at all.
+
+### 13.4 Postgres — switch to managed-identity (Entra) auth [supersedes §5.5 for #1]
+
+**Decision: `todo-api` authenticates to PostgreSQL Flexible Server using its
+system-assigned managed identity via Microsoft Entra authentication. The
+password and the `todo-db-connection` secret are removed from the Azure
+deployment.** Verified viable with Npgsql on .NET 10 (see Sources at end).
+
+How it works (engineer guidance — spec only, no code this cycle):
+- Add the **`Azure.Identity`** package to `TodoApi.csproj`.
+- Build the `DbContext` over an **`NpgsqlDataSource`** whose password is supplied
+  by a **token provider** rather than a static string. Use Npgsql's
+  **periodic password provider** so the ~60-minute Entra access token is
+  refreshed automatically (do not fetch once at startup):
+
+  ```csharp
+  // Azure only. Acquire an Entra token for the Postgres resource via the app's
+  // managed identity and hand it to Npgsql as the (rotating) password.
+  var credential = new DefaultAzureCredential();               // ManagedIdentityCredential in ACA
+  var dataSourceBuilder = new NpgsqlDataSourceBuilder(baseConnString); // no Password= in this string
+  dataSourceBuilder.UsePeriodicPasswordProvider(async (_, ct) =>
+  {
+      var token = await credential.GetTokenAsync(
+          new TokenRequestContext(new[] { "https://ossrdbms-aad.database.windows.net/.default" }), ct);
+      return token.Token;
+  }, TimeSpan.FromMinutes(50), TimeSpan.FromSeconds(5));
+  builder.Services.AddDbContext<TodoDbContext>(o => o.UseNpgsql(dataSourceBuilder.Build()));
+  ```
+
+- **Connection string in Azure becomes passwordless and non-secret**:
+  `Host=<server>.postgres.database.azure.com;Port=5432;Database=tododb;Username=<managed-identity-name>;Ssl Mode=Require;Trust Server Certificate=true`.
+  - `Username` = the **managed identity's name** (the Postgres role created in the
+    bootstrap below), NOT `todoadmin`.
+  - This string contains no credential, so it is delivered as a **plain env var**
+    `ConnectionStrings__TodoDb` (no Container Apps secret, no Key Vault).
+- **Token scope:** `https://ossrdbms-aad.database.windows.net/.default`. **SSL is
+  still required** (unchanged from §5.4).
+
+**Local development is unchanged and stays on password auth** against the local
+Docker Postgres (§6.2/§6.3) — that container is not Entra-enabled and the local
+password is not an Azure secret, so it is out of policy scope. The engineer must
+**gate the token-provider wiring** so it is used **only in Azure**, e.g. a config
+flag `Postgres__UseEntraAuth=true` (set on the `todo-api` Container App; unset
+locally). When the flag is off, keep today's `UseNpgsql(connectionString)` path
+with the local password. `dotnet ef` design-time and startup `Migrate()` continue
+to work: locally against local Postgres; in Azure the startup `Migrate()` runs
+under the managed identity's Entra token (the identity's Postgres role must own /
+be able to create the schema — granted in the bootstrap).
+
+**New one-time MANUAL bootstrap (human-run, never by an agent — extends §11.6).**
+Managed-identity Postgres auth requires steps that cannot live in Bicep because
+they run *inside* the database as the Entra admin:
+1. Enable **Microsoft Entra authentication** on the Flexible Server and set an
+   **Entra administrator** (a human/group). Bicep *can* set the server's Entra
+   admin via the `administrators` child resource and enable Entra auth; the
+   devops agent should do that part in IaC.
+2. Connect to the **`postgres`** database as that Entra admin and create a role
+   for the app's managed identity:
+   ```sql
+   -- run as the Entra admin, connected to the `postgres` database
+   select * from pgaadauth_create_principal('<todo-api-managed-identity-name>', false, false);
+   -- then grant it rights on tododb (connect, and schema ownership/DDL for startup Migrate())
+   ```
+   This SQL step is **manual** (like the §11.6 OIDC bootstrap) and must be
+   documented verbatim by devops in `infra/README.md`, labeled "manual, run once,
+   by a human."
+- Optional hardening (note, not required this cycle): set the server to
+  **Entra-authentication-only** to eliminate the admin password entirely; kept
+  as dual-auth for demo simplicity so the admin login still works for break-glass.
+
+**Trade-off assessment (why we adopt it despite added complexity):** this adds a
+token-provider data source, a config gate for local vs. Azure, and a manual
+in-database principal step. That is moderate, well-trodden complexity and it is
+exactly what the policy mandates ("applications that *can* use managed identity
+*should*"). Postgres *can*, so we adopt it and remove a stored password. No
+blocker was found that would justify keeping the password.
+
+### 13.5 Application Insights — Entra auth, connection string demoted [revises §12.5]
+
+**Decision: `todo-api` authenticates telemetry ingestion with its managed
+identity (Entra), and the Application Insights connection string is demoted from
+a Container Apps *secret* to a plain non-secret env var.** Verified: Azure Monitor
+Distro supports Entra auth via `AzureMonitorOptions.Credential` (see Sources).
+
+The important nuance the policy forces us to get right:
+- **The connection string does not disappear.** `Azure.Monitor.OpenTelemetry`
+  still needs it for the **ingestion endpoint URL + the resource's
+  InstrumentationKey/App-Id** (it identifies *which* resource and *where*, not
+  *how* to authenticate). So `APPLICATIONINSIGHTS_CONNECTION_STRING` remains set.
+- **Auth moves to the managed identity.** Set the credential and disable the
+  shared-key path:
+  ```csharp
+  builder.Services.AddOpenTelemetry().UseAzureMonitor(o =>
+  {
+      // o.ConnectionString is read from APPLICATIONINSIGHTS_CONNECTION_STRING automatically.
+      o.Credential = new ManagedIdentityCredential();   // Entra auth in ACA
+  });
+  ```
+- **Disable local (key-based) auth on the component** (`DisableLocalAuth = true`
+  on the `Microsoft.Insights/components` resource) and grant the `todo-api`
+  managed identity the **`Monitoring Metrics Publisher`** role on that component.
+  Once local auth is disabled, the InstrumentationKey embedded in the connection
+  string is **no longer a usable credential** — it is just a resource identifier.
+- **Therefore the connection string is non-sensitive config** and is delivered as
+  a **plain env var** (NOT a Container Apps secret, NOT Key Vault). This revises
+  §12.5, which had it as the `appinsights-connection` secret — that secret is no
+  longer created.
+- **Local dev:** leave `APPLICATIONINSIGHTS_CONNECTION_STRING` unset (exporter
+  no-ops, per §12.5). Only set `o.Credential` when a connection string is present
+  / when running in Azure, so `ManagedIdentityCredential` is never invoked
+  locally (guard with the same environment check as §13.4, or use
+  `DefaultAzureCredential`). All §12.8 tests still hold (they run with no
+  connection string and no live endpoint).
+
+### 13.6 Key Vault pattern — specified, but NOT instantiated this cycle
+
+No current secret reaches the Key Vault branch (§13.3). We still record the
+**standing pattern** so any future secret that genuinely cannot use managed
+identity is handled consistently without re-litigation:
+
+- **Resource:** one Key Vault `kv-todo-demo` (name ≤ 24 chars, globally unique —
+  append `uniqueString` suffix), **RBAC authorization enabled**
+  (`enableRbacAuthorization: true`) — do **NOT** use legacy vault access
+  policies. Standard SKU. Soft-delete on (default), purge protection optional for
+  a demo.
+- **Access:** grant the consuming Container App's **system-assigned managed
+  identity** the **`Key Vault Secrets User`** role (RBAC) scoped to the vault.
+- **How the app reads it — Container Apps Key Vault reference (preferred).**
+  Define the Container Apps secret with `keyVaultUrl` + `identity` pointing at the
+  secret version; Container Apps resolves it via the app's managed identity and
+  surfaces it as an env var. Rationale: no `Azure.Security.KeyVault.Secrets` SDK
+  code, no startup fetch/caching logic, and rotation is handled by the platform —
+  strictly simpler than reading via SDK, and it keeps secret plumbing declarative
+  in Bicep. (SDK-at-startup is the documented alternative if a value must be
+  fetched dynamically, which none here do.)
+- **When to use:** only for a value that (a) is required by the app at runtime,
+  (b) whose target service does **not** support Entra/managed-identity auth, and
+  (c) therefore must be stored. Adding such a secret in a future cycle triggers:
+  provision `kv-todo-demo`, grant `Key Vault Secrets User`, add the Key Vault
+  reference — and record it in architecture-memory.
+
+### 13.7 ACR pull — already compliant (reference example)
+
+`todo-api` and `todo-web` already pull images using their managed identity with
+the **`AcrPull`** role (§5.5/§11.3). This is the canonical example of the policy
+already satisfied — **no change**. Do not regress to admin-user registry
+credentials.
+
+### 13.8 CI/CD → Azure — OIDC federation satisfies the policy's spirit
+
+GitHub Actions / Azure DevOps run **outside** Azure, so they cannot use an Azure
+*managed* identity. They already use **OIDC workload-identity federation**
+(§11.6), which is the identity-first, secretless equivalent for an external
+workload — Azure mints a short-lived token per run; no stored client secret.
+This **satisfies the spirit** of the policy at that boundary. It is a distinct
+case (external workload, not an Azure resource identity) and needs no change.
+
+### 13.9 Postgres admin password — deploy-time secret, out of app-secret scope
+
+The Postgres **admin** password (`PGADMIN_PASSWORD`, §11.6) is a **CI/CD
+deploy-time** secret used to *provision* the server, held as a GitHub secret /
+`@secure()` Bicep param — never read by the running application. The policy
+targets **application** authentication; this is infrastructure provisioning
+credential handling, already secretless-at-rest in the pipeline. It stays as-is.
+The app itself never uses it (it authenticates via managed identity, §13.4). If a
+future cycle adopts Entra-only auth on the server (§13.4 optional hardening), this
+password can be dropped too.
+
+### 13.10 Impact on the devops PROPOSE-mode scope (what devops must now propose)
+
+The devops stage has **not run** for this cycle, so there is no conflict — but its
+future proposal must now reflect this policy. Net changes vs. §11/§12:
+
+- **DROP** the `todo-db-connection` Container Apps secret and the password from
+  the connection string. Deliver a **passwordless** `ConnectionStrings__TodoDb`
+  as a **plain env var** (Username = managed identity name).
+- **DROP** the `appinsights-connection` Container Apps secret (§12.6 item 2 is
+  revised): deliver `APPLICATIONINSIGHTS_CONNECTION_STRING` as a **plain env var**;
+  set `DisableLocalAuth = true` on the AI component.
+- **ADD role assignments** (Bicep, `AcrPull` pattern already there):
+  `todo-api` managed identity → **`Monitoring Metrics Publisher`** on
+  `appi-todo-demo`. (Postgres access is granted in-DB via the manual bootstrap,
+  not via an Azure RBAC role.)
+- **ADD** to Bicep: enable **Entra authentication** on the Postgres Flexible
+  Server and set its **Entra administrator** (`administrators` child resource).
+- **ADD** to `infra/README.md`: the **manual, human-run** Postgres
+  `pgaadauth_create_principal` + grant step (§13.4), clearly labeled — analogous
+  to the §11.6 OIDC bootstrap.
+- **Do NOT** provision a Key Vault (§13.6): no application secret requires it.
+- **Cost note:** this policy is **cost-neutral to cost-negative** — it removes
+  stored secrets and adds **no** Key Vault (which would have carried per-operation
+  cost). Managed-identity auth and the added role assignments are free. This
+  strengthens, not violates, the §11.9 cost posture.
+- **PROPOSE mode unchanged (§11.8):** devops authors IaC + documents the manual
+  steps; it never provisions, never runs the `pgaadauth` SQL, never creates role
+  assignments itself.
+
+### 13.11 Acceptance criteria for the identity/secrets policy
+
+Complete when:
+1. `todo-api` authenticates to Postgres via managed identity (Entra token as
+   Npgsql password, periodic refresh); no password secret exists in the Azure
+   deployment; local dev still works via the password gate (§13.4).
+2. `todo-api` authenticates App Insights ingestion via `ManagedIdentityCredential`;
+   the AI connection string is a **non-secret env var**; local auth is disabled on
+   the component; `Monitoring Metrics Publisher` is granted (§13.5).
+3. **No Container Apps raw secrets and no Key Vault** are used for application
+   credentials; the classification table (§13.3) holds — zero app runtime secrets.
+4. ACR pull (MI) and CI/CD (OIDC) are confirmed compliant, unchanged (§13.7–13.8).
+5. The Key Vault fallback pattern (§13.6) is documented for future secrets but not
+   instantiated.
+6. All new provisioning/role/SQL steps are specified for the devops PROPOSE stage
+   and the manual human bootstrap (§13.10), with nothing provisioned by an agent.
+
+### 13.12 Sources (managed-identity viability verification)
+
+- Connect with Managed Identity — Azure Database for PostgreSQL Flexible Server
+  (Npgsql, token scope `https://ossrdbms-aad.database.windows.net/.default`,
+  token as password, `pgaadauth_create_principal`):
+  https://learn.microsoft.com/en-us/azure/postgresql/security/security-connect-with-managed-identity
+- Microsoft Entra authentication for Azure Database for PostgreSQL Flexible
+  Server (concepts / configure):
+  https://learn.microsoft.com/en-us/azure/postgresql/security/security-entra-concepts
+- Microsoft Entra authentication for Application Insights (Azure Monitor
+  OpenTelemetry Distro `AzureMonitorOptions.Credential`, disable local auth,
+  `Monitoring Metrics Publisher`):
+  https://learn.microsoft.com/en-us/azure/azure-monitor/app/azure-ad-authentication

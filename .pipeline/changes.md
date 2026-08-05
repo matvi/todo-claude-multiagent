@@ -367,3 +367,326 @@ no tracked `.env`/connection strings), CORS stays restricted to the configured
 frontend origin, TLS-to-Postgres is enforced by the deploy-time connection
 string (`Ssl Mode=Require`), and EF Core parameterizes all queries. No new
 attack surface was introduced because no code changed.
+
+---
+
+# Implementation Changes — Observability + Identity Policy (2026-07-28)
+
+Branch: `pipeline/appinsights-tracing` (off `main`). Cycle 1 of up to 3 for the
+combined tracing (§12) + identity/secrets policy (§13) scope. Backend only —
+no frontend, Bicep/IaC, or pipeline YAML touched (those are devops/tester stages).
+
+## Summary
+
+Implemented the two backend capabilities specified in specs.md §12 and §13:
+
+1. **Distributed tracing to Application Insights (§12).** Added
+   `Azure.Monitor.OpenTelemetry.AspNetCore` and wired OpenTelemetry so every
+   inbound request produces one W3C-`traceId`-correlated trace spanning the
+   ASP.NET Core request, outbound `HttpClient` calls, and Npgsql DB calls.
+   Existing `ILogger`/console logging is unchanged and becomes trace-correlated
+   automatically via `Activity.Current`. When
+   `APPLICATIONINSIGHTS_CONNECTION_STRING` is unset (local dev / CI) the exporter
+   cleanly no-ops — in-process tracing still flows, nothing is exported, nothing
+   throws.
+
+2. **Managed-identity Postgres authentication (§13.4).** Added `Azure.Identity`
+   and a config-gated (`Postgres__UseEntraAuth`) code path that authenticates to
+   PostgreSQL Flexible Server with an Entra token (scope
+   `https://ossrdbms-aad.database.windows.net/.default`) supplied to Npgsql via
+   its **periodic** password provider (auto-refresh, not a one-shot fetch).
+   When the flag is false/unset (local Docker dev, and the deployed env until
+   devops cuts over) the existing password-based connection path is used
+   unchanged.
+
+Additionally, per §13.5, Application Insights ingestion is authenticated with the
+Container App's managed identity (`options.Credential`) rather than the
+connection string's embedded key, and the AI connection string is treated as a
+**plain non-secret env var** (no Container Apps secret, no Key Vault).
+
+## Files changed/created
+
+- `backend/src/TodoApi/TodoApi.csproj` — added package references:
+  `Azure.Monitor.OpenTelemetry.AspNetCore` 1.6.0, `Npgsql.OpenTelemetry` 10.0.3,
+  `Azure.Identity` 1.21.0. (Transitively pulled `Azure.Core` 1.60.0 and the
+  OpenTelemetry AspNetCore/Http instrumentation packages.)
+- `backend/src/TodoApi/Observability/TelemetryRegistration.cs` — **new.**
+  `AddTodoTelemetry(...)` extension: always registers in-process OpenTelemetry
+  tracing (ASP.NET Core + HttpClient + Npgsql spans); adds the Azure Monitor
+  exporter with managed-identity auth only when the AI connection string is
+  present. Single responsibility: telemetry wiring only.
+- `backend/src/TodoApi/Data/TodoDbContextRegistration.cs` — **new.**
+  `AddTodoDbContext(...)` extension: assembles the `TodoDbContext` registration,
+  selecting password auth (default) vs. Entra/managed-identity auth
+  (`Postgres:UseEntraAuth=true`) with an Npgsql periodic-password-provider
+  `NpgsqlDataSource` (registered as a singleton so DI disposes it). Single
+  responsibility: connection assembly / auth-mode selection.
+- `backend/src/TodoApi/Program.cs` — replaced the inline connection-string read +
+  `AddDbContext` with `builder.Services.AddTodoTelemetry(...)` and
+  `builder.Services.AddTodoDbContext(...)`. Controllers, Swagger, CORS, `/health`,
+  and the startup `Database.Migrate()` try/log block are untouched. The
+  missing-connection-string guard moved into `AddTodoDbContext` (same exception
+  message, same behavior).
+- `backend/src/TodoApi/appsettings.json` — added an explicit
+  `"Postgres": { "UseEntraAuth": false }` default so the new flag is
+  discoverable; overridden to `true` in Azure via the `Postgres__UseEntraAuth`
+  env var.
+
+`Data/TodoDbContextFactory.cs` (EF Core design-time factory) was intentionally
+left unchanged — it is used only by `dotnet ef` locally and correctly stays on
+the local password/env-var connection (design-time never runs in Azure; runtime
+`Migrate()` uses the DI-registered context, which honors the Entra path).
+
+## Key decisions
+
+- **Conditional exporter, always-on in-process tracing (deviation from the
+  literal §12.3 snippet — see below).** OpenTelemetry tracing + instrumentation
+  is registered unconditionally so `traceId`/`spanId` flow onto logs and the
+  §12.8 in-process correlation tests work with no live endpoint; `UseAzureMonitor`
+  is only invoked when the connection string is present. This guarantees the
+  §12.5 / Feature-1 "no-op cleanly, do not throw when unset" requirement and
+  avoids double-registering the ASP.NET Core / HttpClient instrumentation that
+  the distro adds (each instrumentation is added in exactly one branch; Npgsql is
+  added once for both modes).
+- **`DefaultAzureCredential` for both boundaries.** §13.4's Postgres example uses
+  `DefaultAzureCredential`; §13.5's AI example uses `ManagedIdentityCredential`
+  but explicitly permits `DefaultAzureCredential` as an alternative. I used
+  `DefaultAzureCredential` for both: it resolves to the managed identity inside
+  ACA, is consistent across the two paths, and avoids a CS0618 obsolete-
+  constructor warning on the parameterless `ManagedIdentityCredential` in
+  Azure.Identity 1.21.0 (build is warning-clean as a result). The credential is
+  only constructed when its trigger is active (AI connection string present /
+  `UseEntraAuth=true`), so it is never invoked during local dev.
+- **Npgsql periodic password provider**
+  (`UsePeriodicPasswordProvider(cb, 50min, 5s)`) — the token is refreshed on a
+  schedule ahead of the ~60-min expiry rather than fetched once, per §13.4.
+  Verified the API exists on `NpgsqlDataSourceBuilder` in Npgsql 10.0.3.
+- **`NpgsqlDataSource` as a singleton** in the Entra path so the token provider /
+  connection pool are shared and disposed by the container.
+- **AI connection string is non-secret config** (§13.5): read from
+  `APPLICATIONINSIGHTS_CONNECTION_STRING`, never placed in `appsettings*.json`,
+  never hardcoded.
+
+## Deviations from specs.md
+
+1. **§12.3 shows `AddOpenTelemetry().UseAzureMonitor()` called unconditionally;
+   this implementation calls `UseAzureMonitor` only when
+   `APPLICATIONINSIGHTS_CONNECTION_STRING` is set.** Justification: Feature-1's
+   explicit requirement and §12.5 mandate that an unset connection string must
+   no-op cleanly and not throw, and §13.5 requires the managed-identity credential
+   to never be set/invoked locally. Gating the exporter call satisfies both while
+   still leaving in-process tracing fully active (so §12.8's tracer-provider and
+   trace-context tests pass with no endpoint). This is a behavior-preserving
+   refinement of the spec's illustrative snippet, not a scope change.
+2. **§12.3/§13.5 name `ManagedIdentityCredential`; used `DefaultAzureCredential`
+   instead** (explicitly permitted by §13.5). Rationale above (consistency +
+   avoids an obsolete-constructor warning). Functionally equivalent inside ACA.
+
+No other deviations. No changes to controllers, DTOs, the data model/migrations,
+CORS, health, or the startup-migration logic.
+
+## Assumptions made
+
+- The managed identity's Postgres **role name** arrives as the `Username=` in the
+  deployed (passwordless) connection string, assembled at the infra/devops layer
+  (§13.4) — the backend code reads whatever `ConnectionStrings__TodoDb` provides
+  and does not construct the host/username itself.
+- `Postgres__UseEntraAuth` is set (`true`) on the `todo-api` Container App by
+  devops and left unset locally; unset resolves to `false` (`GetValue<bool>`),
+  preserving the existing local password path with zero config changes needed.
+- The in-DB `pgaadauth_create_principal` grant and the AI role assignment
+  (`Monitoring Metrics Publisher`) / `DisableLocalAuth` are devops/manual-human
+  steps (§13.4/§13.5/§13.10) and are out of scope for this backend-code cycle.
+
+## Known limitations / TODOs (for later stages, not this cycle)
+
+- Verified against a live Azure Postgres / App Insights: not possible in this
+  environment. The Entra token path was exercised locally only to the point of a
+  (caught) connection attempt; a human should confirm end-to-end auth after
+  devops enables Entra on the server and runs the `pgaadauth` bootstrap.
+- Devops must: deliver `ConnectionStrings__TodoDb` (passwordless) and
+  `APPLICATIONINSIGHTS_CONNECTION_STRING` as **plain env vars**, set
+  `Postgres__UseEntraAuth=true`, add the AI Bicep module + `Monitoring Metrics
+  Publisher` role + `DisableLocalAuth=true`, enable Entra auth on Postgres, and
+  drop the `todo-db-connection` / `appinsights-connection` Container Apps secrets
+  (§13.10).
+- Tester owns the §12.8 in-process trace-correlation / env-var-absence tests.
+
+## How to run / verify
+
+```
+export PATH="/c/Users/ingda/dotnet10:$PATH"     # SDK 10.0.302
+cd backend
+dotnet build -c Release        # clean: 0 warnings, 0 errors
+dotnet test  -c Release        # 29/29 passed (unchanged, EF Core InMemory)
+```
+
+Verification performed this cycle:
+- `dotnet build -c Release` — succeeded, **0 warnings / 0 errors**.
+- `dotnet test -c Release` — **29/29 passed** (existing suite, unchanged).
+- Startup smoke tests (Production env, no DB running so `Migrate()` fails and is
+  caught, then `/health` polled):
+  - No `APPLICATIONINSIGHTS_CONNECTION_STRING` → app starts, `/health` = `200
+    {"status":"ok"}`, no Azure Monitor error (clean no-op).
+  - Dummy `APPLICATIONINSIGHTS_CONNECTION_STRING` set (exporter + managed-identity
+    credential wired) → app starts, `/health` = `200`.
+  - `Postgres__UseEntraAuth=true` (Entra `NpgsqlDataSource` + periodic token
+    provider built) → app starts, `/health` = `200`; token/connection attempt
+    fails only because there is no local managed identity / server, and is caught
+    by the existing migration try/log.
+
+## Security & PCI DSS scope
+
+Unchanged and still **not in PCI DSS scope** — this is a no-auth Todo demo that
+processes no payment or cardholder data; no PAN/CVV/track data anywhere. This
+cycle **strengthens** the security posture per the managed-identity-first policy
+(§13):
+
+- **Secrets removed, not added.** The Postgres password and the AI connection
+  string are no longer credentials in the deployed system — Postgres uses an
+  Entra token via managed identity, and (once devops disables local auth on the
+  AI component) the AI connection string is a non-sensitive resource identifier.
+  No secret, key, or connection string is hardcoded or committed (verified: AI
+  string is env-only and absent from `appsettings*.json`; the only committed
+  credential remains the throwaway local Docker `todo` password in
+  `appsettings.Development.json`, per §6.3).
+- **No secrets in logs.** Tracing correlates logs by `traceId`/`spanId` only; no
+  tokens, connection strings, or credentials are logged. Npgsql DB spans capture
+  SQL text/metadata, not credentials (the Entra token is passed as the connection
+  password and is never emitted to a span or log).
+- **OWASP-relevant risks:** no new injection surface (EF Core parameterized
+  queries unchanged; no raw SQL added). Sensitive-data-exposure risk is reduced
+  by eliminating the stored DB password. Two residual items are **owned by devops/
+  infra, not closable in backend code this cycle**: (a) `Trust Server
+  Certificate=true` in the connection string encrypts but skips cert verification
+  (MITM-susceptible) — production should move to `SslMode=VerifyFull` with the
+  Azure Postgres CA (already flagged in prior review); (b) disabling AI local auth
+  (`DisableLocalAuth=true`) and granting `Monitoring Metrics Publisher` must be
+  done in Bicep for the managed-identity telemetry auth to actually take effect —
+  until then the connection-string key would still be a usable credential.
+
+---
+
+# Implementation Changes — Npgsql Entra first-connection fix (2026-07-28)
+
+Branch: `fix/npgsql-entra-first-connection` (off `pipeline/appinsights-tracing`).
+Backend code-only, targeted bug fix. No infra/Bicep, frontend, or CI/CD YAML
+touched. Fixes the live outage documented in
+`deployment-lessons-learned.md` §5a.
+
+## The bug (recap)
+
+Flipping `Postgres__UseEntraAuth=true` on the live `todo-api` Container App made
+the startup EF `Migrate()` (and every DB request) fail on the **first** connection
+with `Npgsql.NpgsqlException: No password has been provided but the backend
+requires one (in cleartext)`. The password came back **empty**, not wrong. Rolled
+back to password auth immediately.
+
+## Research findings — Npgsql's actual documented behavior (verified, not assumed)
+
+Inspected the installed **Npgsql 10.0.3** assembly + its shipped XML docs
+(`~/.nuget/packages/npgsql/10.0.3/lib/net10.0/Npgsql.xml`) and confirmed method
+signatures/attributes by reflection:
+
+- `NpgsqlDataSourceBuilder.UsePeriodicPasswordProvider(...)` remarks state verbatim:
+  **"The provided callback is invoked in a timer, and not when opening connections.
+  It therefore doesn't affect opening time."**
+- `NpgsqlDataSourceBuilder.UsePasswordProvider(Func<…,string> sync,
+  Func<…,CancellationToken,ValueTask<string>> async)` remarks state verbatim:
+  **"Configures a password provider, which is called by the data source when opening
+  connections."** — one callback invoked on `Open()`, the other on `OpenAsync()`.
+- Neither method is marked `[Obsolete]` in 10.0.3 (checked via reflection).
+
+**Root cause — the user's hypothesis is CONFIRMED by Npgsql's own docs.** With
+`UsePeriodicPasswordProvider`, the token is fetched on a background timer that is
+*not* on the connection-open path. `Build()` returns before the first timer tick
+completes; the app then calls `db.Database.Migrate()` (a **synchronous** open —
+verified in `Program.cs:60`) immediately, which races ahead of that first fetch and
+finds an empty password → the exact "no password ... in cleartext" error, on the
+first-ever connection. The GSSAPI `libgssapi_krb5.so.2` log line was correctly a red
+herring (noted in §5a).
+
+**Chosen fix vs. the hypothesised fix.** The user's suggested fix (eagerly fetch a
+token and seed `Password=` while *keeping* the periodic provider) would also work,
+but the better-documented, cleaner fix is Npgsql's newer `UsePasswordProvider`,
+which is *designed* to run on the connection-open path — so the token is guaranteed
+present before the first auth handshake, with no timer to race, and no dead
+`Password=` seed to reconcile against the rotating provider. `TokenCredential`
+caches tokens in-memory and only hits the network near expiry, so calling it per
+physical open is cheap and still handles the ~60-minute rotation (no separate timer
+needed). Both the sync and async callbacks are supplied, because startup `Migrate()`
+takes the sync `Open()` path while request-time EF operations take `OpenAsync()`.
+
+## Fix applied
+
+- `src/TodoApi/Data/EntraTokenPasswordProvider.cs` (**new**): small, single-purpose,
+  testable class holding the injected `TokenCredential` and the Postgres AAD scope.
+  Exposes `GetPassword` (sync) and `GetPasswordAsync` (async) — the two callbacks
+  Npgsql invokes on connection open.
+- `src/TodoApi/Data/TodoDbContextRegistration.cs`: `BuildEntraAuthenticatedDataSource`
+  now wires `dataSourceBuilder.UsePasswordProvider(provider.GetPassword,
+  provider.GetPasswordAsync)` instead of `UsePeriodicPasswordProvider(...)`. Added an
+  `internal` overload that takes the `TokenCredential` as a parameter (the public path
+  passes `new DefaultAzureCredential()`), so token acquisition is injectable for
+  tests. Removed the now-unused `TokenRefreshPeriod`/`TokenRefreshFailureRetry`
+  fields. **Public contract unchanged**: the `Postgres:UseEntraAuth` gate, the
+  `UseEntraAuthKey` constant, the password-auth fallback path, and the
+  `AddTodoDbContext(IServiceCollection, IConfiguration)` signature are all untouched.
+- `src/TodoApi/TodoApi.csproj`: added `<InternalsVisibleTo Include="TodoApi.Tests" />`
+  so the test project can reach the internal seam.
+- `tests/TodoApi.Tests/TodoApi.Tests.csproj`: added `Azure.Identity` 1.21.0 (for
+  `TokenCredential`/`AccessToken` to build a fake credential in tests).
+
+## Test(s) added — the test that would have caught this
+
+`tests/TodoApi.Tests/EntraTokenPasswordProviderTests.cs` (**new**), using a fake
+instrumented `RecordingTokenCredential` (no network, no live server). It proves the
+property the old tests never asserted — that a **real, non-empty token is produced
+on the connection-open seam**, not deferred to a background timer:
+
+- `GetPassword_ReturnsFetchedTokenSynchronously_AndActuallyInvokesCredential` — the
+  synchronous `Open()` path (the one startup `Migrate()` uses) returns the token and
+  actually invokes the credential (call count = 1).
+- `GetPasswordAsync_ReturnsFetchedToken_AndActuallyInvokesCredential` — async path.
+- `GetPassword_NeverReturnsNullOrEmpty` — asserts directly against the exact live
+  failure mode (empty password → "no password ... in cleartext").
+- `GetPassword_RequestsTheAzurePostgresAadScope` — the correct
+  `https://ossrdbms-aad.database.windows.net/.default` scope is requested.
+- `Constructor_NullCredential_Throws`, `Constructor_BlankScope_Throws` (x2 Theory).
+- `BuildEntraAuthenticatedDataSource_WithInjectedCredential_BuildsWithoutThrowing`.
+- `BuildEntraAuthenticatedDataSource_DoesNotAcquireTokenUntilAConnectionIsOpened` —
+  building the data source alone triggers **zero** credential calls, documenting that
+  acquisition is tied to the open path (where it's guaranteed present).
+
+## What remains UNVERIFIED without a live Postgres server (human to do)
+
+These tests prove the token is available at the moment Npgsql asks for it (open
+time) — the property that was previously violated. They **cannot** prove the
+end-to-end first-connection against the real Entra-enabled Postgres Flexible Server
+succeeds, because there is no live server in this environment. The final live check
+(flip `Postgres__UseEntraAuth=true` on `todo-api`, confirm startup `Migrate()` and
+DB requests authenticate on the first connection) is left for the human to run
+against the deployed server, per the task. Npgsql does not expose the resolved
+password publicly, so opening a real connection is the only way to exercise the full
+data-source → provider → auth-handshake path.
+
+## Build & test verification
+
+Ran from `backend` with `C:\Users\ingda\dotnet10` prepended to PATH:
+
+- `dotnet build -c Release` → **Build succeeded, 0 Warning(s), 0 Error(s)**.
+- `dotnet test -c Release` → **Passed! Failed: 0, Passed: 53, Skipped: 0,
+  Total: 53** (was 44 before; +9 new Entra-auth regression cases). All pre-existing
+  tests still pass.
+
+## Security & PCI DSS scope
+
+No change to PCI scope — this app processes to-do items, not payment/cardholder
+data; no PAN/CVV/track data anywhere, so PCI DSS is not engaged. The fix is
+security-relevant only in that it **strengthens** the credential posture: the DB
+password is a short-lived Entra access token acquired via managed identity on the
+connection-open path, never stored and never logged (Npgsql passes it as the
+connection password; it is not emitted to any span or log). No secret/key/credential
+is hardcoded. `InternalsVisibleTo` widens visibility only to the test assembly, not
+across a trust boundary. The pre-existing `Trust Server Certificate=true` MITM
+caveat (devops-owned, flagged in the prior cycle) is unchanged by this fix.

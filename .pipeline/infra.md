@@ -160,3 +160,153 @@ Dominated by the always-on Burstable Postgres. Region/usage-dependent, not a quo
 | `todo-web` (min 1) | ~$4–12 (one always-on 0.25 vCPU replica) |
 | Postgres B1ms + 32 GiB | ~$16–18 |
 | **Total** | **~$25–37 / month** (idle floor ~$21–25) |
+
+---
+
+# Infrastructure — APPLY-mode result (2026-07-28, cycle 1 of 3) — Observability + managed-identity-first
+
+Branch: `pipeline/appinsights-tracing` (off `main`, the live already-deployed app).
+Mode: **APPLY**. Files authored/updated on disk; **nothing was provisioned** — no
+`az deployment/create/update`, no identity/credential/role assignment, no in-DB
+principal. Only local read-only validation (`az bicep build` + `az bicep lint`) was
+run. This section is the delta on top of the 2026-07-24 section above (which stays
+as-is); it does not supersede it.
+
+## Approved decisions (user, in chat, 2026-07-28)
+
+Applied against `.pipeline/infra-proposal.md` (2026-07-28). Deviations from that
+proposal are called out explicitly in "Deviations" below.
+
+| # | Decision | Approved value |
+|---|---|---|
+| — | App Insights | Workspace-based, reuses `log-todo-demo`, `kind: web`, `DisableLocalAuth: true`. No independent SKU/fee. |
+| 1 | Postgres Entra administrator | The human's own Entra user — objectId `ee31140f-3164-439c-8fa9-9f7e5dbd1b2c`, UPN `ing.david.mata.az_outlook.com#EXT#@ingdavidmataazoutlook.onmicrosoft.com`, type `User`, tenant `6ce2ff72-209a-447d-bf53-9579c52c03f5`. (Proposal §3b offered a group; user chose their own user.) |
+| 2 | Telemetry sampling | **100%** — backend OTel exporter default (`AzureMonitorOptions.SamplingRatio = 1.0`), a code-level setting. **No ARM property set** (see below). |
+| 3 | `Monitoring Metrics Publisher` role placement | **Manual** human grant (Phase 4 step C), NOT Bicep — matches the existing `AcrPull` manual-grant convention. |
+| 4 | Postgres auth mode | **Dual-auth** — `activeDirectoryAuth: Enabled` + `passwordAuth: Enabled`. Admin password kept as break-glass, NOT disabled. |
+| 5 | Log Analytics daily ingestion cap | **1 GB/day** (`workspaceCapping.dailyQuotaGb: 1`) — **user OVERRODE the proposal's "no cap" default**. Hard cost circuit-breaker; accepted tradeoff = telemetry silently drops once the cap is hit that UTC day. |
+
+## What was authored (files touched)
+
+| File | Change |
+|---|---|
+| `infra/modules/appinsights.bicep` | **NEW.** Workspace-based `Microsoft.Insights/components@2020-02-02`, `kind: web`, `Application_Type: web`, `WorkspaceResourceId` → existing `log-todo-demo`, `IngestionMode: LogAnalytics`, `DisableLocalAuth: true`. Outputs `connectionString`, `id`, `name`. |
+| `infra/modules/loganalytics.bicep` | Added `workspaceCapping.dailyQuotaGb` (new `dailyQuotaGb` param, default **1**). |
+| `infra/modules/postgres.bicep` | Added 4 Entra-admin params; set `authConfig` (dual-auth + `tenantId`); added the `flexibleServers/administrators` child resource (name = admin objectId). |
+| `infra/main.bicep` | New `appInsightsName` param + 4 `postgresEntraAdmin*` params; wired the `appinsights` module off `logAnalytics.outputs.id`; passed Entra-admin params to `postgres`; **dropped the `todo-db-connection` secret + `secretEnvVars`**; `ConnectionStrings__TodoDb` now a passwordless plain env var (`Username=todo-api`), plus new plain env vars `Postgres__UseEntraAuth=true` and `APPLICATIONINSIGHTS_CONNECTION_STRING`; added `appInsightsName`/`appInsightsId` outputs. `todo-web` unchanged. |
+| `infra/main.parameters.json` | Added the 4 `postgresEntraAdmin*` non-secret param values (approved values). |
+| `infra/README.md` | New **Phase 4** (App Insights + MI Postgres auth) with steps A/B/C, the **CUTOVER SEQUENCING** callout, an ad-hoc-deploy caveat, and Files-table updates. |
+
+**Managed-identity name / Postgres role / `Username=` — single source of truth:**
+`todo-api` (the Container App name == its system-assigned MI name == the Postgres
+role created in Phase 4 B == `Username=` in the passwordless connection string).
+
+**Net secret posture after this cycle:** the `todo-api` Container App has **zero
+Container Apps secrets**. All three of its config values are non-secret plain env
+vars. Only remaining credential anywhere is `PGADMIN_PASSWORD` (deploy-time CI/CD
+secret / break-glass), out of app-runtime scope. No Key Vault provisioned (§13.6).
+
+## Sampling: why NO ARM property was set (verified, not fabricated)
+
+`Microsoft.Insights/components` *does* expose a `SamplingPercentage` property, but
+it governs the **classic/legacy ingestion-sampling** path and does **not** drive the
+`Azure.Monitor.OpenTelemetry.AspNetCore` exporter. The requested 100% sampling is the
+exporter's own default (`AzureMonitorOptions.SamplingRatio = 1.0`), configured in
+**backend code** (already merged), not in ARM. Setting the ARM property would be
+misleading (it would imply it controls the OTel path). So it is intentionally left
+unset, with a note in `modules/appinsights.bicep` and README Phase 4. No fabricated
+property was added.
+
+## CUTOVER SEQUENCE the human MUST follow (live app — wrong order = DB outage)
+
+`main` is a running production app; `todo-api` runs `Migrate()` at startup, so a
+cold replica can fail to start if it cannot reach the DB. Strict order (full detail
++ the exact SQL/`az` commands are in `infra/README.md` Phase 4):
+
+1. **Deploy the Postgres server change** — enable Entra auth + set the Entra admin
+   (idempotent, does not disturb the running password path).
+2. **Create the in-DB principal** for todo-api's MI + grant schema/DDL rights:
+   connect to the `postgres` DB as the Entra admin and run
+   `pgaadauth_create_principal('todo-api', false, false)`, then grant/own `public`
+   on `tododb`. (Manual, in-database — cannot be Bicep.)
+3. **Grant `Monitoring Metrics Publisher`** to the todo-api MI on the AI component
+   (`az role assignment create`, scope = `appInsightsId` output) — before telemetry
+   starts, or ingestion 403s silently.
+4. **ONLY THEN** roll `todo-api` with the new env (single revision flip):
+   `Postgres__UseEntraAuth=true`, passwordless `ConnectionStrings__TodoDb`,
+   `APPLICATIONINSIGHTS_CONNECTION_STRING`, and the `todo-db-connection` secret
+   dropped.
+
+Because the Bicep now embeds all of step 4 (env vars + no secret), a single
+full-template apply does steps 1 AND 4 together — so **run steps 2 and 3 before the
+first full apply**, or split the deploy (server first, app last). Doing step 4
+before step 2 is the concrete outage scenario.
+
+> Note: per the established image/ordering model (README), **CD does not deploy
+> Bicep** — it only rolls images imperatively and (confirmed via grep) does NOT set
+> any env var or secret. So these new env vars take effect only on a **manual**
+> `az deployment group create`, which IS cutover step 4. No `cd.yml` /
+> `azure-pipelines.yml` change was needed this cycle.
+
+## Validation result (actual, local, read-only)
+
+- `az bicep build --file infra/main.bicep` → **exit 0, no errors, no warnings**
+  (Bicep CLI **0.45.15**).
+- `az bicep lint  --file infra/main.bicep` → **exit 0, clean, no findings**.
+- Compiled ARM (transient `main.json`, since removed) inspected to confirm the delta
+  landed: `DisableLocalAuth: true`, `WorkspaceResourceId`, `dailyQuotaGb`,
+  `authConfig.activeDirectoryAuth: Enabled` + `passwordAuth: Enabled`, the
+  `flexibleServers/administrators` resource, env vars `Postgres__UseEntraAuth` +
+  `APPLICATIONINSIGHTS_CONNECTION_STRING`, and **zero** occurrences of
+  `todo-db-connection` (secret successfully dropped).
+- `az deployment group validate` / `what-if` were **not** run — no Azure credentials
+  in this environment, and running them would touch the live subscription. They are
+  documented in `infra/README.md` for the human to run as the dry-run before applying.
+
+## Manual human bootstrap this cycle adds (NOT run by any agent)
+
+Full copy-pasteable commands are in `infra/README.md` **Phase 4**. Summary:
+- **A** — Postgres Entra admin + dual-auth: baked into Bicep params (applied on
+  template deploy; no separate command). Non-secret identity metadata.
+- **B** — `pgaadauth_create_principal('todo-api', false, false)` on the `postgres`
+  DB as the Entra admin + grant/own `public` schema on `tododb`. In-database SQL.
+- **C** — `az role assignment create --role "Monitoring Metrics Publisher"
+  --assignee <todoApiPrincipalId> --scope <appInsightsId>`. Requires `User Access
+  Administrator`/`Owner`.
+
+## Branch protection status on `main`
+
+Unchanged from the 2026-07-24 section and **still not verifiable here**: no git
+remote is configured and `gh` is not available in this environment, so
+`gh api repos/{owner}/{repo}/branches/main/protection` cannot be run. Until a remote
+exists and protection is enabled, the "a human reviews and merges the PR" gate is
+only a convention, not GitHub-enforced. Enable steps remain in `infra/README.md`
+(Settings → Branches → require PR, ≥1 approval, require the CI status check,
+up-to-date branch, no force-push/delete, no admin bypass).
+
+## Deviations from the proposal (with justification)
+
+1. **Daily ingestion cap: 1 GB/day applied** — the proposal §3e **recommended NO
+   cap**; the user explicitly overrode this to get a hard cost ceiling, accepting
+   that telemetry silently drops once the cap is hit on a given day. Implemented via
+   `workspaceCapping.dailyQuotaGb: 1` and documented as a tradeoff in the module +
+   README. This is a deliberate, user-directed deviation.
+2. **Entra admin = the user's own Entra user**, not the group the proposal §3b
+   preferred — the user supplied their own objectId/UPN. Functionally equivalent for
+   the bootstrap; a group would survive staff changes but was not chosen.
+3. No `SamplingPercentage` ARM property (see the sampling section) — a considered
+   non-action, not a deviation from any approved decision; 100% is honored in code.
+
+Everything else follows the proposal's recommendations as approved (manual role
+grant, dual-auth Postgres, workspace-based App Insights reusing `log-todo-demo`,
+zero app secrets, no Key Vault).
+
+## Estimated cost delta (this cycle)
+
+**~$0 fixed added.** Workspace-based App Insights has no fixed fee; role assignment,
+MI auth, and enabling Postgres Entra auth are free; dropping a Container Apps secret
+is free. The only variable is telemetry ingestion, billed usage-based through
+`log-todo-demo` at the Log Analytics per-GB rate (~5 GB/month free grant; a
+low-traffic demo is expected to sit inside it). The new **1 GB/day cap** bounds the
+worst case to ~1 GB/day of ingestion (est. **~$2.30–3.00/GB** beyond the free grant,
+region-dependent — ESTIMATE ONLY). Steady-state expected added cost ≈ **$0/month**.

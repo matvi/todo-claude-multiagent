@@ -1,241 +1,305 @@
-# Infrastructure proposal — 2026-07-24
+# Infrastructure proposal — 2026-07-28
 
-Mode: **PROPOSE** (no IaC, workflow YAML, or `azure-pipelines.yml` written this
-run — see §11.8). Branch: `pipeline/todo-app-azure-cicd`.
+Feature cycle: **Observability / distributed tracing (§12) + managed-identity-first
+identity & secrets policy (§13)**, branch `pipeline/appinsights-tracing` (off
+`main`). PROPOSE mode — nothing here is provisioned; this is authored + costed for
+SKU/decision sign-off before any Bicep is written.
 
-This is a **greenfield** infra run: there is no existing `infra/`,
-`.github/workflows/`, or `azure-pipelines.yml` in the tree yet (confirmed), so
-**every resource below is NEW**. Nothing is "changed" or "unchanged" relative to
-prior IaC — there is no prior IaC to diff against.
+> This is a **new proposal for a new cycle**, not an amendment. The resources in
+> the prior proposal (ACR Basic, ACA Consumption env, Postgres B1ms, two Container
+> Apps, Log Analytics `log-todo-demo`) are **already-deployed production reality on
+> `main`** and are NOT re-proposed here. Only the *delta* this feature introduces is
+> below. Everything not listed as **new** or **changed** stays exactly as deployed.
 
-The app itself (backend .NET 10 API, frontend Vite/React SPA, EF Core migrations,
-Dockerfiles, tests) is already built and green (29/29 backend, 37/37 frontend per
-`tests.md`). What is missing and being proposed here is only the **delivery layer**:
-the Azure resource SKUs the Bicep will provision, and the identity strategy for the
-pipelines that will deploy them.
-
-The spec (§11.9) and `architecture-memory.md` already **pre-commit** the SKU choices
-for a cost-conscious demo. This proposal therefore does two things:
-1. Restates each concrete resource + SKU + one-line rationale, tied to the "simple
-   demo app, cost-conscious" guidance, with a monthly cost estimate.
-2. Surfaces the handful of places where a **second reasonable choice exists**, as
-   explicit approve/choose options for the human — because that is the point of
-   PROPOSE mode. Where I recommend the spec's default, I say so; where I think a
-   spec detail is worth a second look, it is in **Open questions** (§5), not baked
-   silently into the table.
+Grounded against the actual deployed IaC: `infra/main.bicep`,
+`infra/main.parameters.json`, and `infra/README.md` (bootstrap Phases 1–3) as they
+stand today — not the original spec draft.
 
 ---
 
-## 1. Proposed Azure resources (all NEW)
+## 0. What this cycle changes vs. the deployed infra (the diff)
 
-Region baseline for every estimate below: **East US** (stated explicitly per the
-task; ACA + Postgres Flexible Server are both broadly available there, matching
-spec §5.3 default). Prices are **rough estimates**, USD, and Azure pricing changes
-over time and varies by region — treat every number as indicative, not a quote.
+| Resource / setting | State | This cycle |
+|---|---|---|
+| ACR (Basic), ACA env, Log Analytics `log-todo-demo`, `todo-web` | deployed | **unchanged** |
+| **Application Insights `appi-todo-demo`** | does not exist | **NEW** — workspace-based, backed by existing `log-todo-demo` |
+| **Role assignment: `todo-api` MI → `Monitoring Metrics Publisher` on `appi-todo-demo`** | does not exist | **NEW** |
+| **Postgres Flexible Server `pg-todo-demo-cus01`** | password auth only | **CHANGED** — enable Entra auth + set Entra administrator (server side, Bicep) |
+| **`todo-api` Container App secret `todo-db-connection`** | present, `ConnectionStrings__TodoDb` = `secretref` | **DROPPED** — becomes a passwordless, non-secret plain env var |
+| **`todo-api` App Insights connection** | did not exist as infra | **NEW, non-secret** — `APPLICATIONINSIGHTS_CONNECTION_STRING` as a plain env var (NOT a Container Apps secret) |
+| **`todo-api` env `Postgres__UseEntraAuth`** | absent (backend defaults to `false`) | **NEW** — set to `true` so the backend takes its Entra-token DB path (backend code already merged, §13.4) |
+| **Key Vault** | never provisioned | **still not provisioned** — see §6, no application secret requires it |
 
-| # | Resource | Type | Proposed SKU / tier | One-line rationale (demo, cost-conscious) |
-|---|----------|------|---------------------|-------------------------------------------|
-| 1 | `rg-todo-demo` | Resource group | n/a (free) | One RG per app/env per memory conventions; container for everything, no cost. |
-| 2 | `acrtododemo<suffix>` | Azure Container Registry | **Basic** | Cheapest ACR tier; one small repo of two images, no geo-replication or Premium features needed. |
-| 3 | `log-todo-demo` | Log Analytics workspace | **Pay-as-you-go, 30-day retention** | Backs the ACA environment's logs; tiny ingestion for a demo, retention kept at the spec-mandated 30 days. |
-| 4 | `cae-todo-demo` | Container Apps managed environment | **Consumption** workload profile | Pay-per-use, scale-to-zero capable; the environment resource itself has no standing charge — you pay only for the apps' usage. |
-| 5 | `todo-api` | Azure Container App (backend) | **Consumption**, 0.25 vCPU / 0.5 GiB, min **0** / max **3** | Scale-to-zero backend → ~$0 when idle; cold start is acceptable for a demo (§5.6). |
-| 6 | `todo-web` | Azure Container App (frontend) | **Consumption**, 0.25 vCPU / 0.5 GiB, min **1** / max **2** | Min 1 so the SPA loads instantly for demos; still the smallest replica size. |
-| 7 | `pg-todo-demo<suffix>` | Azure DB for PostgreSQL Flexible Server | **Burstable `Standard_B1ms`**, 32 GiB storage, PG 16, no HA, no read replica, LRS backup | Cheapest usable managed Postgres tier; single-DB demo has no need for General Purpose IOPS or HA. This is the one always-on cost center. |
-| 8 | `tododb` | PostgreSQL database (logical) | n/a (inside #7) | Single logical DB per spec §2/§5.3; no extra charge. |
-
-Identity / access notes baked into the plan (not separately billable):
-- Each Container App gets a **system-assigned managed identity** with **`AcrPull`**
-  on the registry (spec §11.3 preferred path — supersedes the admin-user fallback
-  the app-cycle `changes.md` used in the manual runbook).
-- Postgres uses **public access + the `0.0.0.0` "allow Azure services" firewall rule
-  + required TLS** (spec §5.4). No VNet, no private endpoint, no NAT gateway — each
-  of those would add cost and is explicitly out of scope (§8, §11.9).
-- Secrets (Postgres connection string) live as **Container Apps secrets**, not Key
-  Vault (spec §5.5) — one fewer resource, no standing cost.
+Net secret count on the deployed system after this cycle: **zero application runtime
+secrets** (the `todo-db-connection` Container Apps secret is removed and nothing
+replaces it). The only remaining credential anywhere is `PGADMIN_PASSWORD`, which is
+a **deploy-time CI/CD secret**, not an app-runtime secret (§13.9) — out of scope, unchanged.
 
 ---
 
-## 2. Estimated monthly cost (East US, ROUGH ESTIMATE)
+## 1. New / changed resources — concrete SKU/tier + rationale
 
-> These are estimates for planning only. Actual cost depends on region, real
-> traffic, ingestion volume, and current Azure list prices, which change over time.
-> Figures assume a genuinely idle-to-light demo (a handful of requests, minimal log
-> ingestion), which is the intended usage per spec §7 / §11.9.
+### 1a. Application Insights `appi-todo-demo` — **NEW**
 
-| Resource | SKU | Est. monthly cost | Notes on the estimate |
-|----------|-----|-------------------|-----------------------|
-| Resource group | — | **$0** | No charge for the RG itself. |
-| ACR | Basic | **~$5** | Basic is a flat ~$0.167/day standing charge; storage for two small images is within the included quota. |
-| Log Analytics | PAYG, 30-day | **~$0–2** | First 5 GB/month ingestion free, then ~$2.76/GB; a demo ingests well under that. First 31 days retention free, so 30-day retention adds nothing. |
-| ACA environment | Consumption | **$0** | The environment has no standing charge; usage bills via the apps below. |
-| `todo-api` (backend) | Consumption, min 0 | **~$0–2** | Scale-to-zero: no replicas running when idle → mostly covered by the monthly free grant (180k vCPU-s + 360k GiB-s + 2M requests per subscription). |
-| `todo-web` (frontend) | Consumption, min 1 | **~$4–12** | Always-on single 0.25 vCPU / 0.5 GiB replica. Mostly billed at the lower **idle** vCPU rate when not serving requests; the free grant offsets part of it. Range reflects idle-vs-active uncertainty. |
-| PostgreSQL Flexible Server | Burstable B1ms, 32 GiB | **~$16–18** | Compute ~$13–15/mo (1 vCore burstable, always on) + 32 GiB storage ~$3–4/mo. LRS backup within the free-equal-to-provisioned-storage allowance. **The dominant, always-on cost.** |
-| **Total** | | **~$25–37 / month** | Dominated by Postgres; the rest is near-zero when the demo is idle. Lands in the "low single-digit to low-double-digit USD/month" the spec targets (§7, §11.9). |
+- **Type / "SKU":** `Microsoft.Insights/components`, `kind: web`,
+  `Application_Type: web`, **workspace-based** (`IngestionMode: LogAnalytics`,
+  `WorkspaceResourceId` → the **existing** `log-todo-demo` workspace's resource id).
+  Workspace-based App Insights has **no independent pricing SKU** of its own — it has
+  no fixed monthly fee; all billing flows through the backing Log Analytics
+  workspace's tier, which is already `PerGB2018` (pay-as-you-go) at 30-day retention.
+  So the only "tier" decision is *reuse the existing workspace*, which the spec
+  (§12.6) mandates.
+- **`DisableLocalAuth: true`** — per §13.5, this turns off shared-key (instrumentation
+  key) ingestion so the embedded key in the connection string stops being a usable
+  credential; ingestion then requires an Entra identity with the publisher role
+  (1b below). This is the single setting that makes "connection string = non-secret"
+  true rather than aspirational.
+- **Region:** `eastus` (same as `log-todo-demo` / the ACA env). App Insights follows
+  its workspace's region; this is independent of the Postgres `centralus`
+  region-restriction (§12.6) — **no contradiction** with architecture-memory.
+- **Rationale:** one new resource satisfies the whole §12 tracing requirement; reusing
+  the single existing workspace keeps the "single of everything" posture, one queryable
+  telemetry store, and adds no second retention setting or cost center.
+- **IaC shape (to be authored in Mode 2, not now):** new `infra/modules/appinsights.bicep`
+  taking the workspace id in and emitting `connectionString` as an output; wired in
+  `main.bicep` off `logAnalytics.outputs.id`. **No second Log Analytics workspace.**
 
-Cheapest realistic idle floor (backend at zero, frontend barely used, no log
-ingestion spike): **~$21–25/month**, essentially Postgres B1ms + ACR Basic.
+### 1b. Role assignment: `todo-api` MI → `Monitoring Metrics Publisher` on `appi-todo-demo` — **NEW**
 
----
+- **Role:** `Monitoring Metrics Publisher`
+  (`3913510d-42f4-4e42-8a64-420c390055eb`), scoped to the `appi-todo-demo` component,
+  assigned to `todo-api`'s **existing system-assigned managed identity** (its
+  `principalId` is already a `main.bicep` output). This is what lets the backend's
+  `DefaultAzureCredential` publish telemetry once local auth is disabled (1a).
+- **Placement — decision point, see §3c.** Recommendation: apply it as a **manual
+  human bootstrap step**, consistent with how the existing `AcrPull` grants are
+  handled in this repo (excluded from the CD-runnable Bicep because a `Contributor`
+  principal can't write role assignments — `infra/README.md` Phase 3). The spec
+  (§13.10) says "Bicep, AcrPull pattern already there," but in *this* repo the AcrPull
+  pattern is a manual Phase-3 grant, not Bicep — so following the real convention means
+  a manual grant. Cost: **free**.
 
-## 3. Decision points (where a second reasonable choice exists)
+### 1c. Postgres `pg-todo-demo-cus01` — enable Entra auth + set Entra administrator — **CHANGED**
 
-These are the choices a human should explicitly approve. For each, the **spec's
-default is the left/recommended option** and I recommend keeping it for this demo;
-the alternatives are documented so the choice is deliberate, not assumed.
+- **No SKU/tier change.** Stays Burstable `Standard_B1ms`, PG16, 32 GiB, no HA, LRS
+  backup, `centralus`, public access + "allow Azure services" firewall + TLS — all
+  exactly as deployed. Immutable properties (name `pg-todo-demo-cus01`, `centralus`)
+  are untouched (they must stay pinned per `main.parameters.json`).
+- **What changes (server side, in Bicep):**
+  - Set `properties.authConfig` to **enable Entra (Azure AD) authentication**
+    alongside password auth: `activeDirectoryAuth: 'Enabled'`,
+    `passwordAuth: 'Enabled'` (dual-auth — keep the admin password as break-glass;
+    Entra-only is the optional hardening in §3d, not recommended for this demo).
+  - Add the `Microsoft.DBforPostgreSQL/flexibleServers/administrators` child resource
+    to set the **Entra administrator** (an Entra user or group — the identity that then
+    runs the manual `pgaadauth_create_principal` step). Requires `objectId`,
+    `principalName`, `principalType`, and `tenantId` — these are **inputs a human must
+    supply** (see §3b).
+- **Rationale:** §13.4 mandate — `todo-api` authenticates to Postgres with its managed
+  identity via an Entra token (backend code already merged), which requires the server
+  to accept Entra auth and to have an admin who can create the MI's DB role. Cost: **free**.
+- **NOT in Bicep (cannot be):** the in-database `pgaadauth_create_principal` + grants —
+  those run *inside* Postgres as the Entra admin and are a manual human step (§4).
 
-### 3.1 PostgreSQL compute tier — **B1ms vs B2s** (this is the meaningful cost lever)
+### 1d. `todo-api` Container App env/secret wiring — **CHANGED**
 
-| Option | Est. monthly cost | Suited for | Limits |
-|--------|-------------------|------------|--------|
-| **Burstable `Standard_B1ms`** (1 vCore, 2 GiB) — spec default | **~$16–18** (compute+storage) | Idle/low-traffic demo, single anonymous user, occasional CRUD | Burstable CPU credits; sustained load will throttle. 2 GiB RAM. No HA. |
-| Burstable `Standard_B2s` (2 vCore, 4 GiB) | **~$29–31** | A demo that might get live/interactive traffic during a presentation | Still burstable (credit-limited under sustained load), just a higher baseline. Roughly doubles the DB bill. |
-| General Purpose `Standard_D2s_v3` (2 vCore, 8 GiB) | **~$95–125+** | Production-ish steady workloads | Overkill for a demo; ~5–7× the cost. **Not recommended** and would violate §11.9 without an explicit note. |
-
-**Recommendation: `Standard_B1ms`.** The workload is a single anonymous user doing
-occasional CRUD against one small table (spec §1/§2), and idle cost is the stated
-priority (§7, §11.9). B1ms is the cheapest tier that still runs Postgres 16 with
-TLS. If a live demo is expected to have several concurrent users hammering it,
-B2s is the clean one-parameter bump — but that is a conscious, cost-doubling choice
-for the human to make, not a default.
-
-### 3.2 Container Apps plan — **Consumption vs Dedicated**
-
-| Option | Est. monthly cost | Suited for | Limits |
-|--------|-------------------|------------|--------|
-| **Consumption workload profile** — spec default | **~$4–14** (mostly frontend always-on) | Bursty/idle demo workloads; scale-to-zero backend | Cold starts on scale-from-zero; per-request billing. |
-| Dedicated workload profile (D4, etc.) | **~$150+** (reserved cores, always on) | Steady high-throughput, VNet-heavy, compliance isolation | Standing charge for reserved compute even when idle. **Explicitly forbidden by §11.9.** |
-
-**Recommendation: Consumption.** Spec §11.9 mandates it and forbids Dedicated. No
-reason to deviate — the demo benefits from scale-to-zero and has no isolation or
-sustained-throughput requirement. Listed only so the choice is on record.
-
-### 3.3 Container Registry — **Basic vs Standard**
-
-| Option | Est. monthly cost | Suited for | Limits |
-|--------|-------------------|------------|--------|
-| **Basic** — spec default | **~$5** | One project, a couple of small images, low pull volume | 10 GiB included storage, lower throughput, no geo-replication. Plenty for two images. |
-| Standard | **~$20** | More repos/images, higher pull throughput, teams | Adds included storage/throughput the demo won't use. |
-| Premium | **~$50+** | Geo-replication, private link, content trust | Enterprise features entirely out of scope (§8/§11.9). |
-
-**Recommendation: Basic.** Two small images, single region, low pull volume — Basic
-covers it at the lowest cost. Standard/Premium buy throughput and geo features this
-demo has no use for.
-
-### 3.4 Frontend Container App — **min replicas 1 vs 0**
-
-| Option | Est. monthly cost impact | Suited for | Limits |
-|--------|--------------------------|------------|--------|
-| **min 1** — spec default (§5.6) | **~$4–12/mo** (always-on replica) | Live demos where instant SPA load matters | Small standing cost even when nobody's using it. |
-| min 0 (scale-to-zero) | **~$0 idle** | Absolute cost minimization; you accept a cold start on the first hit | First visitor waits for a cold start (nginx starts fast, so the penalty is small). |
-
-**Recommendation: min 1** (spec default) for better demo UX — but this is the single
-cheapest thing to flip if idle cost must be near-zero. Spec §5.6 explicitly allows 0
-"if cost is paramount." Low-stakes, easily reversible either way.
-
----
-
-## 4. Identity strategy — OIDC federated credentials (summary only; NOT created here)
-
-Per spec §11.6 and `architecture-memory.md` (2026-07-24 entry), CI/CD authenticates
-to Azure via **OpenID Connect / workload identity federation — no stored client
-secret**. GitHub Actions (`azure/login@v2`) and the Azure DevOps equivalent (a
-workload-identity-federation ARM service connection) both mint short-lived,
-per-run tokens scoped to the repo/branch/environment.
-
-**This is a manual, one-time, human bootstrap.** No agent — including this one —
-creates app registrations, federated credentials, RBAC role assignments, or GitHub
-secrets/variables (§8, §11.6, §11.8; hard rule in architecture-memory). This
-proposal does **not** re-invent those commands; the exact `az ad app create` /
-`az ad sp create` / `az ad app federated-credential create` /
-`az role assignment create` / `gh variable set` / `gh secret set` sequence is
-already written verbatim in **spec §11.6** and is the single source of truth. When
-this stage moves to APPLY, that same block will be copied into `infra/README.md` /
-`infra.md`, clearly labelled "manual, run once, by a human."
-
-What the pipelines will **reference** (never create):
-- GitHub **variables**: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`
-  (not secret — no credential material; OIDC stores nothing sensitive in GitHub).
-- GitHub **secrets**: `PGADMIN_PASSWORD` (Postgres admin password), and
-  `TODO_DB_CONNECTION` if the connection string is assembled outside Bicep — these
-  feed the `@secure()` Bicep parameters (§11.3). No secret is ever committed to git
-  or hardcoded in IaC/YAML.
-
-RBAC scope (from §11.6): `Contributor` on **`rg-todo-demo`** (not the whole
-subscription) + `AcrPush` on the registry — least-privilege for a demo; a reviewer
-may tighten further. If `main.bicep` ends up subscription-scoped (to create the RG
-itself), the SP would need subscription-scope Contributor OR the human pre-creates
-the RG and keeps the SP scoped to it (recommended). **This RG-scope-vs-subscription-
-scope Bicep decision is deferred to APPLY and flagged in §5 below.**
-
-**Who does it:** a human with Owner (or User Access Administrator + Contributor) on
-the target subscription (spec assumption §9.9), once, before the first CD run.
+- **DROP** the `todo-db-connection` Container Apps secret entirely, and the
+  `Password=…` from the connection string. `ConnectionStrings__TodoDb` becomes a
+  **plain (non-secret) env var**, passwordless, with `Username=` set to the managed
+  identity's Postgres role name (not `todoadmin`):
+  `Host=<server>.postgres.database.azure.com;Port=5432;Database=tododb;Username=<mi-role-name>;Ssl Mode=Require;Trust Server Certificate=true`.
+- **ADD** `APPLICATIONINSIGHTS_CONNECTION_STRING` as a **plain (non-secret) env var**
+  (value = `appinsights.outputs.connectionString`). Flat name, no `__` (§12.5). NOT a
+  Container Apps secret, NOT Key Vault.
+- **ADD** `Postgres__UseEntraAuth=true` plain env var so the merged backend code takes
+  its Entra-token DB path in Azure (it defaults to `false` = local password path).
+- **No change to `todo-web`** — it holds no credentials.
+- **Cost:** none (env var changes are free); the `@secure() postgresAdminPassword`
+  param stays only for server *provisioning*, not app runtime.
 
 ---
 
-## 5. Open questions / things to reconsider (flagged, NOT baked into the proposal)
+## 2. Cost estimate for the NEW resource (Application Insights ingestion)
 
-These are surfaced deliberately rather than silently decided. None is blocking; all
-are for reviewer/human sign-off.
+**Fixed monthly cost added by this cycle: ~$0.** Workspace-based App Insights has **no
+fixed fee**; the role assignment and managed-identity auth are **free**; enabling
+Entra auth on Postgres is **free**; dropping a Container Apps secret is **free**. This
+cycle is cost-neutral-to-negative on the §11.9 posture (it removes a stored secret and
+provisions no Key Vault).
 
-1. **Bicep `main.bicep` scope: resource-group-scoped vs subscription-scoped.**
-   Spec §11.3 leaves this to the devops agent ("picks one and documents it"). It
-   directly affects the OIDC SP's required RBAC scope (§4 above): subscription-scope
-   Bicep that creates the RG needs subscription-level Contributor, which is broader
-   than the least-privilege §11.6 intent. **Leaning recommendation for APPLY:**
-   human pre-creates `rg-todo-demo` (`az group create`), `main.bicep` is
-   **RG-scoped**, SP stays scoped to the RG. Calling it out now so the identity
-   bootstrap and the Bicep scope are decided together, not in conflict.
+**The only variable is telemetry ingestion**, billed usage-based through the existing
+`log-todo-demo` workspace at the Log Analytics per-GB rate:
 
-2. **`AcrPull` role assignment inside Bicep vs the deploying SP's privilege.**
-   §11.3 wants the Container Apps' managed identities granted `AcrPull` **via Bicep**
-   (a role assignment resource). Creating a role assignment requires the *deploying*
-   principal to have `Microsoft.Authorization/roleAssignments/write` (e.g. Owner or
-   User Access Administrator) — plain `Contributor` (what §11.6 grants the CI SP)
-   **cannot create role assignments**. So either the CI SP needs a higher role, or
-   the `AcrPull` assignment is done once by the human during bootstrap and left out
-   of the CD-run Bicep. This is a real friction point between §11.3 and §11.6 that
-   should be resolved before APPLY. **Recommendation:** do the managed-identity
-   `AcrPull` grant as part of the one-time human bootstrap, and keep the repeatable
-   CD Bicep to Contributor-only operations — worth explicit reviewer agreement.
+- **Free grant: ~5 GB/month** before ingestion is billed (per the spec §12.9 framing;
+  region/account-dependent). A low-volume single-user demo with scale-to-zero backend
+  is expected to sit **well inside** the free grant → **real-world cost ≈ $0/month**.
+- **Beyond the grant:** roughly **~$2.30–$3.00 per GB** ingested (region-dependent;
+  **estimate only** — confirm against the Azure Monitor pricing page for the actual
+  region). At, say, a hypothetical 10 GB/month you'd pay for ~5 GB over the grant ≈
+  **~$12–15/month** — not expected at demo traffic, shown only to make the pricing
+  model explicit rather than silently assumed.
+- **Retention cost: $0.** The workspace keeps its existing **30-day** retention, which
+  is within Log Analytics' included ~31-day retention — no added retention charge, and
+  we do **not** raise it (§11.9).
 
-3. **Backend↔frontend CORS/ordering within a single Bicep deploy.** Spec §11.5/§11.7
-   flags that the frontend bakes the backend FQDN at build time and the backend must
-   allow the frontend FQDN via CORS — a two-phase apply. The spec offers two paths
-   (imperative image updates after one Bicep run, recommended; or run Bicep twice).
-   This is an APPLY-stage implementation detail, not a SKU/cost decision, but noting
-   it here so it isn't forgotten: it does not change any resource or cost in §1–§2.
+**Pricing model, stated so it isn't assumed:** you pay per **GB ingested** into the
+workspace, not per request/trace; the levers that control that volume are **sampling**
+(§3a) and an optional **daily ingestion cap** (§3e). If projected ingestion ever
+becomes non-trivial, that gets flagged in `changes.md` per the §11.9 "no silent
+costlier choices" rule.
 
-4. **Frontend hosting model (Static Web Apps) — settled, not reopening.** Memory and
-   §5.2 firmly chose "both on Container Apps." I am **not** proposing to change it;
-   noting only that the frontend `todo-web` always-on replica (§3.4) is the second-
-   largest line item after Postgres, and Static Web Apps would be cheaper for the SPA
-   alone. Per the memory rules this is a settled decision; I flag it only as the
-   known cost/architecture tradeoff a future cost-minimization cycle would revisit,
-   exactly as §5.2 itself already says. No action requested.
+---
 
-5. **`npm audit` / lint in CI.** Not a SKU/infra decision, but relevant to the CI
-   workflow authored at APPLY: `changes.md` warns the Vite 5 dev-toolchain advisories
-   (esbuild/vite) would fail a naive `npm audit --audit-level=high` gate. The CI job
-   (§11.4) should **not** add such a gate, or must set the level to not fail on those
-   known dev-only advisories. Recording it here so it's on the radar for the CI YAML.
+## 3. Decision points (more than one reasonable choice exists)
+
+### 3a. Azure Monitor exporter sampling percentage
+- **Options:** 100% (capture every trace) · fixed sampling (e.g. 25–50%) · adaptive sampling.
+- **Recommendation: 100%** for this low-traffic demo — full fidelity, and volume is
+  trivially inside the free grant, so no reason to drop traces. **The lever exists**:
+  if traffic ever grows enough that ingestion approaches the free grant, switch to fixed
+  or adaptive sampling on the exporter (a backend `TelemetryRegistration` change, not an
+  infra change) to cap ingestion cost. Note this is a **backend-code** knob, not Bicep —
+  called out here so the reviewer knows where the cost dial lives.
+
+### 3b. Postgres Entra administrator identity (human input required)
+- **Options:** an individual **Entra user** (simplest for a demo) · an **Entra group**
+  (better — survives staff changes, lets several people administer without editing infra).
+- **Recommendation: an Entra group** if one is readily available, else the deploying
+  human's own user. Either way the human must supply `objectId` / `principalName` /
+  `principalType` (`User` or `Group`) / `tenantId` as Bicep params — these are **not
+  guessable** and are a required input before Mode 2 can author/validate the Postgres change.
+
+### 3c. Where the `Monitoring Metrics Publisher` role assignment lives
+- **Options:** (a) authored in `main.bicep` (spec §13.10's literal wording) · (b) a
+  **manual human Phase-3 grant** like the existing `AcrPull` grants.
+- **Recommendation: (b), manual grant.** It matches this repo's actual established
+  convention (`infra/README.md` deliberately keeps role assignments out of the
+  CD-runnable Bicep because a `Contributor` principal can't create them). Putting it in
+  Bicep would only be safe if the *infra-deploy* identity holds `User Access
+  Administrator`/`Owner`; since infra here is human-deployed and role grants are already
+  a documented manual Phase 3, adding one more `az role assignment create` there is the
+  consistent, lowest-surprise choice. Flagging the spec-vs-repo discrepancy explicitly.
+
+### 3d. Postgres dual-auth vs. Entra-only
+- **Options:** **dual** (`passwordAuth: Enabled` + `activeDirectoryAuth: Enabled`) ·
+  **Entra-only** (`passwordAuth: Disabled`).
+- **Recommendation: dual-auth.** Keeps the admin password as a break-glass path and
+  avoids a hard cutover for a live app (§13.4 lists Entra-only as *optional* hardening).
+  Entra-only would also strand `PGADMIN_PASSWORD` and any password-based break-glass —
+  defer it to a later hardening cycle.
+
+### 3e. Optional daily ingestion cap on `log-todo-demo`
+- **Options:** no cap (default) · a small daily cap (e.g. 1 GB/day) as a cost circuit-breaker.
+- **Recommendation: no cap** for the demo (a cap can *drop* telemetry once hit, which is
+  worse than a few dollars). Noted as an available guardrail if ingestion ever spikes.
+
+---
+
+## 4. Manual / human-only bootstrap steps this cycle adds
+
+These are **run once, by a human** with the right privileges — **never by an agent**
+(PROPOSE mode, §11.8 / §13.10). They extend the existing `infra/README.md` Phase 3 and
+follow the exact same "manual, human-run" convention as the OIDC/RBAC and `AcrPull`
+bootstrap already documented there. In Mode 2 these get written verbatim into
+`infra/README.md`; listed here for sign-off.
+
+**(A) Postgres Entra admin — supply inputs, then the Bicep server-side change sets it.**
+A human provides the Entra admin `objectId` / `principalName` / `principalType` /
+`tenantId` (§3b) as deploy params; the Bicep `administrators` child resource + `authConfig`
+do the server-side enablement. (Bicep-authored, human-applied — same as all infra here.)
+
+**(B) Create the managed identity's Postgres role + grant it schema/DDL rights
+(cannot be done in Bicep — runs inside the database).** Connect to the **`postgres`**
+database **as the Entra administrator** and run:
+```sql
+-- run as the Entra admin, connected to the `postgres` database
+select * from pgaadauth_create_principal('<todo-api-managed-identity-name>', false, false);
+-- then, connected to tododb, grant the new role what startup Migrate() needs:
+--   CONNECT on tododb, USAGE/CREATE on the schema, and table DDL/DML rights
+--   (schema ownership is simplest for the demo's auto-migrate-at-startup path).
+```
+`<todo-api-managed-identity-name>` is the name of `todo-api`'s system-assigned managed
+identity (this becomes the `Username=` in the passwordless connection string, §1d).
+This mirrors the §11.6 OIDC bootstrap in style and labeling: **manual, run once, by a human.**
+
+**(C) Grant `Monitoring Metrics Publisher` (per §3c recommendation — manual Phase-3 grant):**
+```bash
+# Human with User Access Administrator/Owner, after the AI component + app identity exist:
+az role assignment create \
+  --assignee "<todo-api-managed-identity-principalId>" \
+  --role "Monitoring Metrics Publisher" \
+  --scope "<appi-todo-demo resource id>"
+```
+
+---
+
+## 5. Open questions / risks
+
+1. **Dead config cleanup — the old password path becomes orphaned.** Once `todo-api`
+   cuts to Entra auth, the `todo-db-connection` Container Apps secret and the
+   password-based connection string are **dead config**. They must be actively removed
+   from the `todo-api` Container App (not just left dangling) so a stale
+   password-bearing secret doesn't linger in the deployed app. The admin password itself
+   stays only for server provisioning/break-glass (dual-auth, §3d); it is no longer an
+   app runtime credential.
+
+2. **Cutover sequencing on a LIVE app (highest risk).** This is a running production app
+   on `main`, not a fresh bootstrap. If the env flips to `Postgres__UseEntraAuth=true`
+   **before** the in-DB principal exists and is granted (step 4B), the backend loses DB
+   connectivity — and because migrations run at startup (§3.4), a cold-started replica
+   could fail its startup `Migrate()`. Safe order:
+   **(i)** deploy the Postgres Entra-auth server change + set the Entra admin →
+   **(ii)** run `pgaadauth_create_principal` + grants (4B) →
+   **(iii)** grant `Monitoring Metrics Publisher` (4C) + provision the AI component
+   with `DisableLocalAuth: true` →
+   **(iv)** *only then* update `todo-api`: set `Postgres__UseEntraAuth=true`, swap
+   `ConnectionStrings__TodoDb` to the passwordless value, add
+   `APPLICATIONINSIGHTS_CONNECTION_STRING`, and drop the `todo-db-connection` secret.
+   Doing (iv) before (ii) is the concrete outage scenario to avoid. A single revision
+   flip with all of (iv) at once (rather than piecemeal) is cleanest.
+
+3. **`DisableLocalAuth: true` ordering.** If local auth is disabled on the AI component
+   **before** the `Monitoring Metrics Publisher` grant (4C) propagates, telemetry
+   ingestion **silently fails** (403) — the app still runs (exporter errors are
+   non-fatal) but no traces land. Grant the role first (or accept a brief gap while RBAC
+   propagates, which can take a few minutes). This is telemetry-only risk, not an app-availability risk.
+
+4. **`Trust Server Certificate=true` remains** in the connection string — it encrypts
+   but skips CA verification (MITM-susceptible). Unchanged from today and **out of this
+   cycle's scope**; the production hardening (`SslMode=VerifyFull` + Azure Postgres CA)
+   is already flagged in prior review/`changes.md`. Noted so it isn't assumed fixed here.
+
+5. **Postgres role name coupling.** The passwordless `Username=` must exactly match the
+   principal name created in 4B (the MI's name). A mismatch fails auth. Whoever runs 4B
+   and whoever sets the connection string must agree on the exact managed-identity name —
+   worth a single documented source of truth in `infra/README.md`.
+
+6. **Key Vault — deliberately NOT proposed (§6 below).** Flagging only so a reviewer who
+   expected one knows its absence is intentional, not an omission.
+
+---
+
+## 6. Key Vault — not provisioned (agree with the spec)
+
+I **agree** with §13.6's conclusion: after this cycle, every application credential is
+covered by managed identity / Entra (Postgres via MI token; App Insights via MI + local
+auth disabled; ACR pull via MI; CI/CD via OIDC). **Zero application runtime secrets
+remain**, so nothing reaches the "cannot use managed identity" branch that would require
+Key Vault. Provisioning `kv-todo-demo` now would add a resource and per-operation cost to
+hold nothing. The Key Vault pattern stays **specified for the future** (§13.6) — the
+first future secret that genuinely cannot use MI triggers it — but it is correctly **not
+instantiated** this cycle. No disagreement.
 
 ---
 
 ## Status
 
-Proposal ready. **Waiting on SKU approval** before proceeding to APPLY mode.
-
-Concretely, the human decisions requested are:
-- Confirm **Postgres `Standard_B1ms`** (or choose B2s) — §3.1 — this is the main
-  cost lever.
-- Confirm **ACA Consumption**, **ACR Basic**, **frontend min replicas = 1** (or 0)
-  — §3.2 / §3.3 / §3.4 (all spec defaults; confirm or adjust).
-- Acknowledge the two OIDC/RBAC frictions in §5 items 1–2 so the manual identity
-  bootstrap and the Bicep scope are decided consistently before any APPLY run.
-
-No files under `infra/`, `.github/workflows/`, or `azure-pipelines.yml` were
-created or modified, and no Azure resource, credential, or role assignment was
-provisioned (PROPOSE mode, §11.8). Next step is a human approving the SKUs above,
-after which APPLY mode authors the Bicep + pipelines using the approved choices.
+**PROPOSE mode — proposal ready, waiting on SKU/decision sign-off.** No file under
+`infra/`, `.github/workflows/`, or `azure-pipelines.yml` was created or modified, and
+no Azure resource, role assignment, or credential was touched. On approval (App Insights
+workspace-based reuse of `log-todo-demo`; the four decision points in §3 — recommendations:
+100% sampling, Entra **group** admin, **manual** role grant, **dual-auth** Postgres, **no**
+daily cap), Mode 2 will author `infra/modules/appinsights.bicep`, the Postgres Entra-auth +
+`todo-api` env changes, the `Monitoring Metrics Publisher` grant, and the `infra/README.md`
+manual-bootstrap additions, then validate with `az deployment group what-if` / `validate`
+only (never apply).
