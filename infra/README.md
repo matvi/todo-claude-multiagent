@@ -12,7 +12,7 @@ Postgres **Standard_B1ms** · ACA **Consumption** · ACR **Basic** ·
 
 | Path | Provisions |
 |---|---|
-| `main.bicep` | RG-scoped entry point; wires the modules; assembles the DB connection string as a backend Container Apps secret; emits outputs. |
+| `main.bicep` | RG-scoped entry point; wires the modules; assembles the **passwordless, non-secret** DB connection string as a **plain env var** on `todo-api` (Entra-only app auth, specs §14 — it is *not* a Container Apps secret and there is no `todo-db-connection` secret); emits outputs. |
 | `main.parameters.json` | Dev/demo **non-secret** parameter values. The `@secure()` `postgresAdminPassword` is **not** here — it is supplied at deploy time from a secret. |
 | `modules/registry.bicep` | Azure Container Registry (Basic, admin user disabled). |
 | `modules/loganalytics.bicep` | Log Analytics workspace (PerGB2018, 30-day retention, **1 GB/day ingestion cap** — cost circuit-breaker). |
@@ -173,13 +173,14 @@ az role assignment create --assignee "$WEB_PID" --role AcrPull --scope "$ACR_ID"
 After Phase 3, the CD workflow (`.github/workflows/cd.yml`) can build/push real
 images and roll the apps on every merge to `main` with zero stored Azure secrets.
 
-### Phase 4 — App Insights + managed-identity Postgres auth (this cycle, `pipeline/appinsights-tracing`)
+### Phase 4 — Entra-ONLY Postgres auth for the app (+ App Insights) — cutover runbook
 
 > **Run once, by a human. No agent runs any command here.** These extend the
 > Phase 1–3 bootstrap and follow the same "manual, human-run" convention as the
 > OIDC/RBAC and `AcrPull` grants. They cover the observability + managed-identity
-> cutover (specs §12 / §13) approved by the user on 2026-07-28. SKU/decisions
-> baked into the Bicep this cycle:
+> work (specs §12 / §13, approved 2026-07-28) and its completion as
+> **Entra-only application DB auth** (specs §14, approved 2026-08-06).
+> SKU/decisions baked into the Bicep:
 > - **App Insights** `appi-todo-demo`: workspace-based (reuses `log-todo-demo`),
 >   `DisableLocalAuth: true`, no independent SKU/fee.
 > - **Sampling: 100%** — this is the backend OTel exporter default
@@ -187,8 +188,16 @@ images and roll the apps on every merge to `main` with zero stored Azure secrets
 >   ARM property. Nothing to set on the component; see the note in
 >   `modules/appinsights.bicep`.
 > - **Postgres:** dual-auth (`activeDirectoryAuth: Enabled` + `passwordAuth:
->   Enabled` — password kept as break-glass), Entra admin set to the deploying
->   user (baked into `main.parameters.json`, non-secret identity metadata).
+>   Enabled`), Entra admin set to the deploying user (baked into
+>   `main.parameters.json`, non-secret identity metadata).
+>   **`passwordAuth: Enabled` and the `todoadmin` login are KEPT ON PURPOSE — do
+>   not "helpfully" disable them.** Specs §14.1/§14.12: "Entra-only" is a property
+>   of **the application's connection**, not of the server. The human operator
+>   still needs password `psql`/admin access for the step B SQL below, for
+>   break-glass, and for the recovery path in step D. Disabling password auth or
+>   removing `postgresAdminUser` / the `@secure() postgresAdminPassword` param /
+>   the `PGADMIN_PASSWORD` CI secret is explicitly out of scope and would break
+>   the runbook.
 > - **Role grant** (`Monitoring Metrics Publisher`): a **manual** grant here
 >   (step C below), NOT in Bicep — same reason as the `AcrPull` grants (a
 >   `Contributor` principal cannot write role assignments).
@@ -197,34 +206,41 @@ images and roll the apps on every merge to `main` with zero stored Azure secrets
 >   **Tradeoff:** once 1 GB is ingested on a given UTC day, further telemetry is
 >   **silently dropped** until the next day.
 
-> ## ⚠️ CUTOVER SEQUENCING — READ BEFORE APPLYING (live, already-deployed app)
+> ## ⚠️ CUTOVER SEQUENCING — READ BEFORE RUNNING ANYTHING (live, already-deployed app)
+>
 > `main` is a running production app on Azure Container Apps. Getting the order
 > wrong causes a **DB connectivity outage** (the backend runs `Migrate()` at
-> startup, so a cold-started replica can fail to start). Apply strictly in this
-> order — do NOT flip `todo-api`'s env vars first:
+> startup, so a cold-started replica can fail to start). Two facts drive the whole
+> runbook:
 >
-> 1. **Deploy the Postgres server change first** (enable Entra auth + set the
->    Entra admin). This is idempotent and does not disturb the still-running
->    password path. → deploy the updated Bicep (see "Deploy the infra yourself"),
->    OR do steps 1–3 as a targeted change before the app revision flips in 4.
-> 2. **Create the in-DB principal for todo-api's managed identity** and grant it
->    schema/DDL rights (step B below). Until this exists, an Entra-token login for
->    `todo-api` will FAIL.
+> - **The app has NO password path any more** (specs §14.3). There is no
+>   `Postgres__UseEntraAuth` flag to flip back. Recovery is **revision-level or
+>   re-creating the secret by hand** (step D), not a config toggle.
+> - **CD does not apply Bicep** (see "Image / ordering model" above). Editing
+>   `main.bicep` therefore changes **nothing** on the live app. The connection
+>   string must be replaced **imperatively** — that is step D. A Bicep-only change
+>   is not a cutover.
+>
+> Strict order — do NOT touch `todo-api`'s env vars first:
+>
+> 1. **Postgres server config first** (Entra auth enabled + Entra admin set).
+>    Already live since 2026-07-28; idempotent, and it does not disturb anything.
+>    Only needed again on a fresh bootstrap. → step A.
+> 2. **Verify the in-DB principal for todo-api's managed identity** exists and is
+>    bound to the right object ID, and that it holds the `tododb` grants. → step B.
+>    **Verify first; do not blindly re-create.** Until this row exists, an
+>    Entra-token login for `todo-api` FAILS.
 > 3. **Grant `Monitoring Metrics Publisher`** to the todo-api MI on the AI
->    component (step C below) and provision the AI component (`DisableLocalAuth:
->    true`). Do this before the app starts publishing telemetry, or ingestion
->    404/403s silently (app still runs; telemetry is just lost until the grant
->    propagates — a few minutes).
-> 4. **ONLY THEN** roll `todo-api` with the new env (a single revision flip is
->    cleanest): `Postgres__UseEntraAuth=true`, the passwordless
->    `ConnectionStrings__TodoDb`, `APPLICATIONINSIGHTS_CONNECTION_STRING`, and the
->    `todo-db-connection` secret DROPPED. Because the Bicep now embeds all of
->    step 4 (env vars + no secret), applying the full template performs steps 1
->    and 4 together — so **run steps 2 and 3 before you apply the full template**,
->    or split the deploy (server first, app last).
+>    component (`DisableLocalAuth: true` is set), or ingestion 403s silently — the
+>    app still runs, telemetry is just lost. → step C.
+> 4. **ONLY THEN** run the live cutover: deploy the new image, then replace
+>    `ConnectionStrings__TodoDb` with the passwordless value, remove the dead
+>    `Postgres__UseEntraAuth` env var, and delete the `todo-db-connection`
+>    secret — all in one sequence. → step D.
 >
 > Doing step 4 before step 2 is the concrete outage scenario. The passwordless
-> `Username=` (`todo-api`) MUST exactly match the principal name created in step B.
+> `Username=` (`todo-api`) MUST exactly match the principal name verified in
+> step B.
 
 Set these shell variables (continuing from Phases 1–3):
 
@@ -244,21 +260,44 @@ with the values baked into `main.parameters.json`. No separate `az` command is
 needed for this — it happens when you deploy the template (cutover step 1). These
 are non-secret (an object ID and a UPN are not credentials).
 
-**(B) Create the managed identity's Postgres role + grant it schema/DDL rights
-(cutover step 2 — cannot be done in Bicep; runs INSIDE the database).** Connect to
-the **`postgres`** database **as the Entra administrator** (the user in A —
-authenticate with an Entra access token as the password, `Ssl Mode=Require`), then:
+**(B) VERIFY the managed identity's Postgres role, and only repair it if missing
+(cutover step 2 — cannot be done in Bicep; runs INSIDE the database).** The
+`pgaadauth_*` functions exist **only in the `postgres` database** and have no
+ARM/Bicep surface, so this is human-run SQL. Connect to the **`postgres`** database
+**as the Entra administrator** (the user in A — authenticate with an Entra access
+token as the password, `Ssl Mode=Require`, from a machine whose IP is allowed by
+the server firewall).
+
+> Per `.pipeline/infra.md` the principal and its `tododb` grants were created on
+> 2026-07-28 and **already exist**. This step is a **verification**, not a re-run.
+> Do not blindly re-create it.
 
 ```sql
--- Connected to the `postgres` database, AS the Entra admin:
--- creates a Postgres role backed by todo-api's system-assigned managed identity.
-select * from pgaadauth_create_principal('todo-api', false, false);
---   arg1 = the MI name (must equal Username= in ConnectionStrings__TodoDb)
---   arg2 isAdmin = false, arg3 isMfa = false
+-- 1. VERIFY FIRST. Connected to the `postgres` database, AS the Entra admin:
+select * from pgaadauth_list_principals(false);
+```
 
--- Then connect to `tododb` (still as the Entra admin) and grant the new role what
--- the startup Migrate() needs (CONNECT + schema DDL/DML). Schema ownership is the
--- simplest path for the demo's auto-migrate-at-startup:
+Expect a row with `rolname = 'todo-api'`, `principal_type = 'service'`, and
+`objectid = '05c60b63-dda9-4a3e-be87-ac8350600b79'` (the todo-api MI principalId).
+**If that row is present and the objectid matches, step B is done — skip the rest
+of it.**
+
+```sql
+-- 2. ONLY IF the row is MISSING, or its objectid does NOT match: recreate BY OID.
+--    The by-OID form is preferred over pgaadauth_create_principal('todo-api',...),
+--    which resolves the name in Entra and can bind the wrong object (or fail on a
+--    non-unique display name).
+select * from pgaadauth_create_principal_with_oid(
+  'todo-api',                                 -- role name == Username= in the conn string
+  '05c60b63-dda9-4a3e-be87-ac8350600b79',     -- todo-api MI principalId (objectId)
+  'service',                                  -- managed identity / service principal
+  false,                                      -- isAdmin
+  false);                                     -- isMfa
+
+-- 3. ONLY IF you ran step 2 (or the grants are missing): connect to `tododb`, still
+--    as the Entra admin, and grant the role what the startup Migrate() needs
+--    (CONNECT + schema DDL/DML). Schema ownership is the simplest path for the
+--    demo's auto-migrate-at-startup.
 \c tododb
 GRANT CONNECT ON DATABASE tododb TO "todo-api";
 GRANT ALL ON SCHEMA public TO "todo-api";
@@ -272,6 +311,18 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO "todo-api";
 One documented source of truth for the MI name: it is **`todo-api`** (the Container
 App name == its system-assigned identity name == the Postgres role == the
 `Username=` in the passwordless connection string). A mismatch fails auth.
+
+**Do NOT** add the todo-api MI to
+`Microsoft.DBforPostgreSQL/flexibleServers/administrators` (specs §14.7) — that
+resource is for *server-level* Entra admins, and using it here would make the
+application a database admin. The in-DB role above is the correct, least-privilege
+mechanism.
+
+**Diagnostic:** a login failing with *"Service Principal oid mismatch for role
+[todo-api]"* means the in-DB role exists but is bound to a different object ID
+(e.g. the Container App identity was recreated). Fix = drop and recreate with
+`pgaadauth_create_principal_with_oid` using the current principalId. That is not an
+application bug.
 
 **(C) Grant `Monitoring Metrics Publisher` to the todo-api MI on the AI component
 (cutover step 3 — manual, NOT in Bicep).** A human with `User Access
@@ -293,6 +344,108 @@ Because `DisableLocalAuth: true` is set on the component, this grant is what let
 `todo-api` publish telemetry at all — without it, ingestion is rejected (403) and
 traces silently never land (the app itself keeps running).
 
+**(D) LIVE CUTOVER to Entra-only DB auth (cutover step 4 — imperative, human-run,
+one maintenance window).** This is the step that actually changes the running app.
+`main.bicep` already describes this end state, but **CD never applies Bicep**, so
+the live app only changes when you run the commands below.
+
+> ⚠️ **Approved deviation from specs §14.9 / the spec's own Q1 (user decision,
+> 2026-08-06): the `todo-db-connection` secret is deleted as part of THIS
+> sequence, not as a later cleanup.** The consequence, stated plainly: **there is
+> no revision-rollback safety net.** Once the secret is gone, the previous
+> revision's `secretRef` dangles and
+> `az containerapp revision activate "$PREV_REV"` will not restore a working app
+> on its own — recovery needs the secret re-created first (see D6). So: run D3,
+> D4 and D5 **in the same maintenance window**, and do not consider the cutover
+> done until the health check **and** a real DB-backed request have both passed.
+
+```bash
+RG=rg-todo-demo
+APP=todo-api
+PG_FQDN=pg-todo-demo-cus01.postgres.database.azure.com
+
+# --- D0. PRE-CHECK — do not skip. -------------------------------------------
+# Step B above must be green: pgaadauth_list_principals(false) shows rolname
+# 'todo-api', principal_type 'service', objectid 05c60b63-dda9-4a3e-be87-ac8350600b79.
+# Also confirm the todo-api MI principalId still matches that objectid:
+az containerapp show -g $RG -n $APP --query identity.principalId -o tsv
+
+# --- D1. Record the current (known-good) revision BEFORE changing anything. --
+PREV_REV=$(az containerapp revision list -g $RG -n $APP \
+  --query "[?properties.active]|[0].name" -o tsv); echo "previous revision: $PREV_REV"
+# Keep this value. It is still useful for diagnosis and for the D6 recovery path,
+# but see the caveat above: on its own it is no longer a one-command rollback.
+
+# --- D2. Let CD deploy the new (Entra-only) image, then CONFIRM it is running. -
+az containerapp revision list -g $RG -n $APP \
+  --query "[?properties.active].{rev:name,image:properties.template.containers[0].image}" -o table
+# The image tag must be the merge commit that contains the Entra-only backend.
+
+# --- D3. CUTOVER (single sequence — env flip THEN secret delete). ------------
+# 3a. Replace the connection string with the passwordless value and drop the dead
+#     flag. --set-env-vars replaces only that variable's definition
+#     (secretRef -> plain value) and leaves the other env vars alone.
+az containerapp update -g $RG -n $APP \
+  --set-env-vars "ConnectionStrings__TodoDb=Host=$PG_FQDN;Port=5432;Database=tododb;Username=todo-api;Ssl Mode=Require;Trust Server Certificate=true" \
+  --remove-env-vars Postgres__UseEntraAuth
+
+# 3b. Delete the now-unreferenced secret, in this same sequence (user decision).
+#     ORDER MATTERS: this must come AFTER 3a — Container Apps refuses to remove a
+#     secret that a live env var still references via secretRef.
+az containerapp secret remove -g $RG -n $APP --secret-names todo-db-connection
+
+# 3c. Confirm the end state: no secrets, no Postgres__UseEntraAuth, plain conn str.
+az containerapp show -g $RG -n $APP --query "properties.configuration.secrets" -o json   # expect [] or null
+az containerapp show -g $RG -n $APP \
+  --query "properties.template.containers[0].env[].name" -o tsv                          # expect NO Postgres__UseEntraAuth
+
+# --- D4. VERIFY — health AND a real DB-backed request. Both, in this window. --
+API_FQDN=$(az containerapp show -g $RG -n $APP --query properties.configuration.ingress.fqdn -o tsv)
+curl -fsS "https://$API_FQDN/health"     # liveness only — does NOT touch the DB
+curl -fsS "https://$API_FQDN/api/todos"  # THE REAL CHECK: must be 200 + a JSON array, not 500
+
+# --- D5. VERIFY — the startup log names the right principal, with no warning. -
+az containerapp logs show -g $RG -n $APP --tail 100 | grep -i "Postgres auth"
+#   EXPECT: "Postgres auth: Entra / managed identity. Host=pg-todo-demo-cus01... Username=todo-api"
+#   EXPECT: NO "static Postgres password/passfile ... ignored" warning (D3a removed it)
+#   EXPECT: no NotSupportedException, no 28P01, no "No password has been provided"
+```
+
+**D6. Recovery, if D4 or D5 fails.** There is no config flag and no in-app
+fallback by design. In rough order of preference:
+
+1. **Fix forward** — the usual cause is a step B mismatch (missing role or wrong
+   `objectid`, surfaced as *"Service Principal oid mismatch for role [todo-api]"*)
+   or a `Username=` typo. Re-run step B's verify, then re-issue D3a with the
+   corrected string. This does not need the deleted secret.
+2. **Re-create the secret, then roll back** — only if you need the old password
+   path back. Because D3b already deleted it, `az containerapp revision activate`
+   alone is not enough; you must first restore the secret it referenced:
+   ```bash
+   read -rs PGPWD    # the todoadmin password (GitHub secret PGADMIN_PASSWORD)
+   az containerapp secret set -g $RG -n $APP --secrets \
+     "todo-db-connection=Host=$PG_FQDN;Port=5432;Database=tododb;Username=todoadmin;Password=$PGPWD;Ssl Mode=Require;Trust Server Certificate=true"
+   az containerapp revision activate -g $RG -n $APP --revision "$PREV_REV"
+   ```
+   This works **only because the server still accepts password auth** (see the
+   `passwordAuth: Enabled` note at the top of Phase 4). Note the old *image* also
+   has to be one that still contains a password code path — after this cycle's
+   backend change, it does not, so this path really means "roll back to a
+   pre-§14 image".
+
+**Record the outcome.** After a successful cutover, write the real result into
+`.pipeline/infra.md` and into `.pipeline/deployment-lessons-learned.md` §5a, which
+is currently marked UNRESOLVED and must be closed out with what actually happened.
+(Heads-up: that lessons file lives on the `docs/deployment-lessons-learned` branch,
+not on this one — find it before you start writing.)
+
+**Follow-up, deliberately NOT done this cycle:** the connection string keeps
+`Ssl Mode=Require;Trust Server Certificate=true`. That encrypts the transport but
+**skips certificate verification**, so it is MITM-susceptible. Moving to
+`Ssl Mode=VerifyFull` was considered and deferred by the user on 2026-08-06 —
+it changes TLS behavior and deserves its own live verification rather than riding
+along inside a cutover that has no fallback. Tracked as a follow-up.
+
 ### Branch protection on `main` (repo-admin action — human)
 
 Settings → Branches → add a rule for `main`:
@@ -308,13 +461,27 @@ convention, not enforced by GitHub.
 
 # Deploy the infra yourself (human, ad-hoc)
 
-> **⚠️ First time applying the `pipeline/appinsights-tracing` changes on the live
-> app?** A single full-template apply performs BOTH the Postgres server change
-> (cutover step 1) AND the todo-api env flip to Entra auth (cutover step 4) in one
-> shot. If the in-DB principal (Phase 4 step B) and the AI role grant (Phase 4
-> step C) are NOT done first, todo-api loses DB connectivity. Do Phase 4 steps
-> B and C BEFORE the first full apply — see the **CUTOVER SEQUENCING** callout in
-> Phase 4. Steady-state (once bootstrapped) this caveat no longer applies.
+> **⚠️ Applying the full template against the LIVE app? Read this first.**
+>
+> - **This is NOT the cutover.** The live Entra-only cutover is **Phase 4 step D**
+>   (imperative `az containerapp update` + `secret remove`). CD never applies
+>   Bicep, so the app's live config is changed there, not here. Running a full
+>   apply *instead of* step D is not a substitute — and running it *before*
+>   Phase 4 step B (the in-DB principal) is the concrete DB-outage scenario,
+>   because a full apply also flips `todo-api` to the passwordless connection
+>   string and removes the `todo-db-connection` secret in one shot.
+> - **A full apply will revert `todo-api`/`todo-web` to the placeholder image.**
+>   `todoApiImage`/`todoWebImage` default to `mcr.microsoft.com/k8se/quickstart`,
+>   so unless you pass the currently-running image tags with
+>   `--parameters todoApiImage=... todoWebImage=...`, the apply rolls the apps
+>   back off their real images. Read the current tags first:
+>   ```bash
+>   az containerapp show -g rg-todo-demo -n todo-api --query properties.template.containers[0].image -o tsv
+>   az containerapp show -g rg-todo-demo -n todo-web --query properties.template.containers[0].image -o tsv
+>   ```
+> - **Always `what-if` before `create`** and read the `todo-api` delta line by
+>   line. Steady state, the only expected deltas are Azure-side defaults; anything
+>   touching `env`, `secrets` or `image` is you about to change the running app.
 
 ```bash
 read -rs PGPWD; export PGPWD

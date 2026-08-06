@@ -166,10 +166,14 @@ module postgres 'modules/postgres.bicep' = {
 // and the Username= in the passwordless connection string below MUST match it.
 var todoApiName = 'todo-api'
 
-// PASSWORDLESS, NON-SECRET connection string (§13.4). No Password= — todo-api
-// authenticates with an Entra token from its managed identity at runtime. Because
-// it holds no credential it is delivered as a PLAIN env var (not a Container Apps
-// secret, not Key Vault). Username = the MI's Postgres role name (= todoApiName).
+// Application DB auth is Entra-ONLY (specs §14). This string is PASSWORDLESS and
+// NON-SECRET: todo-api authenticates with an Entra token from its managed identity
+// at runtime, so the string holds no credential and is delivered as a PLAIN env
+// var (not a Container Apps secret, not Key Vault).
+// `Username=` MUST equal the `pgaadauth` role name, which is the Container App
+// name, which is the managed identity name (all three == `todoApiName`).
+// The app STRIPS any `Password=` / `Passfile=` it is handed (specs §14.5) and will
+// NOT fall back to password auth — there is no in-app fallback, by design.
 var todoDbConnectionString = 'Host=${postgres.outputs.fqdn};Port=5432;Database=${databaseName};Username=${todoApiName};Ssl Mode=Require;Trust Server Certificate=true'
 
 // Only wire an ACR registry credential when the image actually comes from
@@ -203,11 +207,13 @@ module todoWeb 'modules/containerApp.bicep' = {
 }
 
 // --- 5. Backend Container App (todo-api) -----------------------------------
-//        Managed-identity-first (§13): ZERO Container Apps secrets. All three
-//        config values below are NON-SECRET plain env vars:
-//          - ConnectionStrings__TodoDb: passwordless (Entra-token auth at runtime)
-//          - Postgres__UseEntraAuth=true: backend takes its Entra-token DB path
+//        Managed-identity-first (§13) + Entra-ONLY DB auth (§14): ZERO Container
+//        Apps secrets. Both config values below are NON-SECRET plain env vars:
+//          - ConnectionStrings__TodoDb: passwordless (Entra-token auth at runtime);
+//            the ONLY DB config value the app reads (§14.4)
 //          - APPLICATIONINSIGHTS_CONNECTION_STRING: non-secret (local auth disabled)
+//        There is NO `Postgres__UseEntraAuth` flag any more — the app has a single,
+//        unconditional Entra code path (§14.3), so the key was deleted everywhere.
 //        The old `todo-db-connection` secret is intentionally DROPPED.
 //        CORS allow-list origin 0 = the frontend FQDN from todoWeb above.
 module todoApi 'modules/containerApp.bicep' = {
@@ -232,10 +238,6 @@ module todoApi 'modules/containerApp.bicep' = {
       {
         name: 'ConnectionStrings__TodoDb'
         value: todoDbConnectionString
-      }
-      {
-        name: 'Postgres__UseEntraAuth'
-        value: 'true'
       }
       {
         name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
