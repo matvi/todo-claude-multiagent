@@ -1,765 +1,254 @@
-# Test Report — Todo Application (Cycle 1)
-
-## Verdict: FAIL
-
-Reason: backend tests reveal a reproducible, spec-violating behavior (malformed
-GUID path segments return `404` instead of the spec-mandated `400` on
-`GET/PUT/DELETE /api/todos/{id}`). Everything else tested — full CRUD,
-validation, ordering, CORS, health check, and the entire frontend — passes.
-This is a single, well-isolated defect that the engineer should fix on the
-next pass; it is not a fundamental design problem.
-
----
-
-## What was tested and how
-
-### Backend (`backend/tests/TodoApi.Tests`)
-
-- Framework: xUnit + `Microsoft.AspNetCore.Mvc.Testing` (`WebApplicationFactory<Program>`)
-  driving the real ASP.NET Core pipeline (routing, `[ApiController]` model
-  validation, CORS, controllers) over `HttpClient` — i.e. integration tests,
-  not just calling controller methods directly.
-- Database: **EF Core InMemory provider**, not Postgres. Docker Desktop's
-  daemon is not running in this environment (confirmed below), so a real
-  Postgres instance was not available; this matches the engineer's note in
-  `changes.md`. A `TodoApiFactory : WebApplicationFactory<Program>` swaps out
-  the app's Npgsql-backed `TodoDbContext` registration for a uniquely-named
-  InMemory database per test instance, and injects a dummy (never-dialled)
-  `ConnectionStrings:TodoDb` value purely so `Program.cs`'s "connection string
-  must be configured" startup guard doesn't throw before the swap happens.
-  Each test class instance gets a fresh factory/database (`IDisposable`
-  pattern), so tests don't leak state into each other.
-- Files added:
-  - `backend/tests/TodoApi.Tests/TodoApiFactory.cs`
-  - `backend/tests/TodoApi.Tests/TodosControllerTests.cs`
-  - `backend/tests/TodoApi.Tests/TodoApi.Tests.csproj` — added
-    `Microsoft.EntityFrameworkCore.InMemory` (10.0.0) package reference (the
-    only change to the csproj; no application source files were touched).
-
-Coverage against spec §3.5 (API surface) and §2 (data model):
-
-| Requirement | Test(s) | Result |
-|---|---|---|
-| `GET /health` → 200 `{"status":"ok"}` | `Health_ReturnsOkWithStatusOk` | PASS |
-| `POST /api/todos` valid → 201, `Location` header, body shape | `CreateTodo_WithValidBody_Returns201WithLocationAndBody` | PASS |
-| Create without description → null, not error | `CreateTodo_WithoutDescription_SucceedsWithNullDescription` | PASS |
-| Create with empty title → 400 | `CreateTodo_WithEmptyTitle_Returns400ValidationProblem` | PASS |
-| Create with missing title → 400 | `CreateTodo_WithMissingTitle_Returns400ValidationProblem` | PASS |
-| Create with title > 200 chars → 400 | `CreateTodo_WithTitleOver200Chars_Returns400` | PASS |
-| Create with title exactly 200 chars → 201 (boundary) | `CreateTodo_WithTitleExactly200Chars_Succeeds` | PASS |
-| Create with description > 2000 chars → 400 | `CreateTodo_WithDescriptionOver2000Chars_Returns400` | PASS |
-| Malformed JSON body → 400 | `CreateTodo_WithMalformedJsonBody_Returns400` | PASS |
-| Whitespace-only title → 400 (spec: "1–200 chars after trim") | `CreateTodo_WithWhitespaceOnlyTitle_Returns400` | PASS |
-| `GET /api/todos` empty → `200 []` | `GetTodos_WhenEmpty_ReturnsEmptyArray` | PASS |
-| `GET /api/todos` ordering newest-first | `GetTodos_ReturnsAllCreatedTodos_NewestFirst` | PASS |
-| `GET /api/todos/{id}` existing → 200 | `GetTodo_WithExistingId_Returns200WithBody` | PASS |
-| `GET /api/todos/{id}` unknown → 404 | `GetTodo_WithUnknownId_Returns404` | PASS |
-| `GET /api/todos/{id}` malformed guid → **400 per spec** | `GetTodo_WithMalformedId_ShouldReturn400PerSpec` | **FAIL (actual: 404)** |
-| `PUT /api/todos/{id}` valid → 200, persists | `UpdateTodo_WithExistingIdAndValidBody_Returns200AndPersists` | PASS |
-| `PUT` toggling `isCompleted` persists | `UpdateTodo_TogglingIsCompleted_Persists` | PASS |
-| `PUT` unknown id → 404 | `UpdateTodo_WithUnknownId_Returns404` | PASS |
-| `PUT` empty title → 400 | `UpdateTodo_WithEmptyTitle_Returns400` | PASS |
-| `PUT` missing `isCompleted` → 400 | `UpdateTodo_WithMissingIsCompleted_Returns400` | PASS |
-| `PUT` title > 200 chars → 400 | `UpdateTodo_WithTitleOver200Chars_Returns400` | PASS |
-| `PUT` malformed guid → **400 per spec** | `UpdateTodo_WithMalformedId_ShouldReturn400PerSpec` | **FAIL (actual: 404)** |
-| `DELETE` existing → 204, then 404 on re-fetch | `DeleteTodo_WithExistingId_Returns204AndRemovesIt` | PASS |
-| `DELETE` unknown id → 404 | `DeleteTodo_WithUnknownId_Returns404` | PASS |
-| `DELETE` twice → second call 404 | `DeleteTodo_CalledTwice_SecondCallReturns404` | PASS |
-| `DELETE` malformed guid → **400 per spec** | `DeleteTodo_WithMalformedId_ShouldReturn400PerSpec` | **FAIL (actual: 404)** |
-| CORS preflight allows configured origin | `Cors_PreflightForAllowedOrigin_IsAccepted` | PASS |
-
-**Backend result: 24 passed, 3 failed, 0 skipped, 27 total.**
-Command: `dotnet test TodoApi.sln -c Release` (using the user-local .NET 10.0.302
-SDK at `C:\Users\ingda\dotnet10`, since only .NET 6/8/9 are on the system
-`PATH`/`Program Files` — same substitution the engineer documented).
-`dotnet build TodoApi.sln -c Release` → 0 warnings, 0 errors (confirms the
-engineer's build report is still accurate after adding the test project's
-`Microsoft.EntityFrameworkCore.InMemory` reference).
-
-### Frontend (`frontend/`)
-
-No test tooling existed yet; it was added as part of this pass, consistent
-with the existing Vite + React + TS stack:
-
-- Added devDependencies: `vitest@2.1.9`, `@testing-library/react@16.3.2`,
-  `@testing-library/jest-dom@6.9.1`, `@testing-library/user-event@14.6.1`,
-  `jsdom@25.0.1`.
-- `frontend/vite.config.ts` — added a `test` block (`environment: 'jsdom'`,
-  `globals: true`, `setupFiles`).
-- `frontend/src/test/setup.ts` — imports `@testing-library/jest-dom/vitest`.
-- `frontend/package.json` — added `"test": "vitest run"` and
-  `"test:watch": "vitest"` scripts.
-- Test files added (all colocated with the code they test):
-  - `frontend/src/api.test.ts` — `api.ts` fetch wrapper: GET/POST/PUT/DELETE
-    call shape, JSON body parsing, `ApiError` on non-2xx, ASP.NET
-    `ValidationProblemDetails.errors` message extraction, network-failure
-    (`fetch` rejects) → `ApiError(status: 0)`.
-  - `frontend/src/hooks/useTodos.test.ts` — initial load (success + failure),
-    `create` (success prepends newest-first, failure sets `error` + rethrows),
-    `update`, `toggleComplete` (flips `isCompleted`, keeps title/description),
-    `remove` (success + failure), all against a mocked `api` module (mocking
-    only the four request functions and keeping the real `ApiError` class, so
-    `err instanceof Error` checks inside the hook still behave correctly).
-  - `frontend/src/components/TodoForm.test.tsx` — trims title/description on
-    submit, sends `description: null` when blank, disables submit for
-    empty/whitespace-only title, no-op on submit with empty form.
-  - `frontend/src/components/TodoList.test.tsx` — empty state, one `<li>` per
-    todo, checkbox reflects `isCompleted`.
-  - `frontend/src/components/TodoItem.test.tsx` — renders title/description/
-    date; checkbox click → `onToggleComplete(todo)`; Delete click →
-    `onRemove(id)`; Edit → change title → Save → `onUpdate(id, {...})` with
-    trimmed title and unchanged `isCompleted`; Edit → Cancel discards changes;
-    Save disabled when edited title is emptied.
-  - `frontend/src/App.test.tsx` — end-to-end component-level flows against a
-    mocked API client: loading state → rendered list; empty state; inline
-    error banner on load failure; full create flow (form submit → API call →
-    new item rendered); full toggle-complete flow; full edit flow; full
-    delete flow (including keeping the item and showing the error banner when
-    delete fails); multiple todos each rendered as their own list item.
-
-**Frontend result: 37 passed, 0 failed, 6 test files.**
-Command: `npm run test` (`vitest run`), run from `frontend/`.
-
-`npm run build` (`tsc && vite build`) was re-run after adding the test
-dependencies/config and still succeeds (0 type errors, bundle produced) —
-confirms the new devDependencies didn't regress the production build.
-
----
-
-## Bugs / spec mismatches found (not fixed — for the engineer)
-
-1. **Malformed `{id}` returns 404, not 400, on all three id-based endpoints**
-   (`GET/PUT/DELETE /api/todos/{id}`). Spec §3.5: *"`{id}` is a `Guid`;
-   malformed ids return `400`."* Actual behavior, reproduced by three failing
-   tests (`GetTodo_WithMalformedId_ShouldReturn400PerSpec`,
-   `UpdateTodo_WithMalformedId_ShouldReturn400PerSpec`,
-   `DeleteTodo_WithMalformedId_ShouldReturn400PerSpec`): `GET
-   /api/todos/not-a-guid` → `404 Not Found`, not `400 Bad Request`.
-   Root cause: the actions are declared with a route constraint
-   (`[HttpGet("{id:guid}")]` etc.). When the URL segment fails the `:guid`
-   constraint, ASP.NET Core's routing treats the request as "no endpoint
-   matched" rather than invoking the action with a model-binding failure, so
-   it falls through to a plain 404 instead of a 400 `ProblemDetails`. Typical
-   fixes: drop the `:guid` route constraint and bind `id` as `string`,
-   `Guid.TryParse` it manually, and return `BadRequest()` on failure; or add
-   a fallback/exception-based translation. This is a real, easily
-   reproducible defect, not a testing artifact — I confirmed it consistently
-   across all three affected verbs.
-
-2. **Not a bug (verified, documented for completeness):** a whitespace-only
-   title (e.g. `"   "`) *does* correctly get rejected with 400, even though
-   `CreateTodoRequest.Title` is trimmed only after `[Required]`/`[StringLength]`
-   validation runs. This works because ASP.NET Core's `RequiredAttribute`
-   internally trims string values before checking for emptiness (when
-   `AllowEmptyStrings` is false, the default) — so the apparent "trim after
-   validate" ordering in `TodosController.CreateTodo`/`UpdateTodo` does not
-   actually let whitespace-only titles through. Confirmed via
-   `CreateTodo_WithWhitespaceOnlyTitle_Returns400`, which passes.
-
-3. **Test-infrastructure gotcha worth flagging** (not an app bug, but
-   relevant if others write EF Core test doubles against this project):
-   simply removing the `DbContextOptions<TodoDbContext>` service descriptor
-   and re-calling `AddDbContext` with `UseInMemoryDatabase` is *not* enough
-   with the EF Core 10 / current `AddDbContext` implementation — it still
-   also registers other services keyed by `TodoDbContext` (e.g.
-   `IDbContextOptionsConfiguration<TodoDbContext>`), and leaving those in
-   place causes `"Services for database providers 'Npgsql...',
-   'Microsoft.EntityFrameworkCore.InMemory' have been registered ... Only a
-   single database provider can be registered"` at request time. The fix used
-   in `TodoApiFactory.cs` removes *every* descriptor whose `ServiceType` is,
-   or is generically parameterized with, `TodoDbContext` before re-adding the
-   InMemory-backed registration. No production code needed to change for
-   this — it's purely a test-harness detail — but worth knowing if the
-   engineer or a future tester extends the test factory.
-
----
-
-## Gaps (not testable in this environment)
-
-- **No real Postgres / Azure DB for PostgreSQL integration test.** Docker
-  Desktop's daemon is not running here (`docker version` succeeds for the
-  CLI but `docker compose` / `docker version` server-side calls fail with
-  `open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file
-  specified`), confirming the engineer's note in `changes.md`. This means:
-  - The EF Core migration (`InitialCreate`) was **not** applied to a real
-    Postgres instance and verified against actual `varchar(200)`/`varchar(2000)`
-    column constraints, the `timestamptz` defaults, or the
-    `ix_todos_created_at DESC` index — those were reviewed by reading the
-    migration/`OnModelCreating` code, not exercised end-to-end.
-  - `Npgsql`-specific behaviors (e.g. actual SSL/`Ssl Mode=Require` connection
-    behavior, real DB-level `NOT NULL`/length enforcement) are unverified.
-  - Recommend: once Docker Desktop is available, run `docker compose up -d`
-    from the repo root, then `dotnet run` from `backend/src/TodoApi` and
-    confirm `GET/POST/PUT/DELETE /api/todos` against the real Postgres
-    instance, and inspect the generated schema with `\d todos` in `psql`.
-- **No Azure deployment smoke test.** `scripts/deploy-azure.sh` was not run
-  (per spec §5.7, a human runs it; no Azure resources were provisioned in
-  this pass either). CORS-against-a-real-frontend-FQDN, Container Apps
-  scale-to-zero cold start, and ACR pull/managed-identity behavior are
-  therefore unverified — this matches the spec's explicit scope (manual `az`
-  commands, not CI/CD).
-- **Concurrency / race conditions** (e.g. two simultaneous `PUT`s to the same
-  todo) are not tested — not called out as a requirement in specs.md.
-- **Load/performance** was not tested — explicitly out of scope per specs.md
-  §7 ("Do not over-invest").
-
----
-
-## Environment notes
-
-- .NET SDK: only 6.0.427 / 8.0.303 / 9.0.302 are on the default `PATH`
-  (`C:\Program Files\dotnet`); a user-local **.NET SDK 10.0.302** exists at
-  `C:\Users\ingda\dotnet10` (matches the engineer's note that they installed
-  a user-local .NET 10 SDK) and was used for `dotnet build`/`dotnet test`
-  after prepending it to `PATH`. Any downstream agent (or CI) needs this SDK
-  discoverable the same way.
-- Node: v22.18.0 / npm 10.9.3 — matches the frontend's `node:22-alpine`
-  Dockerfile base image expectation.
-- Docker Desktop CLI is installed (`docker version` client succeeds,
-  `docker compose version` reports v2.31.0-desktop.2) but the Docker Desktop
-  **engine/daemon was not running**, so no containers could be built or run,
-  and Postgres could not be started. This corroborates `changes.md`'s stated
-  limitation.
-
----
-
-## Files added/modified by this test pass
-
-### Backend (test project only — no application source files touched)
-- `backend/tests/TodoApi.Tests/TodoApi.Tests.csproj` (added
-  `Microsoft.EntityFrameworkCore.InMemory` package reference)
-- `backend/tests/TodoApi.Tests/TodoApiFactory.cs` (new)
-- `backend/tests/TodoApi.Tests/TodosControllerTests.cs` (new)
-
-### Frontend
-- `frontend/package.json` (added test devDependencies + `test`/`test:watch`
-  scripts)
-- `frontend/vite.config.ts` (added `test` config block)
-- `frontend/src/test/setup.ts` (new)
-- `frontend/src/api.test.ts` (new)
-- `frontend/src/hooks/useTodos.test.ts` (new)
-- `frontend/src/components/TodoForm.test.tsx` (new)
-- `frontend/src/components/TodoList.test.tsx` (new)
-- `frontend/src/components/TodoItem.test.tsx` (new)
-- `frontend/src/App.test.tsx` (new)
-
----
-
-## Summary for the next engineer pass
-
-Fix the route-constraint/malformed-id handling on `TodosController` (GET, PUT,
-DELETE by id) so malformed GUIDs return `400` instead of `404`, per specs.md
-§3.5. Once that's fixed, re-run:
-
-```bash
-# backend
-cd backend && dotnet test TodoApi.sln -c Release
-
-# frontend
-cd frontend && npm run test
-```
-
-Everything else (24 of 27 backend tests, all 37 frontend tests) already
-passes and does not need further engineering changes for this cycle.
-
----
-
-# Cycle 2 verification
+# Test Report — Entra-ONLY Postgres auth for the application (specs §14)
 
 ## Verdict: PASS
 
-The malformed-GUID defect from cycle 1 (spec §3.5) is fixed, verified by
-reading the actual updated source (not just trusting `changes.md`), by
-re-running the full existing backend + frontend suites, and by adding two new
-hardening tests that also pass. No regressions found anywhere.
-
-### 1. Code review of `TodosController.cs`
-
-Read the file directly (not the engineer's diff summary). Confirmed for all
-three id-based actions:
-
-- `GetTodo` (line 34-52), `UpdateTodo` (line 81-109), `DeleteTodo`
-  (line 112-133): route template is `[Http*("{id}")]` (no `:guid` constraint),
-  parameter is `string id`, each starts with `Guid.TryParse(id, out var
-  todoId)` and returns `MalformedId(id)` — a `BadRequest(new
-  ValidationProblemDetails(ModelState))` with an `errors["id"]` entry — on
-  parse failure, before doing any DB lookup. The well-formed-but-unknown-GUID
-  path (`FindAsync` → `NotFound()`) is unchanged, so `404` for a valid-shape
-  but nonexistent id still works as before.
-- `CreateTodo`'s `CreatedAtAction(nameof(GetTodo), new { id = todo.Id }, ...)`
-  is untouched; a `Guid` route value still serializes correctly into the
-  unconstrained `{id}` template — verified this doesn't break by the passing
-  `CreateTodo_WithValidBody_Returns201WithLocationAndBody` test (checks the
-  `Location` header).
-- Searched the whole `backend/src/TodoApi` tree for any other `:guid`,
-  `HttpGet`/`HttpPut`/`HttpDelete`/`HttpPost`/`Map*` route declarations: the
-  only other route is `MapGet("/health", ...)` in `Program.cs`, which has no
-  id segment and is unaffected. No other id-based routes were missed — the
-  fix is complete and correctly scoped.
-- The `MalformedId` helper is a single, well-documented, DRY implementation
-  shared by all three actions (no copy-paste drift).
-
-Verdict on the code: fix is correct, complete, and matches the reviewer's
-suggested approach exactly, including the `ValidationProblemDetails` shape
-(reviewer's non-blocking suggestion #2, which the engineer also adopted).
-
-### 2. Backend test suite re-run
-
-Environment: prepended `C:\Users\ingda\dotnet10` to `PATH` and set
-`DOTNET_ROOT` before invoking `dotnet`, as instructed (confirmed `dotnet
---version` reports `10.0.302`, not the system 9.0.302).
-
-```
-cd backend
-dotnet test TodoApi.sln -c Release
-```
-
-Result (before adding new tests, to independently reproduce the engineer's
-claim): **27 passed, 0 failed, 0 skipped, 27 total.**
-
-- All three previously-failing tests now pass:
-  `GetTodo_WithMalformedId_ShouldReturn400PerSpec`,
-  `UpdateTodo_WithMalformedId_ShouldReturn400PerSpec`,
-  `DeleteTodo_WithMalformedId_ShouldReturn400PerSpec`.
-- The other 24 tests (full CRUD, validation boundaries, 404s, ordering, CORS,
-  health) remain green — no regressions.
-
-This independently confirms the engineer's reported "27 passed, 0 failed" —
-actual pass count matches, not just trusted.
-
-### 3. New hardening tests added
-
-Added two tests to
-`backend/tests/TodoApi.Tests/TodosControllerTests.cs`, immediately after
-`GetTodo_WithMalformedId_ShouldReturn400PerSpec`, to close small gaps not
-already covered (route-level edge cases beyond the simple `"not-a-guid"`
-literal already tested for all three verbs):
-
-- `GetTodo_WithWhitespaceOnlyId_Returns400` — requests
-  `/api/todos/%20%20%20` (a URL-encoded whitespace-only segment, decodes to
-  three spaces). Confirms whitespace doesn't get treated as an "empty"
-  segment that routes elsewhere or 404s, and that `Guid.TryParse` correctly
-  rejects it with `400`.
-- `GetTodo_WithExtremelyLongGarbageId_Returns400` — requests
-  `/api/todos/{2000-char string of 'a's}`. Confirms a pathological long
-  garbage segment is rejected with a clean `400`, not a `500`/unhandled
-  exception from routing or model binding.
-
-Re-ran the full backend suite after adding these:
-
-```
-dotnet test TodoApi.sln -c Release
-```
-
-Result: **29 passed, 0 failed, 0 skipped, 29 total.** Both new tests pass;
-no regressions from the addition.
-
-### 4. Frontend regression check
-
-Confirmed the engineer's claim that the frontend was untouched by re-running
-the existing suite (no source changes were made to `frontend/` by this
-verification pass):
-
-```
-cd frontend
-npm run test
-```
-
-Result: **37 passed, 0 failed, 6 test files** — exactly matches the cycle 1
-frontend result (`api.test.ts` 7, `TodoList.test.tsx` 3, `useTodos.test.ts`
-8, `TodoForm.test.tsx` 4, `App.test.tsx` 9, `TodoItem.test.tsx` 6). No
-regressions; frontend confirmed untouched and unaffected by the backend-only
-fix.
-
-### Coverage summary against specs.md §3.5
-
-| Requirement | Covered by | Result |
-|---|---|---|
-| Malformed id → 400 on GET | `GetTodo_WithMalformedId_ShouldReturn400PerSpec` | PASS |
-| Malformed id → 400 on PUT | `UpdateTodo_WithMalformedId_ShouldReturn400PerSpec` | PASS |
-| Malformed id → 400 on DELETE | `DeleteTodo_WithMalformedId_ShouldReturn400PerSpec` | PASS |
-| Malformed id (whitespace) → 400 | `GetTodo_WithWhitespaceOnlyId_Returns400` (new) | PASS |
-| Malformed id (long garbage) → 400 | `GetTodo_WithExtremelyLongGarbageId_Returns400` (new) | PASS |
-| Well-formed but unknown id → 404 (unaffected by fix) | `GetTodo_WithUnknownId_Returns404` et al. | PASS |
-| Valid id CRUD paths (unaffected by fix) | full existing 200/201/204 suite | PASS |
-| Frontend unaffected | full existing 37-test suite | PASS |
-
-### Result totals
-
-- Backend: **29/29 passed** (27 pre-existing + 2 new hardening tests).
-- Frontend: **37/37 passed**, no regressions, confirmed untouched.
-
-### Gaps (unchanged from cycle 1, not related to this fix)
-
-- No real Postgres / Azure DB integration test (Docker Desktop engine not
-  running in this environment) — same limitation as cycle 1, not related to
-  this fix, and not re-verified here since it's out of scope for this
-  targeted re-verification pass.
-- No Azure deployment smoke test — out of scope per spec §5.7 (manual `az`
-  commands, human-run).
-
-### Overall verdict for cycle 2: PASS
-
-The cycle 1 blocking defect is fixed correctly and completely, verified
-independently by direct code reading (not just trusting `changes.md`), by
-reproducing the engineer's test results exactly, and by adding new edge-case
-tests that also pass. No regressions in either backend or frontend. Nothing
-else to report for the reviewer to re-check beyond this single fix.
+Branch: `pipeline/entra-passwordless-connection-string`. This report supersedes
+all prior `.pipeline/tests.md` cycles (per process, this file is overwritten
+each cycle). Scope: `.pipeline/specs.md` §14 (the current cycle) as implemented
+in the "Implementation Changes — Entra-ONLY Postgres auth for the application
+(2026-08-06)" entry of `.pipeline/changes.md`.
 
 ---
 
-# CI/CD cycle (2026-07-24) — verification of the §11 CI/CD & IaC extension pass
+## What was verified
 
-## Verdict: PASS
-
-This cycle's engineer pass made **no application code changes** — it was a
-CI/CD-readiness audit against the newly-added spec §11 (CI/CD & Infrastructure-
-as-Code) and `.pipeline/architecture-memory.md`, both authored this cycle. The
-audit's own claim ("nothing needed fixing") was independently re-verified here
-by re-running the full existing test suites from a clean invocation, rather
-than trusting the prior report.
-
-### What changed this cycle (confirmed via `git diff --stat` / `git status`)
-
-- `.pipeline/specs.md` — gained §11 (CI/CD & IaC) and a few in-place edits to
-  §6/§8 pulling CI/CD into scope. 355 insertions / 9 deletions.
-- `.pipeline/changes.md` — gained the dated "CI/CD-readiness pass" section
-  documenting the audit (no code diff).
-- `.pipeline/architecture-memory.md` — new file (140 lines), not previously
-  tracked.
-- **No changes under `backend/`, `frontend/`, `infra/`, `.github/workflows/`,
-  or `azure-pipelines.yml`.** Confirmed `infra/`, `.github/workflows/`, and
-  `azure-pipelines.yml` do not exist yet in the working tree — the `devops`
-  subagent described in §11 has not run yet this cycle. This is expected: this
-  cycle's engineer pass was explicitly scoped to auditing existing app code
-  for CI/CD-readiness, not authoring the IaC/pipeline artifacts themselves.
-
-Since no application source changed, no new test files were needed or added.
-Padding the suite with redundant tests for unchanged code would not have
-added signal.
-
-### Independent re-run of both existing suites
-
-**Backend** (`C:\Users\ingda\Documents\bankClaude\backend`):
+### 1. Build & full existing suite
 
 ```
-export PATH="/c/Users/ingda/dotnet10:$PATH"
-dotnet --version          # 10.0.302
-dotnet test TodoApi.sln -c Release
+cd backend && dotnet build -c Release   → Build succeeded, 0 Warning(s), 0 Error(s)
+dotnet test  -c Release                 → Passed!  Failed: 0, Passed: 81, Skipped: 0, Total: 81
 ```
 
-Result: **Passed! - Failed: 0, Passed: 29, Skipped: 0, Total: 29**, duration
-~2s. Matches the prior cycle's reported 29/29 exactly — independently
-reproduced, not just trusted.
+All 81 tests pass, including the 9 pre-existing `EntraTokenPasswordProviderTests`
+(unchanged per §14.12, confirmed unchanged in the diff) and the fully rewritten
+`TodoDbContextRegistrationTests` (28 tests). The "Failed to apply database
+migrations at startup" lines seen in the console log during `ObservabilityTests`
+are the pre-existing, intentional, caught-and-logged behavior of `Migrate()`
+against the EF Core InMemory provider (it doesn't support `Migrate()`); they are
+not test failures — every test in that class reports Passed.
 
-**Frontend** (`C:\Users\ingda\Documents\bankClaude\frontend`):
+### 2. §14.10 test-by-test coverage check (all present, all passing)
 
-```
-npm test        # vitest run
-npm run build   # tsc && vite build
-```
+I read `TodoDbContextRegistrationTests.cs` in full and cross-checked it against
+the explicit numbered list in specs §14.10:
 
-- `npm test` → **37 passed, 0 failed, across 6 test files**
-  (`api.test.ts` 7, `TodoList.test.tsx` 3, `useTodos.test.ts` 8,
-  `App.test.tsx` 9, `TodoForm.test.tsx` 4, `TodoItem.test.tsx` 6). Matches the
-  prior cycle's reported 37/37 exactly.
-- `npm run build` → succeeded, 0 TypeScript errors, production bundle emitted
-  to `dist/` (`index.html`, CSS, JS chunk, gzip sizes reported), confirming
-  the app still builds cleanly for a containerized/CI build step.
-
-### Coverage summary against specs.md §11 (CI/CD-readiness properties)
-
-§11 itself defines infrastructure/pipeline deliverables (Bicep, GitHub
-Actions, Azure Pipelines) that are explicitly out of scope for this cycle's
-app-code pass and for the tester agent — they belong to the `devops` subagent
-and cannot be meaningfully unit/integration-tested by this agent (they require
-`az bicep build/lint`, workflow-syntax validation, or a live Azure
-subscription, none of which exist here yet). What **is** testable from the
-existing suites, and was already covered by them:
-
-| §11 CI/CD-readiness property (as audited in changes.md) | Existing coverage | Status |
+| Spec item | Test(s) present | Verdict |
 |---|---|---|
-| `dotnet test` runs headlessly with no Postgres | `TodoApiFactory` swaps in EF Core InMemory (all 29 backend tests run without a live DB) | Re-confirmed — 29/29 pass with no Postgres running |
-| `npm test` / `npm run build` run headlessly, non-interactively | `vitest run` (not watch) + `tsc && vite build` | Re-confirmed — 37/37 pass, build succeeds |
-| Connection string / CORS origin come from config/env, not hardcoded | Not independently re-tested this cycle (no code changed); previously verified by direct source reading in `changes.md`, consistent with `appsettings.json` having empty placeholders | Not re-verified (code unchanged since last audit) |
-| `/health` is dependency-free, no auth gate | Covered by `Health_ReturnsOkWithStatusOk` backend test | Still passing |
-| No build artifacts tracked in git / Dockerfiles don't depend on test project | Not independently re-checked this cycle (audit-only claim, code unchanged) | Not re-verified — see Gaps |
+| 1. Production password-shaped string does not throw | `BuildEntraAuthenticatedDataSource_WithProductionPasswordConnectionString_DoesNotThrow` | PASS — real regression test against the exact string from §14.1(a) |
+| 2. Same via DI, `NpgsqlDataSource` + `TodoDbContext` resolve | `AddTodoDbContext_WithPasswordBearingConnectionString_ResolvesDataSourceAndContext` | PASS |
+| 3-4. `Password=` / `pwd=` / `PASSWORD=` stripped | `BuildEntraConnectionString_StripsPasswordAndItsAliases` (3 cases) | PASS |
+| 5. `Passfile=` stripped | `BuildEntraConnectionString_StripsPassfile` | PASS |
+| 6. Missing `Username` → `InvalidOperationException` naming both `ConnectionStrings:TodoDb` and `Username` | `BuildEntraConnectionString_MissingUsername_Throws` (absent / empty / whitespace) | PASS |
+| 7. `Host`/`Port`/`Database`/`Trust Server Certificate`/unrelated keyword preserved | `BuildEntraConnectionString_PreservesAllOtherKeywords` (also covers `Command Timeout`, `Maximum Pool Size`) | PASS |
+| 8. Remote host + `Disable`/`Allow` → forced `Require` | `BuildEntraConnectionString_RemoteHostWithWeakSsl_ForcesRequire` | PASS |
+| 9. Remote host + `Require`/`VerifyFull`/`VerifyCA`/`Prefer`/omitted → unchanged | `BuildEntraConnectionString_RemoteHostWithAdequateSsl_LeavesItAlone` + `..._RemoteHostWithOmittedSsl_LeavesTheNpgsqlDefault` | PASS |
+| 10. Loopback exemption (`localhost`, `127.0.0.1`, also `LOCALHOST`, `::1`) | `BuildEntraConnectionString_LoopbackHostWithSslDisabled_StaysDisabled` | PASS |
+| 11. Idempotence | `BuildEntraConnectionString_IsIdempotent` | PASS |
+| 12. Exactly one `NpgsqlDataSource` singleton backs the `DbContext` | `AddTodoDbContext_RegistersExactlyOneDataSourceSingleton_BackingTheDbContext` | PASS |
+| 13. `Postgres:UseEntraAuth=true`/`false` changes nothing (flag is dead) | `AddTodoDbContext_LegacyUseEntraAuthFlag_HasNoEffect` (Theory: both values) | PASS |
+| 14. Blank/missing connection-string guard unchanged | `AddTodoDbContext_MissingConnectionString_ThrowsInvalidOperationException` / `_BlankConnectionString_...` | PASS |
+| 15. `EntraTokenPasswordProviderTests` still pass, unchanged | confirmed — file untouched in the diff, 9/9 pass as part of the 81 | PASS |
+| Additional: registration stays lazy (no credential/network work on mere registration) | `AddTodoDbContext_RegistrationIsLazy_NoDataSourceBuiltUntilResolved` | PASS |
+| Additional: startup logging, no secret leakage | 3 tests, see §3 below | PASS |
 
-### Gaps (not testable this cycle)
+Also present, not separately numbered in §14.10 but required by §14.5:
+`BuildEntraConnectionString_UnparseableInput_ThrowsNamingTheConfigKey` (malformed
+input wrapped in `InvalidOperationException` naming the config key).
 
-- **§11.3–§11.10 (Bicep IaC, GitHub Actions CI/CD workflows, Azure Pipelines
-  equivalent) have not been authored yet** — `infra/`, `.github/workflows/`,
-  and `azure-pipelines.yml` do not exist in the working tree. These cannot be
-  tested until the `devops` subagent produces them (a future pipeline stage).
-  This is not a regression or a failure of this cycle — §11 explicitly assigns
-  that authoring to a separate `devops` subagent, and per its PROPOSE-mode
-  rules (§11.8) it hasn't run yet.
-- **No live Azure resources / OIDC identity** exist to smoke-test the deploy
-  path described in §11.5–§11.6 — this is intentional per spec (§11.6 is a
-  manual, human, one-time bootstrap; §11.8 forbids the devops agent from
-  provisioning anything).
-- The three "not re-verified" rows above (config-from-env, `/health`
-  dependency-freedom source claims, Dockerfile/`.dockerignore` hygiene) were
-  not re-audited by direct source reading in this cycle, since no source
-  changed since the prior cycle's audit already did that reading and this
-  cycle's job was to independently confirm the test suites still pass, not to
-  redo a full source audit with no diff to review. If a reviewer wants this
-  re-confirmed line-by-line, it would need a targeted read of
-  `Program.cs`/`appsettings.json`, which was not repeated here since it was
-  unchanged.
+### 3. Deep-dive: does the "no secret in logs" test actually assert anything real?
 
-### Result totals
+Per the task's specific instruction, I inspected
+`BuildEntraAuthenticatedDataSource_LogsPrincipalAndWarnings_WithoutLeakingSecrets`
+line by line, not just its name:
 
-- Backend: **29/29 passed** (independently re-run, matches prior report).
-- Frontend: **37/37 passed** across 6 files (independently re-run, matches
-  prior report); `npm run build` also succeeds.
+- It builds a data source from a connection string containing the literal
+  password value `Password=REDACTED` (the placeholder token itself, used as a
+  stand-in "secret value" for the test).
+- `RecordingLogger` is a real `ILogger` implementation that calls the actual
+  `Func<TState, Exception?, string> formatter` supplied by the structured-logging
+  call sites (`logger.LogInformation("... Username={Username}", ...)` etc.) and
+  stores the **fully rendered message string** — not the raw template, not a
+  boolean flag. This means the assertion inspects what would actually reach a
+  sink/exporter.
+- The production code (`LogStartupDiagnostics`) only ever passes `Host`,
+  `Database`, `Username`, and the *previous* `SslMode` enum value as format
+  arguments — the password/passfile value is never one of the substituted
+  arguments in any of the three possible log lines. I confirmed this by reading
+  `TodoDbContextRegistration.cs` lines 218-239 directly: no code path threads
+  `normalized.ConnectionString`, the raw input string, or any password-bearing
+  value into a log call.
+- `Assert.DoesNotContain(logger.Entries, e => e.Message.Contains("REDACTED"))`
+  therefore is not a tautology — it is checking the rendered output of real
+  logging calls against a value that (a) genuinely appears in the input to the
+  function under test and (b) would appear in the message if the production
+  code were changed to (incorrectly) interpolate the connection string or the
+  stripped password into a log line. I did **not** mutate
+  `TodoDbContextRegistration.cs` to confirm this by fault-injection — as a
+  tester I do not edit application source files, even temporarily, so this is a
+  static-analysis conclusion (verified by reading every call site of `logger.Log*`
+  in the file), not a runtime-proven mutation-kill. Given the code review found
+  no path where a password-bearing value is ever passed as a format argument,
+  the assertion is real (it exercises actual rendered log text against a value
+  that would appear if the production code regressed), but its sensitivity to a
+  hypothetical future regression is inferred from the source, not empirically
+  demonstrated by breaking and un-breaking the code.
+- Two companion tests further strengthen this: `..._CleanConnectionString_LogsInformationOnly`
+  (exactly one log entry when nothing needed correcting — proves the two warning
+  branches are genuinely conditional, not always firing) and
+  `..._NullLogger_DoesNotThrow` (the null-safety contract required by §14.5, so
+  tests/hosts without a logger don't crash).
 
-## Git / PR status for this cycle — IMPORTANT environment limitation
+**Conclusion: the no-leak test is a real, falsifiable assertion**, not
+"it didn't throw."
 
-This environment has **no git remote configured** (`git remote -v` returns
-empty) and **no `gh` CLI installed**. As a result:
+### 4. Config-file / dead-reference audit (repo-wide grep)
 
-- Changes were committed **locally only** on branch
-  `pipeline/todo-app-azure-cicd` (no push was attempted — it would fail with
-  no remote configured).
-- **No PR was created or updated** — `gh pr create`/`gh pr list` are
-  unavailable in this environment. No PR URL is being fabricated; none exists.
-- This is a **one-time environment setup gap for a human** (add a git remote,
-  e.g. `git remote add origin <url>`, and install/authenticate the `gh` CLI),
-  not a defect in the app, the spec, or this cycle's work, and it should not
-  be routed back through the pipeline as a rejection or engineering task.
-- Once a remote and `gh` are configured, a human (or a future cycle running in
-  an environment that has them) can push `pipeline/todo-app-azure-cicd` and
-  open the PR against `main` using `.pipeline/specs.md`'s overview and
-  `.pipeline/changes.md`'s summary as the PR body.
+Searched the whole repository (not just `backend/`) for `Postgres:UseEntraAuth`,
+`Postgres__UseEntraAuth`, and `UseEntraAuthKey`:
+
+- **Application code**: zero occurrences of `UseEntraAuthKey` and zero live
+  branches on `Postgres:UseEntraAuth` remain in `backend/src/TodoApi/`. The only
+  in-code mention is a rewritten test name/comment (`AddTodoDbContext_LegacyUseEntraAuthFlag_HasNoEffect`
+  and its XML-doc paragraph) and a doc comment in
+  `TodoDbContextRegistration.cs`'s class summary — both explicitly documenting
+  that the flag is *gone*, not using it.
+- **`infra/main.bicep`** still contains `Postgres__UseEntraAuth` (an env var on
+  `todo-api`) and **`infra/README.md`** still documents it. Per this cycle's
+  explicit scope statement (specs §14.1: *"infra/main.bicep env wiring... [is
+  covered]"*, but §14.8 assigns the actual Bicep edit to *"the devops agent —
+  author only, never apply"* as a distinct downstream step) and per the parent
+  task's explicit instruction, **this is expected, documented drift, not a
+  defect in this cycle's deliverable.** `changes.md`'s "Known limitations / TODOs"
+  section already flags it as devops's outstanding item (§14.8 item 1). I did
+  not flag it as a failure; noting it here only for completeness/traceability.
+- **`appsettings.json`**: the `"Postgres": { "UseEntraAuth": false }` block is
+  fully deleted (confirmed by reading the file — only `Logging`, `AllowedHosts`,
+  `ConnectionStrings`, `Cors` remain).
+- **`Program.cs`**: comment updated to "PostgreSQL DbContext. Entra /
+  managed-identity auth only (specs §14)." — no residual "Uses password auth by
+  default..." text.
+- No `Password=` literal remains in any committed application config: checked
+  `appsettings.Development.json`, `appsettings.json`, `docker-compose.yml`,
+  `.env.example`, `TodoDbContextFactory.cs`, `TodoApiFactory.cs`,
+  `ObservabilityTests.cs` — all passwordless, confirmed by direct read.
+
+### 5. `BuildEntraConnectionString` edge cases — additional scrutiny beyond the unit tests
+
+Independently reasoned through cases not explicitly enumerated in §14.10 to make
+sure the implementation's behavior is actually correct, not just internally
+self-consistent with its own tests:
+
+- **`pwd=` alias stripping**: `NpgsqlConnectionStringBuilder.Password` setter is
+  the canonical property backing both `Password` and `pwd` keywords in Npgsql's
+  keyword table, so setting `.Password = null` clears whichever alias was used
+  at parse time — confirmed via the passing `pwd=hunter2` theory case (test
+  re-parses via a **fresh** `NpgsqlConnectionStringBuilder`, so it is asserting
+  against the actual serialized output, not an in-memory object still holding
+  the alias).
+- **SslMode omitted on a remote host**: Npgsql's own default (`Prefer` in
+  Npgsql 10) is left untouched per the spec's literal rule (only `Disable`/
+  `Allow` are corrected) — this is a documented, reviewer-flagged risk in
+  `changes.md` (assumption 2: `Prefer` silently downgrades to plaintext if the
+  server refuses TLS) and is explicitly not something this cycle was asked to
+  change; the checked-in Azure Bicep always sets `Ssl Mode=Require` explicitly,
+  so it is unreachable in the deployed configuration. Correctly *not* silently
+  "fixed" beyond the spec's instructions.
+- **Case-insensitive loopback matching** (`LOCALHOST`) and the **bracketed
+  `[::1]` form** are both exercised/handled — `LOCALHOST` via the Theory test,
+  `[::1]` via the `IsLoopbackHost` implementation's explicit `Trim('[', ']')`
+  (code-read, no test targets the bracketed form directly — noted as a minor gap
+  below).
+- **Non-loopback IPv4 addresses that are not `127.0.0.1`** (e.g. a private
+  `10.x` address) are correctly *not* exempted (fail-safe direction, forces
+  TLS) — confirmed by reading `LoopbackHosts` array (`localhost`, `127.0.0.1`,
+  `::1` only, no wildcard/prefix matching).
+- **Malformed input** (`Host=db;NotARealKeyword=1`) throws via
+  `NpgsqlConnectionStringBuilder`'s constructor and is correctly re-wrapped —
+  confirmed the test expects `InvalidOperationException` naming
+  `ConnectionStrings:TodoDb`, matching §14.5 step 1's requirement.
+
+### 6. Regression check — nothing else broken
+
+- `git diff --stat` confirms only backend + local-dev + docs files changed; no
+  frontend files touched (matches `changes.md`'s "No frontend code changed").
+- Full existing controller/DTO/health/CORS test suite (the pre-§14 52 tests)
+  still passes unchanged as part of the 81/81 total — no regression from this
+  cycle's rewrite of `TodoDbContextRegistrationTests.cs`.
 
 ---
 
-# Observability + Identity Policy cycle (2026-07-28) — verification of specs.md §12/§13
+## Test results summary
 
-Branch: `pipeline/appinsights-tracing` (off `main`). Cycle 1 of up to 3 for this
-feature. Backend-only scope (distributed tracing + managed-identity Postgres
-auth); no frontend/Bicep/pipeline-YAML changes to verify this cycle.
+| Suite | Passed | Failed | Skipped | Total |
+|---|---|---|---|---|
+| `TodoApi.Tests` (`dotnet test -c Release`) | 81 | 0 | 0 | 81 |
 
-## Verdict: PASS
+Build: `dotnet build -c Release` → 0 Warning(s), 0 Error(s).
 
-## What was independently verified (code read, not just changes.md trusted)
+---
 
-Read in full: `.pipeline/specs.md` §12 (Observability / Distributed Tracing) and
-§13 (Identity & Secrets Policy), and the actual implementation:
+## Gaps (explicitly not verifiable in this environment — matches §14.10's own scope limit)
 
-- `backend/src/TodoApi/Observability/TelemetryRegistration.cs`
-- `backend/src/TodoApi/Data/TodoDbContextRegistration.cs`
-- `backend/src/TodoApi/Program.cs`
-- `backend/src/TodoApi/TodoApi.csproj`
-- `backend/src/TodoApi/appsettings.json` / `appsettings.Development.json`
-- `backend/src/TodoApi/Data/TodoDbContextFactory.cs` (confirmed correctly left
-  untouched — design-time only, never used at Azure runtime)
+These are the same items `changes.md` and specs §14.10 already call out as
+requiring a live Azure environment or a human. I did not attempt to fake or
+mock around them, per instructions:
 
-Findings, matched against the spec:
+1. **Real Entra token acquisition against Azure Postgres Flexible Server** — no
+   live server in this environment; the `EntraTokenPasswordProvider` tests
+   (unchanged, 9/9 passing) already cover the token-callback contract with a
+   fake credential, which is the maximum verifiable without Azure.
+2. **The Postgres AAD handshake / in-DB `pgaadauth` grants (§14.7)** — requires
+   a live server connection as the Entra admin; explicitly a human step.
+3. **`docker-compose.yml` `trust`-auth local container end-to-end behavior
+   (§14.6)** — I did not have Docker available to independently re-run the
+   engineer's empirical probe (Probes A/B in `changes.md`). The engineer's
+   documented method (counting-provider probe showing 0 password-provider
+   invocations under `trust`, plus a full `dotnet run` + CRUD round-trip) is
+   methodologically sound and specific enough to be credible, but I could not
+   independently reproduce it in this test pass. This is a **process gap**, not
+   a **defect** — flagging for transparency, not as a blocker.
+4. **The live cutover (§14.9)** — explicitly human-run, post-merge, against the
+   real `todo-api` Container App. `.pipeline/deployment-lessons-learned.md` §5a
+   (referenced by the spec as needing to be closed out) does not yet exist in
+   this repo; that is expected, since the live cutover has not been run yet.
+5. **`[::1]` bracketed-host loopback exemption** — implemented (`IsLoopbackHost`
+   strips `[` `]` before comparing) but not covered by a dedicated unit test
+   (only bare `::1` is tested). Low risk (same code path as `::1`), noting as a
+   minor coverage gap rather than a failure — does not change the PASS verdict.
 
-1. **§12 tracing wiring is real, not just declared.** `AddTodoTelemetry`
-   registers OpenTelemetry tracing **unconditionally** (ASP.NET Core +
-   HttpClient instrumentation when no AI connection string; the Azure Monitor
-   distro's own instrumentation when a connection string is present), and
-   **always** adds `AddNpgsql()` exactly once regardless of branch, satisfying
-   "one correlated trace across request + HttpClient + DB calls" (§12.2) and
-   the "no-op cleanly when unset" requirement (§12.5) — confirmed both by
-   reading the code and by the new tests below, which prove it produces real
-   `Activity`/`traceId` data, not merely that registration doesn't throw.
-2. **Deviation from the literal §12.3 snippet is intentional and documented**
-   in `changes.md`: `UseAzureMonitor()` is called only when
-   `APPLICATIONINSIGHTS_CONNECTION_STRING` is present, rather than
-   unconditionally. This is a legitimate, spec-compatible refinement — §12.5
-   explicitly requires "no-op cleanly... does not throw" when unset, and
-   §13.5 requires the managed-identity credential to never be constructed
-   locally. Verified: `DefaultAzureCredential` is only `new`'d inside the
-   `appInsightsConfigured` branch.
-3. **§12.4 (coexist with console logging, automatic `TraceId`/`SpanId`
-   correlation, no manual enrichment)** — confirmed empirically (not just by
-   reading code): ASP.NET Core's default logging config already stamps
-   `TraceId`/`SpanId` onto `Activity.Current` for every `ILogger` call once an
-   `ActivitySource` listener exists (added by `AddAspNetCoreInstrumentation`);
-   no Serilog or custom enricher was introduced, matching the spec's
-   "keep it simple" principle. Proven end-to-end by the new
-   `Request_ProducesValidTraceId_AndCorrelatesLogRecordToSameTrace` test.
-4. **§13.4 (Postgres managed-identity path)** — `TodoDbContextRegistration`
-   correctly branches on `Postgres:UseEntraAuth`: false/unset uses the
-   original `UseNpgsql(connectionString)` password path unchanged (regression
-   confirmed by tests); true builds an `NpgsqlDataSource` via
-   `NpgsqlDataSourceBuilder.UsePeriodicPasswordProvider` (not a one-shot
-   fetch, per spec) using `DefaultAzureCredential` and the exact token scope
-   `https://ossrdbms-aad.database.windows.net/.default` specified in §13.4.
-   Registered as a DI singleton (correct — shared pool/token cache, disposed
-   by the container).
-5. **§13.5 (App Insights Entra auth, connection string demoted to non-secret
-   config)** — `options.Credential = new DefaultAzureCredential()` is only set
-   inside the `appInsightsConfigured` branch (never invoked locally); the
-   connection string is read only from the flat env var
-   `APPLICATIONINSIGHTS_CONNECTION_STRING` (confirmed: absent from
-   `appsettings*.json`, no `__` section syntax, matching §12.5's explicit
-   note). §13.5 permits `DefaultAzureCredential` as an alternative to
-   `ManagedIdentityCredential`; the engineer's stated rationale (avoids a
-   CS0618 obsolete-constructor warning, keeps the build 0-warning) checks out
-   against the build result below.
-6. **§13.3 zero-app-secret claim** — confirmed no Container Apps secret name,
-   no Key Vault reference, and no hardcoded credential appears anywhere in the
-   backend source; the only committed password is the throwaway local Docker
-   value in `appsettings.Development.json` (spec-sanctioned, §6.3).
-7. **`Postgres:UseEntraAuth: false` default** is explicit in
-   `appsettings.json`, so local dev / CI is unaffected unless the env var
-   `Postgres__UseEntraAuth=true` is set — confirmed this is exactly the flag
-   the existing `TodoApiFactory` test host leaves unset, i.e. all 29
-   pre-existing tests exercise the **unchanged password branch**, not a new
-   code path (see below — this was verified, not assumed).
+None of these gaps are testable without a live Azure subscription and are
+correctly deferred to the human-run procedures in specs §14.6/§14.7/§14.9, as
+the spec itself mandates.
 
-No application source files were modified by this test pass — only test files
-and this report, per the tester agent's mandate.
+---
 
-## Independent build + existing-suite re-run
+## Coverage vs. specs.md §14 acceptance criteria
 
-```
-cd backend
-export PATH="/c/Users/ingda/dotnet10:$PATH"   # .NET SDK 10.0.302
-dotnet build TodoApi.sln -c Release
-dotnet test  TodoApi.sln -c Release
-```
+- §14.4 configuration contract (single `ConnectionStrings:TodoDb` key, all
+  `Postgres:UseEntraAuth` references deleted from app code/config) — **verified**.
+- §14.5 backend behavior (normalizer rules 1-6, startup logging, no dual mode) —
+  **verified** by unit tests + direct code read.
+- §14.6 local dev (passwordless `docker-compose.yml`/`appsettings.Development.json`/
+  `.env.example`, documented `down -v` + `az login` guidance) — **verified** by
+  direct file read; empirical Npgsql-provider-not-invoked-under-trust claim is
+  the engineer's own documented probe, not independently reproduced here (gap
+  #3 above).
+- §14.10 testing requirements — **all 15 enumerated items present and passing**,
+  plus additional logging/laziness coverage.
+- §14.11 non-functional (breaking-change disclosure, TLS enforcement, no secret
+  logging) — **verified**.
+- §14.12 out-of-scope items (server auth unchanged, `todoadmin` preserved, no
+  Key Vault, `EntraTokenPasswordProvider`/`UsePasswordProvider` untouched) —
+  **verified**: `infra/modules/postgres.bicep` was not part of this diff (only
+  `infra/main.bicep`, `main.parameters.json` mention the still-present
+  `Postgres__UseEntraAuth` env var / admin password, which is expected drift
+  per §14.8, not a code defect); `EntraTokenPasswordProvider.cs` is byte-for-byte
+  absent from `git diff --stat`, confirming it was not touched.
 
-- **Clean build (removed `bin/`/`obj/` first, restored from scratch):
-  succeeded, 0 Warning(s), 0 Error(s).** Matches the engineer's claim, verified
-  independently rather than trusted.
-- **Pre-existing 29 tests: still 29/29 passing**, confirmed run in isolation
-  before any new test files were added, and again after. `TodoApiFactory`
-  (`backend/tests/TodoApi.Tests/TodoApiFactory.cs`) does not set
-  `Postgres:UseEntraAuth` or `APPLICATIONINSIGHTS_CONNECTION_STRING`, so these
-  29 tests exercise exactly the pre-existing password-auth /
-  no-telemetry-exporter code paths — confirmed by direct code reading, not
-  assumed. **No regression**: the refactor of the inline `AddDbContext` call
-  in `Program.cs` into `TodoDbContextRegistration.AddTodoDbContext` preserves
-  identical behavior for the default configuration.
+---
 
-## New tests added this cycle (all backend, `backend/tests/TodoApi.Tests/`)
+## Commit / PR
 
-**Total suite after this cycle: 44/44 passing** (29 pre-existing + 15 new),
-stable across 4 repeated full-suite runs (no flakiness).
-
-### `ObservabilityTests.cs` (5 tests) — in-process trace/log correlation, §12.8
-
-Uses a dedicated `ObservabilityTestFactory : WebApplicationFactory<Program>`
-that (a) swaps the DbContext to EF Core InMemory (same technique as the
-existing `TodoApiFactory`, no real Postgres needed), (b) hooks a small custom
-`BaseProcessor<Activity>` into the app's **own** `TracerProviderBuilder` via
-`IServiceCollection.ConfigureOpenTelemetryTracerProvider` (the same
-accumulation mechanism `TelemetryRegistration` itself relies on to add Npgsql
-instrumentation on top of ASP.NET Core/HttpClient instrumentation — so this is
-a real test of the app's own wiring, not a bypass), and (c) injects a
-deterministic marker `ILogger` call into the middleware pipeline via
-`IStartupFilter` (without touching `Program.cs`) so there is a known in-request
-log line to check for correlation.
-
-| Test | What it proves | Result |
-|---|---|---|
-| `TracerProvider_IsRegisteredInServiceCollection` | §12.8 DI/wiring smoke test — `AddOpenTelemetry()` actually registers a resolvable `TracerProvider` | PASS |
-| `Request_ProducesValidTraceId_AndCorrelatesLogRecordToSameTrace` | The core §12.8 assertion: an in-request `ILogger` record carries a valid 32-hex, non-default W3C `TraceId`, and a `Server`-kind `Activity` exported from the app's tracer provider carries the **same** `TraceId` — proving automatic log↔trace correlation with zero manual enrichment | PASS |
-| `MultipleRequests_ProduceDifferentTraceIds` | Each inbound request gets its own trace (not a shared/static one) | PASS |
-| `AppStartsAndServesRequests_WhenAppInsightsConnectionStringUnset` | §12.5/§12.8 no-op requirement: app boots and serves `/health` normally with no AI connection string configured | PASS |
-| `AppStartsAndServesRequests_WhenAppInsightsConnectionStringIsSet` | The `UseAzureMonitor()` + managed-identity-credential branch is exercised (syntactically valid but non-routable connection string) without requiring network egress to start | PASS |
-
-**Notable debugging finding, documented for future test authors:** an initial
-version of this test used the `OpenTelemetry.Exporter.InMemory` NuGet
-package's `AddInMemoryExporter`, and separately a naive process-wide
-`ActivityListener`. Both were rejected:
-- `AddInMemoryExporter` intermittently returned zero captured activities in
-  this SDK/version combination even after `TracerProvider.ForceFlush()`
-  (root-caused to the packaged exporter, not the app code — a custom
-  `BaseProcessor<Activity>` that simply appends to a list works reliably and
-  was used instead).
-- **A real flakiness root cause was found and fixed**: `System.Diagnostics.
-  ActivitySource` listeners registered by OpenTelemetry are **process-wide
-  (static)**, not scoped per `WebApplicationFactory`/`TestServer` instance.
-  When xUnit runs different test classes in parallel (its default), every
-  test class's own `WebApplicationFactory<Program>` host independently wires
-  `AddAspNetCoreInstrumentation()` against the **same static**
-  `"Microsoft.AspNetCore.Hosting"` `ActivitySource`, so one test's in-memory
-  processor can observe **another concurrently-running test's** request
-  activity. This caused a real, reproducible failure (captured trace ID did
-  not match the expected one) when running the full suite, while the same
-  test passed in isolation. Fixed by (a) `[assembly:
-  CollectionBehavior(DisableTestParallelization = true)]` and (b) making the
-  assertion match the specific known-correct `TraceId` (from the
-  log-provider-scoped-per-host marker log) rather than blindly taking "the
-  first Server-kind activity" — defense in depth. Verified stable across 4
-  consecutive full-suite runs after the fix.
-
-### `TelemetryRegistrationTests.cs` (4 tests) — DI-level unit tests, no host
-
-| Test | What it proves | Result |
-|---|---|---|
-| `ConnectionStringKey_IsTheStandardAppInsightsEnvVarName` | The constant is exactly `APPLICATIONINSIGHTS_CONNECTION_STRING` (§12.5's flat, no-`__` name) | PASS |
-| `AddTodoTelemetry_WithNoConnectionString_DoesNotThrow_AndRegistersTracerProvider` | Registration + `TracerProvider` build succeed with the var absent | PASS |
-| `AddTodoTelemetry_WithConnectionStringConfigured_DoesNotThrow_AndRegistersTracerProvider` | Same, with a syntactically valid dummy AI connection string (exercises the `UseAzureMonitor` branch) | PASS |
-| `AddTodoTelemetry_WithBlankConnectionString_TreatedAsUnset` | Whitespace-only value is treated as absent (matches the `IsNullOrWhiteSpace` guard in the source) | PASS |
-
-### `TodoDbContextRegistrationTests.cs` (6 tests) — §13.4 branching/wiring, no live DB
-
-| Test | What it proves | Result |
-|---|---|---|
-| `AddTodoDbContext_WithEntraAuthNotEnabled_UsesPasswordConnection_NoDataSourceRegistered` (theory: flag absent / flag `false`) | The default/false path takes the **original** `UseNpgsql(connectionString)` route: no `NpgsqlDataSource` singleton is registered, and the resolved `TodoDbContext`'s connection string is exactly the configured password-based string (regression proof, not just "didn't throw") | PASS (both cases) |
-| `AddTodoDbContext_WithEntraAuthTrue_RegistersNpgsqlDataSourceSingleton_ConstructsWithoutThrowing` | `Postgres:UseEntraAuth=true` registers and successfully **constructs** (not just declares) an `NpgsqlDataSource` via `DefaultAzureCredential` + `UsePeriodicPasswordProvider`, and a `TodoDbContext` resolves over it — all without any network I/O (token acquisition is lazy, only triggered by opening a real connection, which this test never does) | PASS |
-| `AddTodoDbContext_EntraAuthTrue_DoesNotRegisterAPlainPasswordDbContext` | Exactly one `NpgsqlDataSource` registration exists in the Entra branch (no conflicting dual-provider registration) | PASS |
-| `AddTodoDbContext_MissingConnectionString_ThrowsInvalidOperationException` | The pre-existing "connection string must be configured" guard survived the `Program.cs` → `TodoDbContextRegistration` refactor | PASS |
-| `AddTodoDbContext_BlankConnectionString_ThrowsInvalidOperationException` | Whitespace-only connection string is also rejected | PASS |
-
-## Gaps — what could NOT be tested in this environment, and why
-
-Called out explicitly per the task brief, distinguishing "automated test
-coverage" from "can only be verified against the real deployed environment":
-
-1. **No live Entra-auth-enabled Postgres Flexible Server exists here.** The
-   `AddTodoDbContext_WithEntraAuthTrue_...` test proves the **branching logic
-   and object construction** are correct (right code path taken, no exception
-   constructing the data source/token-provider wiring), but it does **not**
-   open a real connection or acquire a real Entra token — Npgsql's periodic
-   password provider only calls the token callback lazily on first connection
-   open, which none of these tests trigger. **End-to-end verification (a real
-   token successfully authenticating to a real Entra-enabled Postgres server)
-   can only be done by a human/devops against the deployed environment**,
-   after the §13.4 manual `pgaadauth_create_principal` bootstrap and the
-   devops Bicep changes (Entra admin, role assignment) are in place. This
-   matches what `changes.md` already flags as a known limitation — confirmed
-   independently, not just restated.
-2. **No live Application Insights resource.** All tracing tests run with
-   either no connection string or a syntactically-valid-but-fake one; actual
-   ingestion into Azure Monitor, the `Monitoring Metrics Publisher` role
-   grant, and `DisableLocalAuth` on the AI component (§13.5/§13.10) are devops
-   /infra work for a later stage and cannot be exercised from this backend
-   test suite. Per §12.8, this is explicitly not required — "no live-Azure
-   integration test is required or expected."
-3. **Frontend, Bicep/IaC, and pipeline YAML are unchanged and out of scope**
-   for this cycle (confirmed via `git status` — no diffs under `frontend/`,
-   `infra/`, or `.github/workflows/`), so nothing new to test there.
-4. **`Trust Server Certificate=true` (cert-verification skipped) and the
-   devops-owned AI `DisableLocalAuth`/role-assignment items** flagged as
-   residual risk in `changes.md` are infra/Bicep concerns for the devops
-   stage, not testable from this backend test suite.
-
-## Result totals
-
-- **Backend build**: 0 Warning(s), 0 Error(s) (clean, from-scratch rebuild).
-- **Backend tests**: **44/44 passed** (29 pre-existing + 15 new this cycle),
-  stable across 4 repeated full-suite runs.
-- Frontend: unchanged this cycle, not re-run (no diff to verify).
-
-## Commit / push status for this cycle
-
-This environment **does** have a git remote (`origin` →
-`git@github.com:matvi/todo-claude-multiagent.git`) but **`gh` CLI is not
-installed**, so per this cycle's explicit instructions:
-
-- Changes were committed on `pipeline/appinsights-tracing` and pushed to
-  `origin/pipeline/appinsights-tracing`.
-- **No PR was created via `gh`** (unavailable). The PR-creation URL GitHub
-  prints on push (or, equivalently,
-  `https://github.com/matvi/todo-claude-multiagent/pull/new/pipeline/appinsights-tracing`)
-  is provided for a human to open the PR — none was fabricated as already
-  open.
+Verdict is PASS. Proceeding to commit, push `pipeline/entra-passwordless-connection-string`,
+and open a PR against `main` per instructions, noting the required manual
+production cutover (§14.9) as a pre-merge-effective, not pre-merge, step.

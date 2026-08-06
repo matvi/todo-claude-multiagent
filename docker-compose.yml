@@ -1,13 +1,24 @@
 # Local development helper: runs ONLY Postgres.
 # The backend (dotnet run) and frontend (npm run dev) run on the host.
+#   docker compose down -v   # ONCE, after switching to trust auth (see below)
 #   docker compose up -d
 services:
   db:
     image: postgres:16
     environment:
       POSTGRES_USER: todo
-      POSTGRES_PASSWORD: todo
       POSTGRES_DB: tododb
+      # Entra-only application auth (specs §14.6): this local container cannot
+      # validate Entra tokens, so it is configured to require NO credential at
+      # all. This keeps a single, unconditional Entra code path in the app with
+      # zero passwords anywhere. Local-only; never used in Azure.
+      #
+      # NOTE: POSTGRES_HOST_AUTH_METHOD is only honoured by initdb on an EMPTY
+      # data directory. An existing todo_pgdata volume keeps its old
+      # scram-sha-256 pg_hba.conf and will still demand a password — run
+      # `docker compose down -v` once before the first `up` after this change
+      # (wipes local todo data only).
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports:
       - "5432:5432"
     volumes:

@@ -93,8 +93,9 @@ public class ObservabilityTestFactory : WebApplicationFactory<Program>
         {
             config.AddInMemoryCollection(new Dictionary<string, string?>
             {
+                // Passwordless by contract (specs §14); never dialled.
                 ["ConnectionStrings:TodoDb"] =
-                    "Host=localhost;Port=5432;Database=unused;Username=unused;Password=unused",
+                    "Host=localhost;Port=5432;Database=unused;Username=unused",
                 ["Cors:AllowedOrigins:0"] = "http://localhost:5173",
                 // Explicitly control this key (rather than leaving it to ambient
                 // process env vars) so the test is deterministic either way.

@@ -5,8 +5,14 @@ This document also covers the **CI/CD + Infrastructure-as-Code extension**
 (added 2026-07-24, review cycle 1 of up to 3 for the extended scope). The
 extension lives in **§11**; §1–§10 describe the already-implemented app and are
 unchanged except for the two items in §8 that this cycle moves **into** scope.
+Later cycles appended **§12** (observability), **§13** (identity/secrets policy)
+and **§14** (Entra-ONLY Postgres auth for the app — *current cycle*).
 Author: Architect agent
-Date: 2026-07-24 (extension); app spec 2026-07-23
+Date: 2026-08-06 (§14); 2026-07-27 (§12/§13); 2026-07-24 (§11); app spec 2026-07-23
+
+> **Current cycle = §14 only.** §1–§13 are historical/settled and reproduced
+> unchanged. **§14 supersedes parts of §13.4** (application DB auth + connection
+> string) and **§6.2/§6.3** (local dev DB auth). Where they disagree, **§14 wins**.
 
 ---
 
@@ -1478,3 +1484,603 @@ Complete when:
   OpenTelemetry Distro `AzureMonitorOptions.Credential`, disable local auth,
   `Monitoring Metrics Publisher`):
   https://learn.microsoft.com/en-us/azure/azure-monitor/app/azure-ad-authentication
+
+---
+
+## 14. Entra-only Postgres authentication for the application (extension — **this cycle's scope**)
+
+**Cycle date:** 2026-08-06. **Branch:** `pipeline/entra-passwordless-connection-string`.
+
+> **§14 SUPERSEDES §13.4** for how the application authenticates to PostgreSQL and
+> how its connection string is supplied, and **supersedes §6.2/§6.3** for local
+> development database auth. It also supersedes the `UsePeriodicPasswordProvider`
+> code sketch in §13.4 (already replaced in code by `UsePasswordProvider`, commit
+> `1b765fd` — see `.pipeline/deployment-lessons-learned.md` §5a). Everything else
+> in §13 (managed-identity-first policy, per-secret classification, App Insights,
+> the Key Vault pattern) stands unchanged. Where §13.4/§6 and §14 disagree,
+> **§14 wins.**
+
+### 14.1 Overview
+
+Two things drive this cycle.
+
+**(a) A live bug.** Flipping `Postgres__UseEntraAuth=true` on the deployed
+`todo-api` Container App still breaks the app, now failing at data-source
+construction:
+
+```
+System.NotSupportedException: When registering a password provider, a password or
+password file may not be set.
+   at Npgsql.NpgsqlSlimDataSourceBuilder.PrepareConfiguration()
+   at TodoApi.Data.TodoDbContextRegistration.BuildEntraAuthenticatedDataSource(...)
+```
+
+Root cause: **one connection-string value is shared by two auth modes that need
+different connection-string shapes, and nothing reshapes it.** The Entra path
+calls `UsePasswordProvider` on whatever `ConnectionStrings:TodoDb` contains; in
+production that is still the SQL-auth string (`Username=todoadmin;Password=…`),
+and Npgsql refuses to combine a static password with a password provider. Even
+without the password, `Username` would still be wrong (`todoadmin`, not the
+managed identity's Postgres role).
+
+**(b) A deliberate scope decision by the user** (not a discovered bug):
+**the application must authenticate to PostgreSQL with Entra / managed identity
+ONLY — unconditionally, in every environment, including local development.**
+The `Postgres:UseEntraAuth` flag, the password code path, and every `Password=`
+in application configuration are removed. There is no fallback and no dual mode
+*in the application*.
+
+**Deliberately NOT in scope (second user refinement):** the **Postgres server
+keeps accepting both authentication methods**. `activeDirectoryAuth: Enabled` +
+`passwordAuth: Enabled` stays exactly as it is, and the `todoadmin` administrator
+login and its password remain, because the user needs out-of-band `psql`/admin
+access to the server. "Entra-only" is a property of **the application's
+connection**, not of the server.
+
+Removing the branch removes the class of bug entirely: there is only one
+connection-string shape, so it can never be the wrong one for the mode.
+
+**Scope:** backend code + tests, local-dev files (`docker-compose.yml`,
+`appsettings*.json`), `infra/main.bicep` env wiring, `infra/README.md` runbook,
+and a documented live cutover/verification procedure. **No new Azure resources.
+No Azure SKU or server-auth change. Cost delta: zero.**
+
+### 14.2 Verified live state (read-only `az`, 2026-08-06) — do not re-derive
+
+| Fact | Verified value |
+|---|---|
+| Subscription / tenant | `9ba6633f-058c-4269-8b0f-086ab331ef26` / `6ce2ff72-209a-447d-bf53-9579c52c03f5` |
+| `todo-api` env `ConnectionStrings__TodoDb` | `secretRef: todo-db-connection` → the **SQL-auth string** (`Username=todoadmin;Password=…`) |
+| `todo-api` env `Postgres__UseEntraAuth` | `"false"` (rolled back on 2026-07-28; app healthy) |
+| `todo-api` Container App secrets | exactly one: `todo-db-connection` |
+| `todo-api` identity | SystemAssigned, principalId `05c60b63-dda9-4a3e-be87-ac8350600b79`, appId `bd1ec241-b0fe-4665-b6fa-0b0eb8793865`, display name **`todo-api`** |
+| Postgres `pg-todo-demo-cus01` (Central US, PG16) | `activeDirectoryAuth: Enabled`, `passwordAuth: Enabled` — **stays this way** |
+| Server-level Entra administrators | exactly one: the human user `ee31140f-3164-439c-8fa9-9f7e5dbd1b2c`. The `todo-api` MI is **deliberately not** a server admin. |
+| In-DB principal for `todo-api` | created + granted in Phase 4 step B (`.pipeline/infra.md`, "Live cutover status — 2026-07-28"). **Verify (14.7); do not blindly re-run.** |
+| `infra/main.bicep` (checked-in desired state) | already emits a **passwordless plain env var** `ConnectionStrings__TodoDb` (`Username=todo-api`) and **no** `todo-db-connection` secret |
+
+**The live app has drifted from the checked-in Bicep, and that drift is permanent
+by design:** CD deliberately no longer applies the infra Bicep
+(`.pipeline/deployment-lessons-learned.md` §2c), so Bicep is the "if you bootstrap
+again" desired state while live config is changed imperatively. **A design that
+only works once someone re-applies the full Bicep is not a fix.** The live
+connection string must be changed imperatively as part of the cutover (14.9).
+
+### 14.3 Design decision — one unconditional Entra code path
+
+**DECISION: `TodoDbContextRegistration.AddTodoDbContext` always builds the
+Entra-authenticated `NpgsqlDataSource`. The `Postgres:UseEntraAuth` flag and the
+`else` branch (`options.UseNpgsql(connectionString)` with an embedded credential)
+are deleted. `ConnectionStrings:TodoDb` is passwordless in every environment.**
+
+Retained from the previous fix (do not change): the token is supplied through
+`NpgsqlDataSourceBuilder.UsePasswordProvider(sync, async)` backed by
+`EntraTokenPasswordProvider` + `DefaultAzureCredential`, so the token is resolved
+on the connection-open path. **Never** reintroduce `UsePeriodicPasswordProvider`
+(lessons §5a).
+
+Retained as defence-in-depth: the Entra path still **strips** any `Password=` /
+`Passfile=` it is handed (14.5). This is what makes the crash in 14.1(a)
+structurally impossible even if someone re-points the app at a legacy connection
+string, and it makes the live cutover survivable in either order.
+
+#### Alternatives considered and rejected
+
+| Option | Why rejected |
+|---|---|
+| **Keep the flag, add a second connection string** (`ConnectionStrings:TodoDbEntra`) | Contradicts the user's Entra-only directive; duplicates host/port/db in two drift-prone places; leaves a password path alive. |
+| **Keep the flag, only fix the shape** (the pre-refinement draft of this spec) | Superseded by the user's scope decision. Recorded here only so the reviewer can see it was considered. |
+| **Second Container Apps secret for the Entra string** | The Entra string holds **no credential** → it must not be a secret at all (§13.2). Also inert until Bicep is re-applied, which never happens. |
+| **Local dev keeps a password "just for localhost"** | Explicitly rejected by the user: no silent password fallback anywhere. See 14.6. |
+| **Discover the MI's Postgres role name at runtime (IMDS)** | The role name is a Postgres-side choice (whatever `pgaadauth` registered); IMDS cannot report it. The connection string is the source of truth. |
+
+### 14.4 Configuration contract (authoritative — engineer and devops both bind to this)
+
+**Exactly one DB configuration value remains.**
+
+| Config key | Env var | Required | Meaning |
+|---|---|---|---|
+| `ConnectionStrings:TodoDb` | `ConnectionStrings__TodoDb` | **yes, every environment** | Passwordless Npgsql connection string. `Username=` **must** be the Postgres role name that maps to the caller's Entra identity (in Azure: the `todo-api` managed identity's `pgaadauth` role; locally: the local role — see 14.6). It must contain **no** `Password=` and no `Passfile=`. Non-secret → always a **plain env var / plain appsettings value**, never a Container Apps secret, never Key Vault. |
+
+**Keys REMOVED this cycle — delete every occurrence:**
+
+| Removed | Where it must be deleted |
+|---|---|
+| `Postgres:UseEntraAuth` (`Postgres__UseEntraAuth`) | `TodoDbContextRegistration.UseEntraAuthKey` const + branch; `backend/src/TodoApi/appsettings.json` (`"Postgres": { "UseEntraAuth": false }` — remove the whole `Postgres` section if it becomes empty); the `Postgres__UseEntraAuth` env var in `infra/main.bicep`; the live Container App (14.9); every mention in `infra/README.md` and code comments (incl. `Program.cs` line ~16-17). |
+| `Password=` / `Passfile=` in any app config | `backend/src/TodoApi/appsettings.Development.json`; `docker-compose.yml`; `infra/main.bicep` (already absent); the live `todo-db-connection` secret (retired in 14.9). |
+
+**No new configuration keys are introduced.** (An earlier draft of this spec
+proposed `Postgres:EntraUsername`; it is **not** part of the final design — with a
+single unconditional path the connection string is the only source of truth.)
+
+**Not removed (out of app scope, per the user's refinement):** the Bicep
+`postgresAdminUser` / `@secure() postgresAdminPassword` parameters, the
+`todoadmin` login, the `PGADMIN_PASSWORD` CI/CD secret, and `passwordAuth:
+'Enabled'` on the server. These are **deploy-time / human-admin** credentials
+(§13.9), not application runtime credentials, and the user explicitly requires
+continued `psql`/admin access. Leave them exactly as they are.
+
+### 14.5 Required backend behavior
+
+File: `backend/src/TodoApi/Data/TodoDbContextRegistration.cs`.
+
+**Structure after the change:**
+
+```csharp
+public static IServiceCollection AddTodoDbContext(
+    this IServiceCollection services, IConfiguration configuration)
+{
+    var connectionString = configuration.GetConnectionString("TodoDb");
+    if (string.IsNullOrWhiteSpace(connectionString))
+        throw new InvalidOperationException(/* existing message, keep */);
+
+    // Entra / managed-identity auth is the ONLY supported mode (specs §14).
+    services.AddSingleton(sp => BuildEntraAuthenticatedDataSource(
+        connectionString,
+        new DefaultAzureCredential(),
+        sp.GetService<ILoggerFactory>()?.CreateLogger("TodoApi.Data.TodoDbContextRegistration")));
+    services.AddDbContext<TodoDbContext>((sp, options) =>
+        options.UseNpgsql(sp.GetRequiredService<NpgsqlDataSource>()));
+
+    return services;
+}
+```
+
+- The missing/blank connection-string guard and its message are **unchanged**
+  (an existing test asserts it).
+- `UseEntraAuthKey` is deleted. `EntraTokenPasswordProvider` is **unchanged**.
+- The `NpgsqlDataSource` registration stays **lazy** (factory delegate), so merely
+  calling `AddTodoDbContext` performs no credential or network work — the existing
+  test factory relies on this (14.10).
+
+**Connection-string normalization.** Implement as a **pure, `internal static`,
+side-effect-free** function so it is unit-testable with no Azure, token, or DB:
+
+```csharp
+internal static string BuildEntraConnectionString(string baseConnectionString, out NormalizationReport report);
+// or return a small record; the engineer may choose the shape. The rules below are binding.
+```
+
+Steps, in this exact order, using `NpgsqlConnectionStringBuilder` (do **not**
+hand-roll parsing — keyword aliases and quoting must be handled):
+
+1. **Parse.** `var b = new NpgsqlConnectionStringBuilder(baseConnectionString);`
+   If it throws, surface it wrapped in an `InvalidOperationException` naming
+   `ConnectionStrings:TodoDb`.
+2. **Strip any static credential.** Set `b.Password = null` **and**
+   `b.Passfile = null`. Both are required: Npgsql's `PrepareConfiguration()`
+   rejects a password provider when *either* is set (the literal exception text is
+   "a password **or password file** may not be set"). Record whether either was
+   present, for the warning in step 6. Setting `b.Password = null` covers the
+   `Password=` / `password=` / `pwd=` aliases because the builder normalizes them.
+3. **Validate the principal.** If `b.Username` is null/whitespace, throw
+   `InvalidOperationException`:
+   *"ConnectionStrings:TodoDb must specify Username= — the Postgres role that maps
+   to this application's Entra identity (in Azure, the todo-api managed identity's
+   role). Postgres authentication for this application is Entra-only (specs §14)."*
+   Do **not** guess a default and do **not** blacklist `todoadmin` by name — a
+   wrong username is surfaced by the startup log (step 6), not by a heuristic.
+4. **Guarantee TLS for non-loopback hosts.** The Entra access token is transmitted
+   in the cleartext-password field, so the transport must be encrypted against a
+   remote server. If `b.Host` is **not** a loopback host (`localhost`,
+   `127.0.0.1`, `::1`, case-insensitive) **and** the resolved `b.SslMode` is
+   `Disable` or `Allow`, set `b.SslMode = SslMode.Require` and flag it for a
+   warning. Loopback hosts are left untouched (the local dev container has no TLS
+   — 14.6). Any other `SslMode` value (`Prefer`, `Require`, `VerifyCA`,
+   `VerifyFull`) is left exactly as configured. Do not touch
+   `Trust Server Certificate` or anything else.
+5. **Preserve everything else verbatim** — `Host`, `Port`, `Database`,
+   `Trust Server Certificate`, pooling/timeout settings, and any keyword we do not
+   know about must survive the round-trip unchanged.
+6. Return `b.ConnectionString`, then build the data source from the **normalized**
+   string with `UsePasswordProvider(provider.GetPassword, provider.GetPasswordAsync)`.
+
+**Startup logging (required — this is the diagnosability requirement).** Emitted
+once, when the `NpgsqlDataSource` singleton is constructed, via the injected
+`ILogger` (category `TodoApi.Data.TodoDbContextRegistration`); all logging must be
+null-safe so tests may pass `null`:
+
+- `Information`: `"Postgres auth: Entra / managed identity. Host={Host} Database={Database} Username={Username}"`.
+- `Warning` (only if it happened): `"A static Postgres password/passfile was present in ConnectionStrings:TodoDb and has been ignored — this application authenticates with Entra only (specs §14). Remove the credential from configuration."`
+- `Warning` (only if it happened): `"Postgres SslMode was {Original}; forced to Require for host {Host} because the Entra token is transmitted as a cleartext password."`
+- **Never** log the token, the password, or the full connection string.
+
+**Also update the surrounding prose/comments** so nothing still claims a dual-mode
+design: the class XML doc, the `BuildEntraAuthenticatedDataSource` XML doc (its
+"the baseConnectionString must NOT contain a `Password=`" precondition is now
+*enforced by the method*, not assumed of the caller), and `Program.cs` line ~16-17
+("Uses password auth by default; managed-identity (Entra) auth when
+`Postgres__UseEntraAuth=true`") → "PostgreSQL DbContext. Entra / managed-identity
+auth only (specs §14)."
+
+### 14.6 Local development — Entra-only, no password (supersedes §6.2/§6.3)
+
+Local Postgres in Docker cannot validate Entra tokens, but the requirement is
+"no password path anywhere," not "the local server must do Entra." The resolution:
+**the local Postgres container is configured to require no credential at all
+(`trust` authentication), so the single Entra code path runs unmodified against
+it.** No `POSTGRES_PASSWORD`, no `Password=` in any file, no branch in the app.
+
+**`docker-compose.yml` — change the `db` service to:**
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: todo
+      POSTGRES_DB: tododb
+      # Entra-only application auth (specs §14.6): this local container cannot
+      # validate Entra tokens, so it is configured to require NO credential at
+      # all. This keeps a single, unconditional Entra code path in the app with
+      # zero passwords anywhere. Local-only; never used in Azure.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - todo_pgdata:/var/lib/postgresql/data
+```
+
+`POSTGRES_PASSWORD` is **deleted**. `POSTGRES_USER` stays `todo` to minimise churn.
+
+**`backend/src/TodoApi/appsettings.Development.json`:**
+
+```json
+"ConnectionStrings": {
+  "TodoDb": "Host=localhost;Port=5432;Database=tododb;Username=todo;Ssl Mode=Disable"
+}
+```
+
+(no `Password=`; `Ssl Mode=Disable` is fine and is preserved by 14.5 step 4
+because `localhost` is loopback).
+
+**`backend/src/TodoApi/appsettings.json`:** delete the `"Postgres": { "UseEntraAuth": false }`
+section; leave `"ConnectionStrings": { "TodoDb": "" }` as-is.
+
+**Developer prerequisites — document in `README`/§6.3 run instructions:**
+1. **`docker compose down -v` once** before the first `up` after this change.
+   `POSTGRES_HOST_AUTH_METHOD` is only honoured by `initdb` on an **empty** data
+   directory; an existing `todo_pgdata` volume keeps its old `scram-sha-256`
+   `pg_hba.conf` and will still demand a password. This wipes local todo data
+   (local only, no production impact).
+2. **`az login` once per machine.** `DefaultAzureCredential` resolves to
+   `AzureCliCredential` locally. Under `trust` the server never challenges for a
+   password, so Npgsql should never need to invoke the provider — but this must
+   not be left to chance.
+   **Engineer action:** verify empirically whether Npgsql invokes the password
+   provider when the server replies `AuthenticationOk` immediately, and record the
+   observed behaviour in `.pipeline/changes.md`. If the provider **is** invoked
+   eagerly, `az login` is a hard local prerequisite; if it is not, `az login` is
+   only needed for developers who also connect to Azure resources. Either way the
+   documented instruction is "run `az login` once" — this is the accepted cost of
+   Entra-only.
+
+**Tradeoff (documented, as required).** `trust` means the local container accepts
+any connection on the mapped port with no credential. Accepted because: it is a
+throwaway local container with demo data, it is already published only to
+`localhost`, and it is the only way to keep one code path with zero passwords.
+Developers who consider this unacceptable on a shared machine should not publish
+port 5432 (drop the `ports:` mapping and run the backend inside the compose
+network) rather than reintroducing a password.
+
+**Alternative considered and rejected — point local dev at the real Azure server**
+using the developer's own Entra identity (`az login` + `Username=<dev UPN>`):
+rejected because it needs a per-developer Postgres firewall rule (lessons §4a),
+a `pgaadauth` principal per developer, gives every developer write access to the
+demo database (and the startup `Migrate()` would run against it), and breaks
+offline work. It remains the right tool for *manually* verifying real Entra
+behaviour, and is documented as such in 14.7, not as the everyday loop.
+
+### 14.7 Postgres AAD role/login — nothing to change in Bicep
+
+- The `todo-api` managed identity is granted access by an **in-database role**
+  created with the `pgaadauth_*` functions, which exist **only in the `postgres`
+  database** and have **no ARM/Bicep surface**. This stays a manual, human-run
+  step (`infra/README.md` Phase 4 step B), per the §11.6 rule that agents never
+  create identities or role assignments.
+- **Do NOT add the `todo-api` managed identity to
+  `Microsoft.DBforPostgreSQL/flexibleServers/administrators`.** That resource is
+  for *server-level Entra administrators* only; using it for the app would make
+  the application a database admin — an unnecessary privilege escalation.
+- Per `.pipeline/infra.md` ("Live cutover status — 2026-07-28") the principal and
+  its `tododb` grants **already exist**. Treat as done; **verify, do not re-run
+  blindly.**
+
+**Verification (human, before the cutover).** Connect to the **`postgres`**
+database as the Entra administrator (Entra token as the password,
+`Ssl Mode=Require`; from a machine whose IP is allowed by the server firewall —
+lessons §4a) and run:
+
+```sql
+select * from pgaadauth_list_principals(false);
+```
+
+Expect a row with `rolname = 'todo-api'`, `principal_type = 'service'`, and
+`objectid = '05c60b63-dda9-4a3e-be87-ac8350600b79'` (the todo-api MI principalId
+from 14.2).
+
+**Only if that row is missing or its `objectid` does not match**, recreate it by
+object ID — more robust than the by-name form, which resolves the name in Entra
+and can bind the wrong object or fail on a non-unique display name:
+
+```sql
+-- as the Entra admin, connected to the `postgres` database
+select * from pgaadauth_create_principal_with_oid(
+  'todo-api',                                 -- role name == Username= in the conn string
+  '05c60b63-dda9-4a3e-be87-ac8350600b79',     -- todo-api MI principalId (objectId)
+  'service',                                  -- managed identity / service principal
+  false,                                      -- isAdmin
+  false);                                     -- isMfa
+```
+
+Then re-apply the `tododb` grants exactly as in `infra/README.md` Phase 4 step B
+(`GRANT CONNECT`, `GRANT ALL ON SCHEMA public`, `ALTER SCHEMA public OWNER TO
+"todo-api"`, default privileges) — the startup `Migrate()` runs as this role.
+
+**Diagnostic for the live test:** a login failing with *"Service Principal oid
+mismatch for role [todo-api]"* means the in-DB role exists but is bound to a
+different object ID (e.g. the Container App identity was recreated). Fix = drop
+and recreate with `pgaadauth_create_principal_with_oid` using the current
+principalId. That is not an application bug.
+
+### 14.8 Infra / Bicep changes (devops agent — author only, never apply)
+
+Deliberately minimal. **The Postgres server module is not touched at all.**
+
+**(1) `infra/main.bicep` — delete the `Postgres__UseEntraAuth` env var** from the
+`todo-api` `envVars` array (the app no longer reads it; leaving it is dead config
+that misleads the next reader). Keep everything else in that module exactly as it
+is: the passwordless plain `ConnectionStrings__TodoDb` env var with
+`Username=${todoApiName}`, no Container Apps secret, `APPLICATIONINSIGHTS_CONNECTION_STRING`
+unchanged. Update the comment block above `todoDbConnectionString` to state the
+new invariant: *"Application DB auth is Entra-only (specs §14). This string is
+passwordless and non-secret; `Username=` must equal the `pgaadauth` role name
+(== the Container App name == the MI name). The app strips any `Password=` it is
+given and will not fall back to password auth."*
+
+**(2) `infra/modules/postgres.bicep` — NO CHANGE.** Keep
+`activeDirectoryAuth: 'Enabled'` **and** `passwordAuth: 'Enabled'`, keep
+`administratorLogin` / `administratorPassword`, keep the Entra admin child
+resource. The user requires continued password-based `psql`/admin access to the
+server. Likewise **no change** to `main.parameters.json`, to the
+`@secure() postgresAdminPassword` parameter, or to the `PGADMIN_PASSWORD` CI
+secret and the deploy commands that pass it.
+
+**(3) `infra/README.md`** —
+- Rewrite the Phase 4 cutover narrative for Entra-only: the app has **no**
+  password path, so `Postgres__UseEntraAuth` disappears and the cutover is
+  "deploy the new image, then replace the connection string" (14.9), with
+  **revision rollback** (not a config flag) as the escape hatch.
+- Make `pgaadauth_list_principals(false)` the *verify-first* step in Phase 4 step
+  B, and add `pgaadauth_create_principal_with_oid` as the by-OID form.
+- Correct the Phase 4 cutover-step-4 wording that says the `todo-db-connection`
+  secret must be **DROPPED** at cutover: it is now **kept until the Entra
+  connection is verified live**, then deleted as a separate cleanup (14.9 step 6).
+- Add an explicit note that the server keeps password auth for human/admin access
+  and that this is intentional, so a future reader does not "helpfully" disable it.
+
+**Explicitly not required, and must not be done:** no new resources, no SKU
+change, no role assignment, no Key Vault, no server auth-config change, no CD
+workflow change, no removal of the admin credential. **Cost delta: zero.**
+
+### 14.9 Live cutover / verification procedure (human-run, after merge)
+
+Lessons §5a: mocked tests cannot prove this works; a live check is mandatory.
+**There is no in-app fallback any more — the rollback is revision-level**, which
+works because the previous revision (old image + `todo-db-connection` secret) is
+untouched and the server still accepts password auth (14.8 item 2).
+
+```bash
+RG=rg-todo-demo
+APP=todo-api
+PG_FQDN=pg-todo-demo-cus01.postgres.database.azure.com
+
+# 0. PRE-CHECK — confirm the in-DB principal exists and matches the OID (14.7). Do not skip.
+
+# 1. Record the current (known-good) revision name so rollback is one command.
+PREV_REV=$(az containerapp revision list -g $RG -n $APP \
+  --query "[?properties.active]|[0].name" -o tsv); echo "rollback target: $PREV_REV"
+
+# 2. Let CD deploy the new image, then confirm the running revision actually has it.
+az containerapp revision list -g $RG -n $APP \
+  --query "[?properties.active].{rev:name,image:properties.template.containers[0].image}" -o table
+
+# 3. Replace the connection string with the passwordless value and drop the dead flag.
+#    --set-env-vars replaces that variable's definition (secretRef -> plain value)
+#    and leaves all other env vars alone. The todo-db-connection SECRET is NOT
+#    deleted here — it stays as part of the rollback revision.
+az containerapp update -g $RG -n $APP \
+  --set-env-vars "ConnectionStrings__TodoDb=Host=$PG_FQDN;Port=5432;Database=tododb;Username=todo-api;Ssl Mode=Require;Trust Server Certificate=true" \
+  --remove-env-vars Postgres__UseEntraAuth
+
+# 4. Verify health AND a DB-backed endpoint (/health alone does not touch the DB).
+API_FQDN=$(az containerapp show -g $RG -n $APP --query properties.configuration.ingress.fqdn -o tsv)
+curl -fsS "https://$API_FQDN/health"
+curl -fsS "https://$API_FQDN/api/todos"      # must return 200 + a JSON array, not 500
+
+# 5. Confirm the startup log shows the right principal and no stripped credential.
+az containerapp logs show -g $RG -n $APP --tail 100 | grep -i "Postgres auth"
+#    EXPECT: "Postgres auth: Entra / managed identity. Host=pg-todo-demo-cus01... Username=todo-api"
+#    EXPECT: no "static Postgres password/passfile ... ignored" warning (step 3 removed it)
+
+# 5b. ROLLBACK (only if 4 or 5 fails):
+#     az containerapp revision activate -g $RG -n $APP --revision "$PREV_REV"
+#     (old image + old secretRef env; still works because the server keeps password auth)
+
+# 6. CLEANUP — only after at least one healthy revision on Entra auth (see Q1):
+#     az containerapp secret remove -g $RG -n $APP --secret-names todo-db-connection
+```
+
+Note that steps 2 and 3 may be done in either order thanks to the normalization in
+14.5 — a new image reading the old password-bearing secret strips the credential
+and then fails auth as `todoadmin` (a clean, logged auth error), rather than
+crashing with `NotSupportedException`. Doing step 2 first is still preferred.
+
+**Success criteria:** `/api/todos` returns 200; the `Information` log shows
+`Username=todo-api`; no `NotSupportedException`, no `28P01`, no
+`"No password has been provided"` in the logs; traces still land in
+`appi-todo-demo`. Afterwards, the outcome **must** be written back into
+`.pipeline/infra.md` and `.pipeline/deployment-lessons-learned.md` §5a — that
+entry is currently marked UNRESOLVED and must be closed out with the real result.
+
+### 14.10 Testing requirements (tester agent)
+
+All of these run with **no Azure, no token, no database**.
+
+**Regression tests for the reported bug:**
+1. `BuildEntraAuthenticatedDataSource(productionShapedPasswordConnectionString, fakeCredential)` **does not throw** — input is the real production shape:
+   `Host=pg-todo-demo-cus01.postgres.database.azure.com;Port=5432;Database=tododb;Username=todoadmin;Password=REDACTED;Ssl Mode=Require;Trust Server Certificate=true`.
+   Before the fix this throws `NotSupportedException`.
+2. Same via DI: `AddTodoDbContext` with that password-bearing string resolves
+   `NpgsqlDataSource` **and** `TodoDbContext` without throwing.
+
+**Pure-function tests on the normalizer** (assert by re-parsing the result into an
+`NpgsqlConnectionStringBuilder`; never string-match raw output):
+3. `Password=…` present → result's `Password` is null/empty.
+4. `pwd=…` alias → same.
+5. `Passfile=…` present → result's `Passfile` is null/empty.
+6. `Username` missing → `InvalidOperationException` whose message names
+   `ConnectionStrings:TodoDb` and `Username`.
+7. `Host`, `Port`, `Database`, `Trust Server Certificate`, and an unrelated
+   keyword (e.g. `Command Timeout=45`) are preserved.
+8. Remote host + `Ssl Mode=Disable` → `Require`; remote host + `Ssl Mode=Allow` → `Require`.
+9. Remote host + `Ssl Mode=Require` / `VerifyFull` / omitted → unchanged.
+10. **Loopback exemption:** `Host=localhost;…;Ssl Mode=Disable` → stays `Disable`
+    (also assert for `127.0.0.1`). This is the local-dev contract from 14.6.
+11. **Idempotence:** an already-normalized passwordless string round-trips to an
+    equivalent string and does not throw.
+
+**Structural / removal tests:**
+12. The password branch is gone: with **no** `Postgres:UseEntraAuth` key present,
+    `AddTodoDbContext` registers exactly one `NpgsqlDataSource` singleton and the
+    resolved `TodoDbContext` is backed by it.
+13. Setting `Postgres:UseEntraAuth=false` in configuration changes **nothing** —
+    the Entra data source is still registered (proves the flag is truly dead, not
+    merely defaulted the other way).
+14. The blank/missing-`ConnectionStrings:TodoDb` guard still throws
+    `InvalidOperationException` mentioning `TodoDb` (existing tests, unchanged).
+15. `EntraTokenPasswordProviderTests` — unchanged, must still pass.
+
+**Tests that must be REWRITTEN (they encode the deleted behaviour):**
+- `AddTodoDbContext_WithEntraAuthNotEnabled_UsesPasswordConnection_NoDataSourceRegistered`
+  and any assertion that `context.Database.GetConnectionString()` equals a
+  `Password=`-bearing string. Replace with tests 12/13. This is the one place
+  where editing existing tests is correct rather than a smell — state the reason
+  in `tests.md`.
+
+**`TodoApiFactory` (integration/tracing tests):** should keep working untouched —
+it injects a dummy connection string and then removes every `TodoDbContext`-related
+descriptor, and the `NpgsqlDataSource` registration is a lazy factory that is
+never resolved. Confirm this; if the dummy string's `Password=unused` or its
+`Username=unused` causes any issue, fix it **in the factory** (drop the
+`Password=`), never by reintroducing a branch in production code.
+
+**Explicitly NOT verifiable here (say so in `tests.md`; do not fake it):** real
+Entra token acquisition, the Postgres AAD handshake, the in-DB grants, and the
+`trust`-auth local container behaviour. Those are covered by 14.6 (developer
+check) and 14.9 (live check) only. `tests.md` must state that the feature is
+**not** verified end-to-end until 14.9 has been executed and recorded.
+
+### 14.11 Non-functional requirements
+
+- **Auth (application):** Entra / managed identity **only**, unconditionally.
+  System-assigned identity `todo-api`; token scope
+  `https://ossrdbms-aad.database.windows.net/.default`; token refresh handled by
+  `TokenCredential`'s in-memory cache via `UsePasswordProvider`. Zero application
+  runtime secrets (§13 remains satisfied and is strengthened).
+- **Auth (server / humans):** unchanged — the server still accepts password auth
+  and the `todoadmin` login for out-of-band `psql`/admin use (deploy-time/human
+  credential, §13.9).
+- **Security:** TLS enforced for non-loopback hosts (14.5 step 4). No credential,
+  token, or full connection string is ever logged.
+- **Scaling / performance:** unchanged. Normalization happens once, at singleton
+  construction — not per connection, not per request.
+- **Availability:** the startup `Migrate()` runs as the MI's Postgres role.
+  Migration failures are still caught and logged without crashing the app
+  (`Program.cs`), so `/health` stays up and diagnosable. Rollback is
+  revision-level (14.9).
+- **Cost:** zero delta. No new resources, no SKU change.
+- **Region:** unchanged — ACA in `eastus`, Postgres in `centralus`
+  (`pg-todo-demo-cus01`; forced by the subscription restriction in lessons §1a).
+  Do not "fix" this mismatch.
+- **Breaking change:** yes, and deliberately so. Any environment still supplying a
+  `Password=`-bearing connection string will have the credential ignored (with a
+  warning) and will then fail authentication unless `Username=` names a valid
+  Entra-mapped role. This is the intended consequence of the user's directive and
+  must be called out in `changes.md`.
+
+### 14.12 Out of scope (explicitly)
+
+- **Disabling `passwordAuth` on the Postgres server, or removing the `todoadmin`
+  login / `postgresAdminPassword` parameter / `PGADMIN_PASSWORD` CI secret.**
+  Explicitly excluded by the user — human admin access must keep working.
+- Making the server Entra-authentication-only, or dropping the `todoadmin` role
+  in-database.
+- Key Vault (§13.6) — still not instantiated; nothing here is a secret.
+- Changing `EntraTokenPasswordProvider`, the token scope, or reverting to
+  `UsePeriodicPasswordProvider`.
+- App Insights / tracing (§12, §13.5), frontend, API surface, data model, EF
+  migrations content, CI/CD workflow logic, and any new Azure resource.
+- Per-developer Entra principals on the shared Azure Postgres server (14.6
+  rejected alternative).
+- Automating the `pgaadauth` bootstrap — it stays human-run (§11.6, 14.7).
+
+### 14.13 Assumptions, risks and open questions
+
+**Assumptions (decided; implement against these):**
+1. The managed identity's Postgres role name is **`todo-api`** — Container App
+   name == system-assigned identity display name == `pgaadauth` role name ==
+   `Username=`. Confirmed live (14.2). One source of truth; a mismatch fails auth.
+2. The in-DB principal and `tododb` grants from Phase 4 step B are still present;
+   14.7 is a *verification*, not a re-run.
+3. `POSTGRES_HOST_AUTH_METHOD: trust` on `postgres:16` makes the local server
+   accept connections with no credential, so the single Entra path works locally.
+   It only takes effect on a **fresh** data directory (hence `down -v`).
+4. Stripping (rather than rejecting) a `Password=` in configuration is correct:
+   it makes the `NotSupportedException` structurally impossible and makes the
+   cutover order-independent. The `Warning` log is the guard against it hiding a
+   real misconfiguration.
+5. Fail-fast on a missing `Username=` is better than attempting a connection that
+   would fail with an opaque Postgres `28P01`.
+
+**Risks to state in `changes.md`:**
+- **No in-app fallback.** If the Entra path breaks in Azure, recovery is a
+  revision rollback (or a code change), not a config flag. Mitigated by: the
+  server keeping password auth, the previous revision remaining intact, and 14.9
+  capturing the rollback command *before* the cutover.
+- **`az login` may become a hard local prerequisite** (14.6 item 2) — a one-time
+  per-machine cost, and the accepted price of Entra-only.
+- **`trust` on the local container** weakens local-only security; mitigation
+  documented in 14.6.
+
+**Open questions (do not block implementation):**
+- **Q1.** How long before deleting the `todo-db-connection` secret (14.9 step 6)?
+  *Recommendation:* after at least one healthy Entra revision has served real
+  traffic; never in the same change as the cutover.
+- **Q2.** Should CD assert the app's env/connection-string shape (drift
+  detection), now that CD never applies Bicep? *Recommendation:* worth a follow-up
+  cycle given lessons §2c/§2d; out of scope here.
+- **Q3.** Should local dev eventually move to a Postgres image with a token-
+  validating auth shim so local and Azure are truly identical? *Recommendation:*
+  no — cost/complexity far exceeds the benefit for a demo; revisit only if local
+  auth drift causes a real defect.

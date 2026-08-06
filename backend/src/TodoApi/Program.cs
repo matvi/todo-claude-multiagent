@@ -13,8 +13,7 @@ builder.Services.AddSwaggerGen();
 // APPLICATIONINSIGHTS_CONNECTION_STRING is unset (local dev / CI). See specs §12/§13.5.
 builder.Services.AddTodoTelemetry(builder.Configuration);
 
-// PostgreSQL DbContext. Uses password auth by default; managed-identity (Entra) auth
-// when Postgres__UseEntraAuth=true (Azure). See specs §13.4.
+// PostgreSQL DbContext. Entra / managed-identity auth only (specs §14).
 builder.Services.AddTodoDbContext(builder.Configuration);
 
 // CORS: restrict to the configured frontend origin(s).
