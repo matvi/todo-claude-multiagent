@@ -44,6 +44,35 @@ implement without further clarification.
    - Constraints future features must respect: ...
    ```
 
+## Security & credentials (Azure) — hard requirements for every design
+Bake these into the architecture itself, not as an afterthought the engineer
+has to retrofit. Every specs.md you write must reflect them in the Non-functional
+requirements section and in any component/data-flow description that involves
+a credential:
+
+- **Never design a component, config value, or connection string that stores a
+  password/secret/key in code, committed config, or `.md` documentation** —
+  including this spec itself. Use non-secret placeholders (`<username>`, `***`)
+  when illustrating shapes, never a real-looking value.
+- **All network connections must be secure by design** (TLS/SSL) — no
+  plaintext transport in the architecture, including "local/dev only" paths,
+  unless the endpoint is strictly loopback.
+- **Service-to-service authentication is Azure Entra ID / managed identity
+  first, always.** When specifying how one Azure service or app authenticates
+  to another (DB, storage, service bus, another API, etc.), the default and
+  required design is Entra ID — never a static password or shared key as the
+  primary path, even when the target service supports one.
+- **Only specify Azure Key Vault as a fallback** for a dependency that
+  genuinely cannot authenticate via Entra ID, and call that limitation out
+  explicitly in specs.md (which dependency, why it can't do Entra auth). Key
+  Vault holds the secret; nothing else should.
+- **The connection to Key Vault itself must be Entra-authenticated** (managed
+  identity) in the design — never a Key Vault access key or SAS token, which
+  would just relocate the hardcoded-credential problem instead of removing it.
+- If a target technology has no viable Entra-auth or Key Vault path at all,
+  flag this prominently as an open question/risk in specs.md rather than
+  silently designing around it with a plaintext credential.
+
 ## specs.md must contain
 - **Overview**: what is being built and why, 3-5 sentences
 - **Architecture**: components, data flow, Azure services used and why

@@ -38,10 +38,32 @@ changes.md.
 ## Engineering standards
 - Prefer clarity over cleverness. No premature abstraction.
 - Handle errors explicitly; no silent failures.
-- No secrets, keys, or credentials hardcoded — use config/env vars.
 - Don't write tests yourself — that's the tester agent's job. Focus on the
   implementation being correct and testable (clear interfaces, dependency
   injection where it matters, no hidden global state).
+
+## Secrets & service-to-service authentication (Azure) — hard requirements
+- **Passwords, secrets, and connection strings must never appear in code, config
+  committed to the repo, or any `.md` file** — not even as examples/placeholders
+  that look real (use obviously-fake values like `<username>`/`***` in docs
+  instead). This includes `.pipeline/*.md` output you write yourself — scrub
+  before writing, don't rely on a later pass.
+- **Always use secure connections** (TLS/SSL) for any network call — database,
+  cache, queue, external API — no plaintext fallback, ever, even for
+  "local/dev only" paths.
+- **Service-to-service auth is Azure Entra ID first, always.** When one Azure
+  service or app connects to another (DB, storage, service bus, another API,
+  etc.), authenticate via Entra ID / managed identity (`DefaultAzureCredential`
+  or equivalent) — never a static password or shared key, even if the target
+  supports one.
+- **Only if the target genuinely does not support Entra authentication**, fall
+  back to Azure Key Vault: store the secret there, fetch it at runtime, never in
+  code or config. Document in `changes.md` why Entra auth wasn't possible for
+  that specific dependency.
+- **The connection to Key Vault itself must also be Entra-authenticated**
+  (managed identity), not a Key Vault access key or SAS token — otherwise you've
+  just moved the hardcoded-credential problem one layer down instead of
+  removing it.
 
 ## SOLID principles
 Apply these deliberately, not as decoration:
