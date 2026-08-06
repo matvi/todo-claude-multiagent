@@ -284,3 +284,98 @@ not use it, then it should use KeyVault to store secrets or connection strings."
     credentials.
   - The Postgres Entra-principal SQL and any role assignments remain **manual /
     IaC-authored but human-applied**; agents never run them (PROPOSE mode).
+
+---
+
+## 2026-08-06 — Application DB auth is Entra-ONLY (no password path, no mode flag)
+
+Branch `pipeline/entra-passwordless-connection-string`. See specs.md **§14**, which
+**supersedes §13.4** (application DB auth + connection string) and **§6.2/§6.3**
+(local dev DB auth). Two drivers: a live bug, and a **deliberate user scope
+decision** (recorded as such — this was not discovered by an agent).
+
+- **Services added/changed:** **No Azure resource, SKU, region or server-auth
+  change. Cost delta zero.** Behavioural only: `todo-api`'s DB connection becomes
+  Entra/managed-identity-only; its `ConnectionStrings__TodoDb` becomes a
+  passwordless **plain env var** and the `todo-db-connection` Container Apps
+  secret is retired after live verification; the `Postgres__UseEntraAuth` env var
+  is deleted from `infra/main.bicep` and from the live app. `infra/modules/
+  postgres.bicep`, `main.parameters.json` and the CD workflows are **untouched**.
+- **The live bug that started the cycle:** after the `UsePasswordProvider` fix
+  (`1b765fd`) shipped, flipping `Postgres__UseEntraAuth=true` live failed with
+  `NotSupportedException: When registering a password provider, a password or
+  password file may not be set.` Root cause: **one connection-string value served
+  two auth modes that require different shapes, and nothing reshaped it** — the
+  Entra builder received the SQL-auth string (`Username=todoadmin;Password=…`)
+  from the shared secret. The boolean flag was never actually sufficient to
+  switch modes.
+- **Key decisions (with rationale):**
+  - *The application authenticates to Postgres with **Entra/managed identity
+    only**, unconditionally, in every environment* (**user directive**, not an
+    agent choice). `Postgres:UseEntraAuth` and the `else`/password branch in
+    `TodoDbContextRegistration` are **deleted**; `AddTodoDbContext` always builds
+    the Entra `NpgsqlDataSource`. Removing the branch removes the whole bug class:
+    with one code path there is only one connection-string shape, so it can never
+    be the wrong one for the mode.
+  - *The **server** keeps dual auth* (`activeDirectoryAuth: Enabled` +
+    `passwordAuth: Enabled`), keeps the `todoadmin` login, the
+    `@secure() postgresAdminPassword` param and the `PGADMIN_PASSWORD` CI secret
+    — **user directive**: out-of-band `psql`/admin access must keep working.
+    "Entra-only" scopes to the **application's connection**, never to the server.
+    Do not "helpfully" disable password auth in a future cycle.
+  - *`ConnectionStrings:TodoDb` is the **single source of truth** and is
+    passwordless everywhere.* No second connection string, no second secret, and
+    **no** `Postgres:EntraUsername`-style key (an intermediate draft had one;
+    dropped). `Username=` must be the Postgres role mapped to the caller's Entra
+    identity (`todo-api` in Azure).
+  - *The Entra path **normalizes** what it is handed:* strips `Password`/
+    `Passfile` (both — Npgsql rejects a password provider if **either** is set),
+    fails fast with a named-key message if `Username` is missing, and forces
+    `SslMode=Require` for **non-loopback** hosts only (the token travels in the
+    cleartext-password field). Defence-in-depth that makes the crash structurally
+    impossible and the live cutover order-independent.
+  - *One `Information` startup log line — `Host`/`Database`/`Username` + auth mode,
+    plus warnings when a credential was stripped or SSL upgraded.* The original
+    incident was diagnosable only from a stack trace; never log the token,
+    password or full connection string.
+  - *Local dev keeps ONE code path with zero passwords* by running the local
+    Docker Postgres with **`POSTGRES_HOST_AUTH_METHOD: trust`** (no
+    `POSTGRES_PASSWORD`, no `Password=` in `appsettings.Development.json`). The
+    server never challenges, so the Entra path runs unchanged. Costs: a one-time
+    `docker compose down -v` (trust is only applied by `initdb` on an empty
+    volume) and a documented one-time `az login`. *Rejected alternative:* pointing
+    local dev at the real Azure server as the developer's own identity (needs a
+    per-dev firewall rule + per-dev `pgaadauth` principal, gives every dev write
+    access to the demo DB with `Migrate()` at startup, breaks offline work).
+  - *`UsePasswordProvider` (connection-open path) is retained and reaffirmed.*
+    **Never** reintroduce `UsePeriodicPasswordProvider` (lessons §5a outage).
+  - *Rollback model changed:* with no in-app fallback, recovery is a **revision
+    rollback**, which stays viable precisely because the server keeps password
+    auth and the previous revision + its secret are left intact until the Entra
+    connection is verified live. Capture the rollback revision name *before* the
+    cutover.
+  - *The MI is granted via an **in-database** `pgaadauth` role, never via the
+    server's `administrators` child resource* (that would make the app a DB
+    admin). It has no ARM/Bicep surface and stays a human-run step; already
+    applied (verify with `pgaadauth_list_principals(false)`, recreate by OID with
+    `pgaadauth_create_principal_with_oid` only if the row or its `objectid` is
+    wrong).
+- **Constraints future features must respect:**
+  - **The application must never gain a password/SQL-auth path to Postgres
+    again** — no flag, no "just for local", no fallback. Any new service that
+    needs the DB uses the same Entra data source.
+  - **`ConnectionStrings:TodoDb` must never contain `Password=`/`Passfile=`** in
+    any environment or file, and stays a **plain, non-secret** env var
+    (Container Apps secrets remain deprecated for credentials, §13).
+  - **Do not disable `passwordAuth` on the Postgres server** and do not remove
+    `todoadmin` / `postgresAdminPassword` / `PGADMIN_PASSWORD` — human admin
+    access is a standing requirement.
+  - The `Username=` in the connection string, the Container App name, the
+    system-assigned MI name and the `pgaadauth` role name are **one value**
+    (`todo-api`). Changing any one of them requires changing all four.
+  - Local dev is `trust`-auth Docker Postgres + `az login`; keep it password-free
+    if the local setup is ever revised.
+  - Live config drift from Bicep is **permanent and by design** (CD does not apply
+    Bicep — lessons §2c). Any DB/auth change must be expressed as an imperative
+    `az containerapp update` runbook step as well as in Bicep, or it will never
+    take effect.

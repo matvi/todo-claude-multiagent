@@ -37,8 +37,12 @@ public class TodoApiFactory : WebApplicationFactory<Program>
         {
             config.AddInMemoryCollection(new Dictionary<string, string?>
             {
+                // Passwordless by contract (specs §14): app config never carries a
+                // credential. Never dialled — the DbContext registration below is
+                // replaced with InMemory and the NpgsqlDataSource factory is never
+                // resolved.
                 ["ConnectionStrings:TodoDb"] =
-                    "Host=localhost;Port=5432;Database=unused;Username=unused;Password=unused",
+                    "Host=localhost;Port=5432;Database=unused;Username=unused",
                 ["Cors:AllowedOrigins:0"] = "http://localhost:5173",
             });
         });

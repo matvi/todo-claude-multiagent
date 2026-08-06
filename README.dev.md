@@ -22,14 +22,38 @@ scripts/
 - `dotnet-ef` 10 global tool (`dotnet tool install --global dotnet-ef --version 10.0.0`)
 - Node.js 22 + npm
 - Docker (for local Postgres)
+- Azure CLI, and `az login` once per machine — the app authenticates to
+  PostgreSQL with Entra **only** (specs §14), and `DefaultAzureCredential`
+  resolves to `AzureCliCredential` locally. See the note under step 1.
 
 ## Run locally
 
 1. **Start Postgres**
    ```bash
+   docker compose down -v   # ONCE, the first time after the §14 change
    docker compose up -d
    ```
-   Postgres listens on `localhost:5432` (db `tododb`, user/pass `todo`/`todo`).
+   Postgres listens on `localhost:5432` (db `tododb`, user `todo`, **no
+   password**).
+
+   The local container runs with `POSTGRES_HOST_AUTH_METHOD=trust`: it cannot
+   validate Entra tokens, so instead it requires no credential at all. That
+   keeps the application on one unconditional Entra code path with zero
+   passwords anywhere (specs §14.6). `down -v` is required once because
+   `POSTGRES_HOST_AUTH_METHOD` is only applied by `initdb` on an empty data
+   directory — an existing volume keeps its old `scram-sha-256` rules and will
+   still ask for a password. This wipes local todo data only.
+
+   Trade-off: `trust` means anything on the machine can connect on port 5432.
+   If that is unacceptable on a shared machine, drop the `ports:` mapping and
+   run the backend inside the compose network — do **not** reintroduce a
+   password.
+
+   > **`az login`**: under `trust` the server never challenges for a password,
+   > so Npgsql does not invoke the token provider (verified — see
+   > `.pipeline/changes.md`, §14.6 empirical answer). `az login` is therefore a
+   > convenience rather than a hard blocker for the local loop, but run it
+   > anyway: any code path that does reach a real Entra-enabled server needs it.
 
 2. **Backend** — from `backend/src/TodoApi`:
    ```bash
