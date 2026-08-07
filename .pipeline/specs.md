@@ -2084,3 +2084,1063 @@ check) and 14.9 (live check) only. `tests.md` must state that the feature is
   validating auth shim so local and Azure are truly identical? *Recommendation:*
   no — cost/complexity far exceeds the benefit for a demo; revisit only if local
   auth drift causes a real defect.
+
+---
+
+## 15. Dev environment + dev→prod promotion pipeline (extension — **this cycle's scope**)
+
+**Cycle date:** 2026-08-06. **Branch:** `pipeline/dev-environment`.
+
+> **§15 EXTENDS, and does not supersede, §11 (CI/CD + IaC), §12 (App Insights),
+> §13 (managed-identity-first) and §14 (Entra-only Postgres auth).** Everything
+> those sections mandate for the production stack applies **identically** to the
+> new dev stack. §15 **refines §11.7** (branch model: a `develop` branch is
+> added) and **refines the "single Container Apps Environment" convention** in
+> `architecture-memory.md` (now: *one* Container Apps Environment **per
+> deployment environment**, still never one-per-app). Where §11.7 says "single
+> environment, merges to `main` deploy straight to the one demo environment",
+> **§15 wins.**
+
+### 15.1 Overview
+
+Today the project has exactly one deployment environment. Every merge to `main`
+goes straight to the live app, so there is nowhere to exercise a change — an EF
+Core migration, a Bicep edit, a container image, an Entra auth change — before
+real users see it. The §14 cutover incident is the concrete evidence: an auth
+change had to be validated *in production*, with a revision-rollback as the only
+safety net.
+
+This cycle adds a **second, fully isolated `dev` deployment environment inside
+the same resource group `rg-todo-demo`** (per the user's explicit instruction —
+"in the same azure resource"), running the same infrastructure shape as
+production, and replaces the single-shot CD workflow with a **sequential
+dev → verify → approve → prod promotion pipeline**. Dev gets its own Container
+Apps Environment, its own Container Apps, its own PostgreSQL Flexible Server,
+its own managed identities and its own Application Insights component; it
+**shares** only the two resources where sharing is strictly better than
+duplicating (the container registry and the Log Analytics workspace).
+
+**This is an infrastructure and delivery-pipeline change only.** No application
+code, no data model, no API surface, and no production runtime configuration
+changes. The estimated cost delta is **+$18–22/month** (§15.14) — the user must
+approve this consciously at the devops PROPOSE step.
+
+### 15.2 Verified live state (read-only `az`, 2026-08-06) — do not re-derive
+
+| Fact | Verified value |
+|---|---|
+| Subscription / tenant | `9ba6633f-058c-4269-8b0f-086ab331ef26` / `6ce2ff72-209a-447d-bf53-9579c52c03f5` |
+| Resource group | `rg-todo-demo` — contains **all** resources below |
+| Container Apps Environment | `cae-todo-demo`, **East US**, Consumption-only (`workloadProfiles: null`), **no VNet** (`vnetConfiguration: null`), not zone-redundant |
+| `cae-todo-demo` app logs | `destination: log-analytics` → workspace customerId `ad9d45f8-beaa-403c-a9ca-18c51005c84c` (= `log-todo-demo`) |
+| `cae-todo-demo` default domain | `lemoncliff-b3b8a3d9.eastus.azurecontainerapps.io` |
+| Container Apps | `todo-api`, `todo-web` — both East US, both in `cae-todo-demo` |
+| PostgreSQL | `pg-todo-demo-cus01` — **Central US** (not East US), PG16, `Standard_B1ms` Burstable, 32 GiB, `activeDirectoryAuth: Enabled`, `passwordAuth: Enabled`, state `Ready` |
+| ACR | `acrtododemo3bkqjv23abtua` — East US, Basic |
+| Log Analytics | `log-todo-demo` — East US, `PerGB2018`, retention **30 days**, `dailyQuotaGb: 1.0` |
+| App Insights | `appi-todo-demo` — East US, workspace-based on `log-todo-demo`, local auth disabled |
+| Git remote | `git@github.com:matvi/todo-claude-multiagent.git` (a remote **now exists** — it did not when `.pipeline/infra.md` last checked) |
+| `gh` CLI | **not installed** in the agent environment → branch protection and repo visibility **still could not be verified**. See §15.13 and Q1. |
+
+**Why Postgres is in Central US and everything else is in East US:** this
+subscription has a PostgreSQL Flexible Server offer restriction in East US (see
+the `postgresLocation` parameter comment in `infra/main.bicep`). **The dev
+Postgres server must therefore also be created in Central US.** Cross-region is
+already the production reality and is fine — Postgres is reached over its public
+endpoint with required TLS, not a VNet.
+
+### 15.3 Environment model and naming convention
+
+Two deployment environments, one resource group, distinguished by a **`-dev`
+name suffix on every dev-owned resource**. Production resource names are
+**never** renamed (they are live, drifted, and referenced by the existing
+workflows and by the `pgaadauth` role bindings).
+
+| Role | Production (existing, unchanged) | Dev (new) |
+|---|---|---|
+| Resource group | `rg-todo-demo` | **same** `rg-todo-demo` |
+| Container Apps Environment | `cae-todo-demo` (East US) | `cae-todo-demo-dev` (East US) |
+| Backend Container App | `todo-api` | `todo-api-dev` |
+| Frontend Container App | `todo-web` | `todo-web-dev` |
+| PostgreSQL Flexible Server | `pg-todo-demo-cus01` (Central US) | `pg-todo-demo-dev-cus01` (Central US) |
+| Logical database | `tododb` | `tododb` (same name, **different server**) |
+| Application Insights | `appi-todo-demo` | `appi-todo-demo-dev` |
+| Log Analytics workspace | `log-todo-demo` | **shared** — `log-todo-demo` |
+| Container Registry | `acrtododemo3bkqjv23abtua` | **shared** — same ACR |
+| Postgres admin login | `todoadmin` | `todoadmin` (same login name, **different server, different password**) |
+| GitHub Actions environment | `production` | `dev` |
+| Git branch that deploys it | `main` | `develop` (and `main`, first — §15.9) |
+
+**Naming rule for all future work:** a resource that belongs to exactly one
+deployment environment gets the `-dev` suffix in dev and no suffix in prod. A
+resource shared by both gets no suffix. Do not invent `-prod` suffixes; the
+unsuffixed name *is* production.
+
+#### The four-way identity invariant, per environment
+
+`architecture-memory.md` (2026-08-06) records a hard invariant: **Container App
+name == system-assigned managed identity display name == `pgaadauth` Postgres
+role name == `Username=` in the connection string.** It now holds **twice,
+independently**:
+
+| | Production | Dev |
+|---|---|---|
+| Container App name | `todo-api` | `todo-api-dev` |
+| System-assigned MI display name | `todo-api` | `todo-api-dev` |
+| `pgaadauth` role on **its own** server | `todo-api` on `pg-todo-demo-cus01` | `todo-api-dev` on `pg-todo-demo-dev-cus01` |
+| `Username=` in `ConnectionStrings__TodoDb` | `todo-api` | `todo-api-dev` |
+
+Changing any one of the four in an environment requires changing all four **in
+that environment**. The two sets never mix.
+
+### 15.4 What is duplicated vs. shared — decisions and justifications
+
+#### 15.4.1 Container Apps Environment — **DUPLICATED** (`cae-todo-demo-dev`)
+
+**DECISION: dev gets its own `Microsoft.App/managedEnvironments` resource. Dev
+Container Apps are NOT co-located in `cae-todo-demo`.**
+
+A Container Apps Environment is the **security and network boundary** in ACA:
+apps inside one environment share a virtual network, an internal DNS namespace
+(`<app>.internal.<defaultDomain>`), a log destination, environment-level
+certificates/Dapr components, and a platform upgrade schedule. Co-locating dev
+and prod apps would mean:
+
+- dev workloads sit on the same VNet as prod and can reach `todo-api` over
+  internal DNS — a network path from unreviewed code to production compute;
+- any environment-level change (log destination, workload profile, custom
+  domain, certificate, platform maintenance) hits both environments at once and
+  can never be rehearsed in dev first — which defeats the purpose of a dev
+  environment;
+- a single environment-level outage takes both down together.
+
+**Cost:** a Consumption-plan managed environment has **no standing charge** —
+billing is per-app vCPU-second / GiB-second / request. Duplicating the
+environment therefore costs **$0/month in fixed fees**. Because the boundary is
+free and the isolation is real, there is no argument for sharing.
+
+This **refines** the `architecture-memory.md` convention "everything runs in a
+single Container Apps Environment (`cae-todo-demo`)". The intent of that
+convention was *do not create an environment per app*; that still holds. The new
+rule is: **one Container Apps Environment per deployment environment; all apps
+of that deployment environment live in it.**
+
+Consequence the engineer must handle: `cae-todo-demo-dev` gets its **own,
+different `defaultDomain`** (a new random suffix, e.g.
+`<something>.eastus.azurecontainerapps.io`). Dev FQDNs are therefore **not
+predictable** and must be read back with `az containerapp show` at deploy time —
+which the CD workflow already does for prod (§15.9). Never hardcode a dev FQDN.
+
+#### 15.4.2 Log Analytics workspace — **SHARED** (`log-todo-demo`)
+
+**DECISION: `cae-todo-demo-dev` points its `appLogsConfiguration` at the
+existing `log-todo-demo` workspace. No second workspace is created.**
+
+- `architecture-memory.md` (2026-07-27) records a standing constraint: *"Reuse
+  the single `log-todo-demo` workspace for any future telemetry; do not spin up
+  additional Log Analytics workspaces."* This decision honors it.
+- Container Apps log tables (`ContainerAppConsoleLogs_CL`,
+  `ContainerAppSystemLogs_CL`) carry **`EnvironmentName_s`** and
+  **`ContainerAppName_s`** columns, so dev and prod logs are cleanly separable
+  by a KQL filter (`| where EnvironmentName_s == "cae-todo-demo-dev"`). Physical
+  separation buys nothing that a filter does not.
+- One place to correlate a promotion: the same `traceId` for the same image can
+  be followed from dev into prod in one workspace.
+- **Cost delta: $0 fixed.** `PerGB2018` has no standing fee; you pay per GiB
+  ingested. Dev log volume is human-driven and small.
+
+**Accepted risk (must be stated in `changes.md`):** the workspace has a **1
+GB/day ingestion cap** (`workspaceCapping.dailyQuotaGb: 1`, a deliberate user
+override on 2026-07-28). That cap is now **shared with dev**. If dev ingestion
+exhausts it, **production telemetry silently stops for the remainder of that UTC
+day.** This is accepted rather than mitigated because dev traffic is manual and
+tiny, and because adding a sampling configuration key is application scope creep
+for a hypothetical. The documented levers, in order:
+
+1. **Detect** — run periodically or on suspicion:
+   ```kusto
+   Usage
+   | where TimeGenerated > ago(7d) and IsBillable == true
+   | summarize IngestedGB = sum(Quantity) / 1000 by bin(TimeGenerated, 1d), DataType
+   | order by TimeGenerated desc
+   ```
+2. **Respond** — raise the cap to 2 GB/day (`dailyQuotaGb: 2` in
+   `infra/modules/loganalytics.bicep`, plus an imperative
+   `az monitor log-analytics workspace update -g rg-todo-demo -n log-todo-demo --quota 2`
+   because CD does not apply Bicep — see §14.2).
+3. **Escalate only if recurring** — a dedicated `log-todo-demo-dev` workspace
+   (still $0 fixed) would give dev its own cap. This **contradicts the standing
+   constraint above**, so it requires a new, explicitly superseding entry in
+   `architecture-memory.md`. Do not do it silently.
+
+**Note on the workspace shared key (pre-existing, unchanged):**
+`infra/modules/acaEnvironment.bicep` wires app logs with
+`destination: 'log-analytics'`, which requires the workspace's shared key. The
+module reads it inline via `law.listKeys().primarySharedKey` at deploy time, so
+**the key is never a parameter, never an output, never committed, and never in
+this document** — it satisfies the project's no-hardcoded-credential rule. It is
+however not Entra-based. The fully key-free alternative is
+`appLogsConfiguration.destination: 'azure-monitor'` plus a diagnostic setting
+(ARM/Entra-managed, no shared key). **Dev deliberately reuses the same module
+and the same `log-analytics` destination** so that dev and prod remain
+infrastructurally identical — a dev environment that differs from prod is not a
+dev environment. Migrating **both** environments to `azure-monitor` is recorded
+as a follow-up (Q4), not done here.
+
+#### 15.4.3 Application Insights — **DUPLICATED** (`appi-todo-demo-dev`), on the shared workspace
+
+**DECISION: dev gets its own workspace-based Application Insights component,
+`appi-todo-demo-dev`, backed by the same `log-todo-demo` workspace, with
+`DisableLocalAuth: true` exactly like prod.**
+
+- **Required for identity isolation.** Per §13.5, ingestion is authenticated by
+  the app's managed identity holding `Monitoring Metrics Publisher` **scoped to
+  the component**. Sharing one component would mean granting `todo-api-dev`'s
+  identity publisher rights on the production telemetry resource — precisely the
+  shared-identity coupling this cycle exists to eliminate.
+- **Required for signal quality.** Failure rates, availability, dependency maps
+  and any future alert rule are per-component. Dev exceptions polluting the
+  production component would make prod alerting useless.
+- **Cost delta: $0 fixed.** A workspace-based component has no standing fee;
+  ingestion bills against the shared workspace (and its shared cap — see the
+  risk above). This is the cheapest possible way to get real telemetry
+  separation.
+- Reusing the existing `infra/modules/appinsights.bicep` unchanged guarantees
+  dev matches prod (`kind: web`, `IngestionMode: LogAnalytics`,
+  `DisableLocalAuth: true`).
+
+#### 15.4.4 Container Registry — **SHARED** (`acrtododemo3bkqjv23abtua`)
+
+**DECISION: one ACR serves both environments. Do NOT create a dev ACR.**
+
+This is the single most important sharing decision, and it is not primarily
+about cost:
+
+- **The promotion gate only means something if prod runs the exact artifact dev
+  validated.** With one registry, `deploy-prod` re-points the production
+  Container App at the **same image tag** `todo-api:<sha>` that dev just ran —
+  byte-for-byte, same digest, no rebuild (§15.9.4). With two registries, prod
+  would have to rebuild or copy, and "we tested it in dev" would be an assertion
+  about source code rather than about the artifact.
+- Basic ACR includes 10 GiB and costs ~$5/month; a second one is pure duplicated
+  spend for a strictly worse guarantee.
+- Both dev Container Apps pull with their own managed identities via `AcrPull`
+  (§15.6), so sharing the registry does **not** share identity.
+
+**Storage housekeeping:** tagging per commit (`todo-api:<sha>`,
+`todo-web:<sha>-dev`, `todo-web:<sha>-prod`) grows the registry. Basic's 10 GiB
+is generous for these images but not infinite. Document (do not automate this
+cycle) the manual cleanup:
+```bash
+# Keep the 20 most recent manifests per repo; delete older untagged/tagged ones.
+az acr repository show-manifests -n <acr-name> --repository todo-api \
+  --orderby time_desc --query "[20:].digest" -o tsv \
+  | xargs -r -I{} az acr repository delete -n <acr-name> --image todo-api@{} --yes
+```
+An ACR retention policy would be the automated answer but is a **Premium**
+feature — explicitly rejected on cost grounds.
+
+#### 15.4.5 PostgreSQL — **DUPLICATED** (`pg-todo-demo-dev-cus01`, second Flexible Server)
+
+**DECISION: dev gets its own PostgreSQL Flexible Server — NOT a second database
+on `pg-todo-demo-cus01`. This is the entire cost delta of this cycle
+(~$16–17/month) and is the one decision the user should consciously sign off.**
+
+The rejected cheaper option is a second logical database (`tododb_dev`) on the
+existing server: **$0 extra**. It is rejected for four reasons, in order of
+weight:
+
+1. **Entra principals on a Flexible Server are server-global, and the default is
+   permissive.** `pgaadauth_create_principal('todo-api-dev', …)` creates a role
+   in the server's shared `pg_authid`. In PostgreSQL, `PUBLIC` holds `CONNECT`
+   on every database by default — so **out of the box, the dev managed identity
+   could connect to the production `tododb`**. Isolation would rest entirely on
+   remembering `REVOKE CONNECT ON DATABASE tododb FROM PUBLIC;` (plus schema and
+   `pg_read_all_data` hygiene) in a manual, human-run SQL step with no IaC
+   representation and no drift detection. With two servers, the dev identity is
+   simply **not a principal on the production server at all** — isolation by
+   construction, not by grant hygiene. This directly satisfies the requirement
+   that dev and prod must not share a database identity.
+2. **The failure mode of a config mistake inverts from destructive to
+   fail-closed.** The app runs `db.Database.Migrate()` at startup (§3.4). On a
+   shared server, a wrong `Database=` in one environment's connection string
+   means an unreviewed migration executes DDL against the other environment's
+   data. On separate servers the same typo produces a connection failure — the
+   host differs, and the identity has no principal there. Loud and harmless
+   instead of silent and destructive.
+3. **`Standard_B1ms` is one shared burstable CPU-credit pool with 1 vCPU / 2
+   GiB.** Dev exists to be load-tested, migration-tested and broken. Exhausting
+   burst credits or the connection limit in dev would degrade production on the
+   same server, and no amount of configuration discipline prevents it.
+4. **Server-level changes could never be rehearsed** — PG major version,
+   `authConfig`, server parameters, firewall rules, backup/PITR restore drills.
+   Rehearsing exactly these is a primary reason to have a dev environment.
+
+The dev server is configured **identically** to prod via the existing
+`infra/modules/postgres.bicep`, with no parameter changes: Central US,
+PostgreSQL 16, `Standard_B1ms` Burstable, 32 GiB, 7-day locally-redundant
+backup, no HA, no read replica, public access + the
+`AllowAllAzureServicesAndResourcesWithinAzureIps` firewall rule, and **dual auth
+(`activeDirectoryAuth: Enabled` + `passwordAuth: Enabled`)** per the §14
+standing constraint that human `psql` admin access must keep working.
+
+**If the user rejects the cost** at the PROPOSE step, the fallback is the shared
+server with `tododb_dev`. It must **not** be adopted silently: it requires an
+explicitly superseding `architecture-memory.md` entry, plus this exact hardening
+SQL run by the Entra admin **before** `todo-api-dev` first starts:
+```sql
+-- Run as the Entra admin, connected to the `postgres` database.
+-- Removes the permissive PUBLIC default that makes cross-environment
+-- connection possible on a shared server.
+REVOKE CONNECT ON DATABASE tododb     FROM PUBLIC;
+REVOKE CONNECT ON DATABASE tododb_dev FROM PUBLIC;
+GRANT  CONNECT ON DATABASE tododb     TO "todo-api";
+GRANT  CONNECT ON DATABASE tododb_dev TO "todo-api-dev";
+```
+Even then, reasons 3 and 4 above remain unmitigated.
+
+#### 15.4.6 Summary table
+
+| Resource | Dev | Rationale (short) | Fixed cost delta |
+|---|---|---|---|
+| Container Apps Environment | **own** (`cae-todo-demo-dev`) | real network/log/DNS boundary; free on Consumption | $0 |
+| Container Apps ×2 | **own** (`-dev`) | own identities, own config, own scale | usage only |
+| PostgreSQL Flexible Server | **own** (`pg-todo-demo-dev-cus01`) | server-global Entra roles; fail-closed on typos; burst isolation | **~$16–17/mo** |
+| Application Insights | **own** (`appi-todo-demo-dev`) | per-component identity grant + clean signals | $0 |
+| Log Analytics workspace | **shared** | standing memory constraint; `EnvironmentName_s` separates | $0 |
+| Container Registry | **shared** | artifact promotion requires one registry | $0 |
+| Resource group | **shared** | user instruction ("same azure resource") | $0 |
+
+### 15.5 Bicep structure — exact shape
+
+**DECISION: add a new, separate template `infra/main.dev.bicep` (+
+`infra/main.dev.parameters.json`). `infra/main.bicep` is NOT modified,
+NOT parameterized by environment, and NOT re-deployed.**
+
+Rationale: production live configuration has **permanently drifted** from
+`infra/main.bicep` by design (§14.2 — CD does not apply Bicep). Turning
+`main.bicep` into a two-environment template would make every dev bootstrap a
+potential production deployment that would silently revert that drift. Accepting
+a modest amount of duplication between two templates is far cheaper than that
+risk. Both templates call the **same modules**, which is what actually
+guarantees "same infrastructure".
+
+`infra/main.dev.bicep` — `targetScope = 'resourceGroup'`, deployed against
+`rg-todo-demo`:
+
+| # | Bicep declaration | Notes |
+|---|---|---|
+| — | `resource acr 'Microsoft.ContainerRegistry/registries@…' existing = { name: acrName }` | **existing**, shared. Creates nothing. |
+| — | `resource law 'Microsoft.OperationalInsights/workspaces@…' existing = { name: 'log-todo-demo' }` | **existing**, shared. Creates nothing. |
+| 1 | `module acaEnvDev 'modules/acaEnvironment.bicep'` → name `cae-todo-demo-dev`, `location: location` (eastus), `logAnalyticsWorkspaceId: law.id` | **second `Microsoft.App/managedEnvironments`** |
+| 2 | `module appinsightsDev 'modules/appinsights.bicep'` → name `appi-todo-demo-dev`, `workspaceResourceId: law.id` | same module as prod |
+| 3 | `module postgresDev 'modules/postgres.bicep'` → name `pg-todo-demo-dev-cus01`, `location: postgresLocation` (**centralus**), `databaseName: 'tododb'`, same 4 `entraAdmin*` params as prod | same module, unchanged |
+| 4 | `module todoWebDev 'modules/containerApp.bicep'` → name `todo-web-dev`, `environmentId: acaEnvDev.outputs.id`, min **0** / max **1** | deployed **first** (its FQDN feeds CORS) |
+| 5 | `module todoApiDev 'modules/containerApp.bicep'` → name `todo-api-dev`, `environmentId: acaEnvDev.outputs.id`, min **0** / max **1** | deployed second |
+
+Required `params` (mirroring `main.bicep`): `location` (default
+`resourceGroup().location`), `postgresLocation` (default `'centralus'` —
+**do not default to `location`**, East US is restricted for Postgres on this
+subscription), `acrName`, `postgresAdminUser` (`'todoadmin'`),
+`@secure() postgresAdminPassword`, the four `postgresEntraAdmin*` values
+(identical to prod — the same human Entra admin bootstraps both servers),
+`todoApiImage` / `todoWebImage` (default to the
+`mcr.microsoft.com/k8se/quickstart:latest` placeholder for the bootstrap
+deploy), and `containerTargetPort` (default `8080`; **override to `80` for the
+placeholder-image bootstrap deploy**, exactly as documented in `main.bicep`).
+
+`todoApiDev.envVars` — all **plain, non-secret** env vars, zero Container Apps
+secrets (§13/§14):
+
+| Env var | Value |
+|---|---|
+| `Cors__AllowedOrigins__0` | `https://${todoWebDev.outputs.fqdn}` |
+| `ConnectionStrings__TodoDb` | `Host=${postgresDev.outputs.fqdn};Port=5432;Database=tododb;Username=todo-api-dev;Ssl Mode=Require;Trust Server Certificate=true` — **no `Password=`, no `Passfile=`** (§14.4) |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | `appinsightsDev.outputs.connectionString` (non-secret; local auth disabled) |
+
+`Postgres__UseEntraAuth` **must not appear** — that key was deleted in §14.
+
+Reuse `main.bicep`'s `todoApiUsesAcr` / `todoWebUsesAcr` guard verbatim: only
+attach the ACR `registries` entry when the image actually comes from that ACR,
+otherwise the placeholder bootstrap deploy hangs waiting for an `AcrPull` grant
+that does not exist yet.
+
+**Required outputs:** `acaEnvironmentDevId`, `todoApiDevFqdn`, `todoWebDevFqdn`,
+`todoApiDevPrincipalId`, `todoWebDevPrincipalId`, `postgresDevServerName`,
+`postgresDevFqdn`, `appInsightsDevId`, `appInsightsDevName`. The `principalId`
+and `appInsightsDevId` outputs are consumed by the manual Phase-D role grants
+(§15.12).
+
+### 15.6 Identity, Entra auth and secrets — per environment
+
+Every §13/§14 rule applies unchanged to dev. **Dev introduces zero application
+runtime secrets and no Key Vault.**
+
+| Connection | Mechanism | Prod | Dev |
+|---|---|---|---|
+| API → PostgreSQL | **Entra token via system-assigned MI**, `UsePasswordProvider`, `Ssl Mode=Require`. No password path exists in the app (§14). | MI `todo-api` → `pg-todo-demo-cus01` | MI `todo-api-dev` → `pg-todo-demo-dev-cus01` |
+| API → Application Insights | **Entra** via `AzureMonitorOptions.Credential` (`ManagedIdentityCredential`) + `Monitoring Metrics Publisher` scoped to the component; connection string is a non-secret env var | on `appi-todo-demo` | on `appi-todo-demo-dev` |
+| Apps → ACR | **Entra** — `AcrPull` on the shared ACR, `--identity system` | `todo-api`, `todo-web` | `todo-api-dev`, `todo-web-dev` |
+| GitHub Actions → Azure | **OIDC workload identity federation** — no stored client secret | subject `…:environment:production` | subject `…:environment:dev` |
+| Human → Postgres (`psql`) | Entra admin **or** `todoadmin` + password (deliberately retained, §14) | `pg-todo-demo-cus01` | `pg-todo-demo-dev-cus01`, **different password** |
+| Browser → app, app → Postgres, CI → Azure | **TLS everywhere.** ACA ingress `allowInsecure: false`; `Ssl Mode=Require`; ARM/ACR over HTTPS. No plaintext path in either environment. | | |
+
+**Hard rules for the dev environment:**
+
+- **Dev and prod never share a database identity.** `todo-api-dev` is a
+  `pgaadauth` principal **only** on the dev server; `todo-api` is a principal
+  **only** on the production server. Neither appears on the other. This is the
+  isolation guarantee, and separate servers are what make it structural rather
+  than grant-dependent (§15.4.5).
+- **Dev must never gain a password/SQL-auth path to Postgres** — no flag, no
+  "just for dev", no fallback (§14 standing constraint). `ConnectionStrings__TodoDb`
+  for dev contains no `Password=` and no `Passfile=` and is a **plain** env var,
+  never a Container Apps secret and never a Key Vault reference.
+- **No Key Vault is introduced.** Nothing in the dev stack is a secret that an
+  Entra identity cannot replace. If a future dependency genuinely cannot
+  authenticate with Entra, use the §13.6 Key Vault pattern (RBAC `Key Vault
+  Secrets User`, Container Apps Key Vault reference, managed-identity-authenticated
+  connection to the vault itself) — never a raw Container Apps secret, never a
+  vault access key or SAS token.
+- **Dev's `todoadmin` password must differ from production's.** It is a
+  deploy-time secret (§13.9), supplied as a **new GitHub secret
+  `PGADMIN_PASSWORD_DEV`** and passed to `az deployment group create` as the
+  `@secure() postgresAdminPassword` parameter. It is never written to
+  `main.dev.parameters.json`, never logged, and never appears in this or any
+  other `.md` file. A dev credential leak must not reach production.
+- **Both Postgres servers keep `passwordAuth: Enabled`.** Do not "helpfully"
+  disable it (§14 standing constraint).
+
+**No new RBAC is needed for the CD service principal.** It already holds
+`Contributor` on `rg-todo-demo`, and every dev resource lives in that same
+resource group. Only the two role grants that `Contributor` cannot write
+(`AcrPull`, `Monitoring Metrics Publisher`) are new manual steps (§15.12).
+
+### 15.7 Data model impact
+
+**No schema change. No entity change. No migration is authored this cycle.**
+
+Operational consequences only:
+
+- The dev server's `tododb` starts **empty**. The schema is created on the first
+  boot of `todo-api-dev` by the existing startup `db.Database.Migrate()` (§3.4).
+  This requires `todo-api-dev` to hold DDL rights on the `public` schema of the
+  dev `tododb` — granted in the manual Phase D bootstrap (§15.12), exactly
+  mirroring the production Phase 4 step B.
+- **No production data is copied into dev.** Dev data is synthetic and
+  disposable. There is no anonymization pipeline, no restore-from-prod, and no
+  cross-environment data path of any kind. (This is also why sharing a server
+  buys nothing — there is no data to share.)
+- Dev retains the server default 7-day locally-redundant PITR window, but dev
+  data is explicitly **not** treated as recoverable. Rebuilding dev means
+  deleting the database and letting `Migrate()` recreate it.
+- **The promotion pipeline now exercises EF migrations in dev before prod** —
+  the single largest safety win of this cycle. A migration that fails or takes a
+  lock will fail the dev smoke test (§15.9.3) and block promotion.
+
+### 15.8 API surface impact
+
+**None.** `todo-api-dev` exposes the identical §3.5 surface — `GET /api/todos`,
+`GET /api/todos/{id}`, `POST /api/todos`, `PUT /api/todos/{id}`,
+`DELETE /api/todos/{id}`, `GET /health` — with identical DTOs, validation and
+`ProblemDetails` behavior. It is the same image.
+
+The only differences are per-environment values, resolved at deploy time:
+
+| | Prod | Dev |
+|---|---|---|
+| API base URL | `https://todo-api.lemoncliff-b3b8a3d9.eastus.azurecontainerapps.io` | `https://todo-api-dev.<dev-default-domain>` — **read back at deploy time, never hardcoded** |
+| `Cors__AllowedOrigins__0` | prod frontend FQDN only | dev frontend FQDN only |
+
+**CORS is strictly per-environment**: `todo-api-dev` allows only
+`https://todo-web-dev.<dev-default-domain>`, and `todo-api` continues to allow
+only the production frontend origin. Neither allow-list ever contains the other
+environment's origin.
+
+### 15.9 CI/CD pipeline design — **the core deliverable**
+
+#### 15.9.1 Branching model
+
+| Branch | Purpose | Deploys to | Gate |
+|---|---|---|---|
+| `feature/*`, `pipeline/*`, `fix/*` | day-to-day work, branched off `develop` | nothing | CI on PR |
+| **`develop`** | **integration branch — the default target for feature PRs** | **dev**, automatically on every push | CI must pass to merge the PR |
+| **`main`** | **production trunk — only ever receives PRs from `develop` (or `hotfix/*`)** | **dev first, then prod after human approval** | CI + review + deployment approval |
+| `hotfix/*` | urgent production fix, branched off `main`, PR'd directly to `main` | dev first, then prod — **no bypass** | same gate as `develop`→`main` |
+
+`develop` is created once by a human, off the current `main`:
+```bash
+git checkout main && git pull && git checkout -b develop && git push -u origin develop
+```
+After that, `develop` is the base branch for feature work and should be set as
+the repository's **default branch** so new PRs target it by mistake-proof
+default. Promotion to production is a PR **`develop` → `main`**.
+
+Rationale for this model over the alternatives:
+
+- *Two independent triggers (`develop`→dev and `main`→prod as separate,
+  unconnected workflows)* — **rejected.** The user asked for a sequential gate,
+  and nothing would guarantee that the exact commit going to prod had ever run
+  in dev. A merge commit or squash produces a **new SHA** that dev never saw.
+- *Dev-only-on-`develop`, prod-only-on-`main`, no dev step on `main`* —
+  **rejected** for the same SHA-drift reason.
+- **Chosen:** a **single workflow** triggered on both branches, whose
+  `deploy-prod` job `needs:` a successful `deploy-dev` **of the same SHA**. On a
+  `main` push, the prod-bound commit is deployed to dev and smoke-tested
+  **first**, then waits for human approval. "Deploy to dev first, then
+  production" is enforced by the job graph, not by convention.
+
+#### 15.9.2 Workflow file structure — `.github/workflows/cd.yml` (replaces the current one)
+
+```yaml
+name: CD
+
+on:
+  push:
+    branches: [develop, main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # OIDC federated login — no stored secret
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-todo-demo
+
+jobs:
+  deploy-dev:      # always runs (develop AND main)
+  verify-dev:      # needs: deploy-dev — the automated half of the gate
+  deploy-prod:     # needs: [deploy-dev, verify-dev]
+                   # if: github.ref == 'refs/heads/main'
+                   # environment: production  ← the human approval gate
+```
+
+**Remove the workflow-level `concurrency:` block** and use **job-level**
+concurrency instead, so a `develop` run and a `main` run cannot collide on the
+dev environment while still allowing prod deploys to queue independently:
+
+| Job | `concurrency.group` | `cancel-in-progress` |
+|---|---|---|
+| `deploy-dev` | `deploy-dev` | `false` |
+| `deploy-prod` | `deploy-prod` | `false` |
+
+`verify-dev` needs no concurrency group (read-only HTTPS probes).
+
+#### 15.9.3 Job specifications
+
+**Job 1 — `deploy-dev`** · `runs-on: ubuntu-latest` · `environment: dev` ·
+runs on **both** `develop` and `main`.
+
+1. `actions/checkout@v4`.
+2. `azure/login@v2` with `client-id`/`tenant-id`/`subscription-id` from
+   `vars.AZURE_CLIENT_ID` / `vars.AZURE_TENANT_ID` / `vars.AZURE_SUBSCRIPTION_ID`
+   (repository **variables**, no credential material).
+3. **Look up the shared ACR** — identical to the current workflow's step 0
+   (`az acr list -g $RESOURCE_GROUP --query "[0].name"`), failing loudly if
+   absent. One ACR serves both environments, so this step is unchanged.
+4. **Wire ACR pull identity** on the dev apps (idempotent, every run):
+   ```bash
+   az containerapp registry set -n todo-api-dev -g "$RESOURCE_GROUP" --server "$ACR_LOGIN_SERVER" --identity system
+   az containerapp registry set -n todo-web-dev -g "$RESOURCE_GROUP" --server "$ACR_LOGIN_SERVER" --identity system
+   ```
+5. **Build + push the backend image once, environment-agnostically:**
+   `todo-api:${{ github.sha }}`. Use `az acr login` + `docker build` +
+   `docker push` (**not** `az acr build` — ACR Tasks is disabled on this
+   free-credit subscription; the existing comment in `cd.yml` explains this and
+   must be preserved). **This image is the promotion artifact — `deploy-prod`
+   reuses this exact tag and never rebuilds it.**
+6. `az containerapp update -n todo-api-dev --image .../todo-api:${{ github.sha }}`,
+   then read back its FQDN into a job output.
+7. **Build + push the frontend image for dev:** `todo-web:${{ github.sha }}-dev`,
+   with `--build-arg VITE_API_BASE_URL=https://<todo-api-dev FQDN>`. The
+   backend-before-frontend ordering constraint (§4.4/§5.7, an
+   `architecture-memory.md` hard constraint) is honored.
+8. `az containerapp update -n todo-web-dev --image …`, read back its FQDN.
+9. **Reconcile dev CORS:**
+   `az containerapp update -n todo-api-dev --set-env-vars "Cors__AllowedOrigins__0=https://<todo-web-dev FQDN>"`.
+10. **Outputs:** `api_fqdn`, `web_fqdn`, `image_tag` (= `github.sha`),
+    `acr_login_server`, `acr_name`.
+
+**Job 2 — `verify-dev`** · `needs: deploy-dev` · **no `environment:`, no Azure
+login, no credentials at all** — it only makes public HTTPS requests to the dev
+FQDNs from the previous job's outputs. This is the automated half of the
+promotion gate; if it fails, `deploy-prod` never starts.
+
+| Check | Assertion |
+|---|---|
+| `GET https://<api_fqdn>/health` | HTTP `200` and body contains `"status":"ok"` |
+| `GET https://<api_fqdn>/api/todos` | HTTP `200` and a JSON array — **this is the important one: it proves the dev managed identity actually authenticated to the dev Postgres server over Entra and that `Migrate()` succeeded** |
+| `POST https://<api_fqdn>/api/todos` then `DELETE` the returned id | `201` then `204` — proves write path + DDL/DML permissions of the dev `pgaadauth` role |
+| `GET https://<web_fqdn>/` | HTTP `200` and the response body contains the dev API FQDN (proves the correct `VITE_API_BASE_URL` was baked) |
+
+All checks retry with backoff (both dev apps have `minReplicas: 0`, so the first
+request pays a cold start — allow up to ~120 s total before failing). Every URL
+is `https://`; no plaintext probe.
+
+**Job 3 — `deploy-prod`** · `needs: [deploy-dev, verify-dev]` ·
+`if: github.ref == 'refs/heads/main'` · **`environment: production`**.
+
+Declaring `environment: production` is what creates the **human approval gate**:
+with required reviewers configured on that GitHub Environment (§15.12 step 5),
+the run **pauses** here and a reviewer must click Approve before any step
+executes. On a `develop` push this job is skipped entirely by the `if:`.
+
+1. `actions/checkout@v4`, `azure/login@v2` (same OIDC variables).
+2. Look up the shared ACR (same as `deploy-dev`).
+3. **Promotion assertion — fail closed if the artifact was never built:**
+   ```bash
+   az acr repository show -n "$ACR_NAME" --image "todo-api:${{ github.sha }}" -o none \
+     || { echo "::error::todo-api:${{ github.sha }} not in ACR — dev deploy did not produce this artifact."; exit 1; }
+   ```
+4. Wire ACR pull identity on `todo-api` / `todo-web` (idempotent, unchanged).
+5. **Promote the backend — NO REBUILD:**
+   `az containerapp update -n todo-api --image "$ACR_LOGIN_SERVER/todo-api:${{ github.sha }}"`.
+   Read back the prod API FQDN. Production runs the identical image digest that
+   `verify-dev` validated.
+6. **Rebuild the frontend for prod** as `todo-web:${{ github.sha }}-prod` with
+   `--build-arg VITE_API_BASE_URL=https://<prod todo-api FQDN>` — see the caveat
+   in §15.9.4 — then `az containerapp update -n todo-web --image …`.
+7. Reconcile prod CORS (unchanged from today's step 3).
+8. Write a `$GITHUB_STEP_SUMMARY` recording both environments' FQDNs, the
+   promoted `todo-api` tag, and both frontend tags.
+
+**Explicitly unchanged in production:** `todo-api` keeps `minReplicas: 0` /
+`maxReplicas: 3`, `todo-web` keeps `1` / `2`, and no production environment
+variable other than `Cors__AllowedOrigins__0` (already reconciled today) is
+touched. This cycle must not perturb the live production configuration.
+
+#### 15.9.4 Artifact promotion semantics — and the one honest caveat
+
+| Artifact | Promotable? | Mechanism |
+|---|---|---|
+| `todo-api` | **Yes — true promotion.** | Built once in `deploy-dev` as `todo-api:<sha>`; `deploy-prod` re-points the prod app at the same tag. Identical digest. |
+| `todo-web` | **No — rebuilt per environment.** | `VITE_API_BASE_URL` is baked at build time (§4.4), and the dev and prod API FQDNs differ, so one image cannot serve both. Built twice from the **same source SHA and same Dockerfile**, differing only in that one build-arg: `todo-web:<sha>-dev` and `todo-web:<sha>-prod`. |
+
+**Residual risk, stated plainly:** the frontend image that reaches production is
+*not* the exact image validated in dev. It is the same commit, same Dockerfile,
+same `npm ci` lockfile and same base image, differing only in one build
+argument — so the risk is low, but it is not zero (a non-reproducible
+dependency resolution or a base-image tag moving between the two builds could
+diverge them).
+
+**The correct fix, recorded as a follow-up (Q3), not done here:** make the
+frontend read its API base URL **at runtime** instead of build time — e.g. the
+nginx container's entrypoint writes `/usr/share/nginx/html/config.js`
+(`window.__APP_CONFIG__ = { apiBaseUrl: "…" }`) from an env var, and the SPA
+reads it. That makes `todo-web` environment-agnostic and byte-for-byte
+promotable, and it would **remove** the backend-before-frontend deployment
+ordering constraint that has shaped this project since day one. It is an
+application change and is deliberately out of this cycle's infrastructure scope.
+Mitigation until then: pin the frontend Dockerfile's base images by digest, and
+rely on `npm ci` + the committed lockfile (both already true).
+
+#### 15.9.5 Fallback pipeline shape if GitHub Environments are unavailable
+
+**This is a real risk that must be checked before implementation.** GitHub
+**required reviewers and environment protection rules are not available on
+private repositories on the GitHub Free plan** — they require a public
+repository, or GitHub Pro/Team/Enterprise. `gh` is not installed in the agent
+environment, so the repository's visibility and plan **could not be verified**
+(§15.2, Q1).
+
+**Check first** (human, one command):
+```bash
+gh repo view matvi/todo-claude-multiagent --json visibility,isPrivate
+```
+
+- **If environments with required reviewers ARE available → implement Plan A
+  exactly as specified in §15.9.2–15.9.3.** This is the preferred design.
+- **If they are NOT available → Plan B**, which preserves the hard human gate
+  and true artifact promotion, losing only the in-run approval UX and its audit
+  trail:
+  1. Split into `.github/workflows/cd-dev.yml` (trigger: `push` to `develop` and
+     `main`; contains the `deploy-dev` + `verify-dev` jobs, no `environment:`)
+     and `.github/workflows/cd-prod.yml`.
+  2. `cd-prod.yml` triggers on **`workflow_dispatch` only**, with a **required
+     `image_tag` input** (the commit SHA that passed `verify-dev`) and no
+     `environment:`. A human explicitly runs it with a specific, dev-validated
+     tag — the gate becomes an intentional human action rather than an approval
+     click.
+  3. Keep the §15.9.3 step-3 promotion assertion; under Plan B it is the *only*
+     thing preventing an un-validated tag from reaching production, so it is
+     mandatory.
+  4. The OIDC federated-credential subjects change (see the table in §15.12
+     step 4) — with no `environment:`, the subject reverts to the branch form
+     `repo:matvi/todo-claude-multiagent:ref:refs/heads/main`.
+
+The engineer must record in `changes.md` which plan was implemented and why.
+
+#### 15.9.6 CI workflow changes — `.github/workflows/ci.yml`
+
+1. **Extend the trigger** to both target branches:
+   ```yaml
+   on:
+     pull_request:
+       branches: [main, develop]
+   ```
+   CI remains **credential-free** — no Azure login, no push, no deploy.
+2. **Extend the `iac` job** to validate the new template alongside the existing
+   one:
+   ```bash
+   az bicep build --file infra/main.dev.bicep --stdout > /dev/null
+   az bicep lint  --file infra/main.dev.bicep
+   ```
+3. **Add a `guard-promotion-source` job** that runs only on PRs targeting `main`
+   and fails unless the source branch is `develop` or `hotfix/*`. GitHub branch
+   protection cannot express "only merge from `develop`", so this status check
+   is how the promotion path is actually enforced:
+   ```yaml
+   if: github.event_name == 'pull_request' && github.base_ref == 'main'
+   # fail unless github.head_ref == 'develop' || startsWith(github.head_ref, 'hotfix/')
+   ```
+4. Do **not** add a `what-if` step against the dev parameters. `what-if`
+   requires an Azure login, which would make CI credentialed and unsafe on fork
+   PRs. Bicep compile + lint is the credential-free validation boundary.
+
+#### 15.9.7 Azure DevOps parity — `azure-pipelines.yml`
+
+Per §11.10, this file exists for portability and is **not actively wired**. It
+must still be updated so the two systems do not diverge into different
+architectures:
+
+- Restructure into **`stage: DeployDev` → `stage: VerifyDev` → `stage:
+  DeployProd`**, with `DeployProd` carrying `condition:
+  eq(variables['Build.SourceBranch'], 'refs/heads/main')` and using an **Azure
+  DevOps Environment with an approval check** as the analogue of the GitHub
+  required-reviewer gate.
+- Trigger on both `develop` and `main`.
+- Continue using `AzureCLI@2` with a **workload-identity-federation service
+  connection** (secretless, human-created) — never a service-principal secret.
+- Same promotion semantics: `todo-api` built once in `DeployDev` and reused by
+  tag; `todo-web` rebuilt per stage.
+
+### 15.10 Non-functional requirements
+
+| Requirement | Specification |
+|---|---|
+| **Region** | Compute/observability **East US** (`cae-todo-demo-dev`, both dev apps, `appi-todo-demo-dev`); PostgreSQL **Central US** (`pg-todo-demo-dev-cus01`) — identical to production, and mandatory because of the East US Postgres offer restriction on this subscription (§15.2). |
+| **Isolation — network** | Separate `Microsoft.App/managedEnvironments`; dev apps cannot reach production apps over ACA internal DNS. |
+| **Isolation — data** | Separate Flexible Server; no data path, no replication, no restore between environments. |
+| **Isolation — identity** | Separate system-assigned managed identities; each is a `pgaadauth` principal **only** on its own server and a `Monitoring Metrics Publisher` **only** on its own App Insights component. No shared credential of any kind. |
+| **Isolation — telemetry** | Separate App Insights component. Shared workspace, separable by `EnvironmentName_s`. |
+| **Blast radius (accepted, non-zero)** | Shared: the resource group (user-mandated), the ACR (promotion requires it), and the Log Analytics workspace + its **shared 1 GB/day cap** (§15.4.2). These are documented and accepted, not overlooked. |
+| **Auth** | Entra/managed-identity-first everywhere (§13); Entra-**only** for the app→Postgres path (§14). **Zero application runtime secrets in dev.** No Key Vault. The only new secret is the deploy-time `PGADMIN_PASSWORD_DEV`, held as a GitHub secret, distinct from production's. |
+| **Transport** | TLS everywhere. ACA ingress `allowInsecure: false` on all four apps; `Ssl Mode=Require` on both DB connections; all smoke probes `https://`. No plaintext path, including dev. |
+| **Scaling (dev)** | `todo-api-dev` **min 0 / max 1**; `todo-web-dev` **min 0 / max 1**; 0.25 vCPU / 0.5 GiB. Dev scales to **zero when idle** — deliberately cheaper than prod, and the reason the dev idle cost is ~$0. Cold start is acceptable in dev and is absorbed by the retry logic in `verify-dev`. |
+| **Scaling (prod)** | **Unchanged.** `todo-api` min 0 / max 3; `todo-web` min 1 / max 2. |
+| **Availability** | Dev has **no availability target**. No HA on the dev Postgres server, no zone redundancy, no alerting. Dev may be broken; that is what it is for. |
+| **Backup/recovery (dev)** | Dev Postgres keeps the 7-day locally-redundant PITR default (it comes free with the SKU) but dev data is explicitly **not** recoverable-by-policy. Recovery procedure for dev is "delete and let `Migrate()` rebuild". |
+| **Cost** | +$18–22/month (§15.14). Cheapest-SKU posture preserved: Burstable B1ms, Consumption ACA, shared Basic ACR, shared workspace, no VNet, no Key Vault, no Front Door, no NAT gateway. |
+| **Ingress (dev)** | Both dev apps use **external** ingress. Internal-only for `todo-api-dev` was considered and rejected: the GitHub-hosted runner running `verify-dev` and a developer's browser both need to reach it, and adding a VNet + private ingress would contradict the no-VNet cost posture. Dev is publicly reachable and contains no real data. |
+
+### 15.11 Manual, human-run bootstrap (agents MUST NOT run any of this)
+
+Per the standing PROPOSE-mode rule (§11.6/§11.8), **agents author these commands
+and never execute them.** No agent creates identities, federated credentials,
+role assignments, GitHub secrets/variables/environments, branch protection, or
+in-database principals.
+
+**Phase A — one-time infrastructure deploy of the dev stack.**
+```bash
+RG=rg-todo-demo
+# Bootstrap deploy: placeholder images listen on port 80, so override the target
+# port. A later CD run replaces both images and the port reverts to 8080 via a
+# second deploy with containerTargetPort=8080 (mirrors infra/README.md Phase 2).
+az deployment group create -g "$RG" \
+  --template-file infra/main.dev.bicep \
+  --parameters infra/main.dev.parameters.json \
+  --parameters containerTargetPort=80 \
+  --parameters postgresAdminPassword="$PGADMIN_PASSWORD_DEV"   # from the operator's
+                                                              # password manager;
+                                                              # never echoed, never committed
+```
+Capture the outputs (`todoApiDevPrincipalId`, `todoWebDevPrincipalId`,
+`appInsightsDevId`, `postgresDevServerName`) — Phases B–D consume them.
+
+**Phase B — `AcrPull` for both dev identities on the shared ACR** (the CD service
+principal holds only `Contributor` and cannot write role assignments):
+```bash
+ACR_ID=$(az acr show -n <acr-name> -g "$RG" --query id -o tsv)
+az role assignment create --role AcrPull --assignee <todoApiDevPrincipalId> --scope "$ACR_ID"
+az role assignment create --role AcrPull --assignee <todoWebDevPrincipalId> --scope "$ACR_ID"
+```
+
+**Phase C — `Monitoring Metrics Publisher` for `todo-api-dev` on the dev App
+Insights component only:**
+```bash
+az role assignment create --role "Monitoring Metrics Publisher" \
+  --assignee <todoApiDevPrincipalId> --scope <appInsightsDevId>
+```
+
+**Phase D — the in-database Entra principal for `todo-api-dev`.** This has no
+ARM/Bicep surface and is permanently a human step. Connect to the **dev** server
+as the Entra admin (`az account get-access-token --resource-type oss-rdbms`
+supplies the token that `psql` takes as the password; the connection is TLS):
+```sql
+-- Connected to the `postgres` database on pg-todo-demo-dev-cus01 as the Entra admin.
+SELECT * FROM pgaadauth_list_principals(false);          -- verify before creating
+SELECT * FROM pgaadauth_create_principal('todo-api-dev', false, false);
+
+-- Then, connected to `tododb` on the DEV server, grant the DDL rights that the
+-- startup Migrate() needs (mirrors production Phase 4 step B):
+GRANT ALL ON SCHEMA public TO "todo-api-dev";
+ALTER SCHEMA public OWNER TO "todo-api-dev";
+```
+The principal name **must** be exactly `todo-api-dev` — the four-way invariant in
+§15.3. Run this **only against the dev server**; do not create `todo-api-dev` on
+`pg-todo-demo-cus01`.
+
+**Phase E — GitHub configuration.**
+
+1. Create the `develop` branch and make it the repository default (§15.9.1).
+2. Add the new deploy-time secret:
+   `gh secret set PGADMIN_PASSWORD_DEV` (value entered interactively — never on
+   the command line, never in a file).
+3. Create the GitHub Environments `dev` (no protection rules) and confirm
+   `production` exists.
+4. **Add the OIDC federated credentials.** This is the step most likely to be
+   missed: when a job declares `environment: <name>`, GitHub's OIDC **subject
+   claim becomes the environment form, not the branch form**. Required subjects
+   (`repo:matvi/todo-claude-multiagent:…`):
+
+   | Consumer | Required subject | Plan |
+   |---|---|---|
+   | `deploy-dev` (`environment: dev`) | `…:environment:dev` | A |
+   | `deploy-prod` (`environment: production`) | `…:environment:production` | A (likely already exists) |
+   | `cd-dev.yml` (no environment) | `…:ref:refs/heads/develop` **and** `…:ref:refs/heads/main` | B |
+   | `cd-prod.yml` (dispatch on `main`) | `…:ref:refs/heads/main` | B |
+
+   Add each with
+   `az ad app federated-credential create --id <appId> --parameters <json>` using
+   `issuer: https://token.actions.githubusercontent.com` and
+   `audiences: ["api://AzureADTokenExchange"]`. `verify-dev` needs none (no Azure
+   login).
+5. **Configure required reviewers on the `production` environment** — this is
+   the promotion gate:
+   `gh api -X PUT repos/matvi/todo-claude-multiagent/environments/production -f 'reviewers[][type]=User' -F 'reviewers[][id]=<user-id>'`.
+   If this fails with a plan/visibility error, Plan B (§15.9.5) applies.
+6. Apply branch protection per §15.12.
+
+**Phase F — first real deploy.** Merge to `develop`, let `deploy-dev` +
+`verify-dev` run green, then open the `develop` → `main` PR.
+
+### 15.12 Branch protection requirements (human/`gh`, still not enforced today)
+
+`.pipeline/infra.md` recorded twice that branch protection on `main` **could not
+be verified and is not enforced**, because no git remote existed and `gh` was
+unavailable. **A remote now exists** (`matvi/todo-claude-multiagent`, §15.2), so
+the first blocker is gone; `gh` is still unavailable to the agent, so this
+remains a human step and its status is still unverified (Q1). Introducing a
+promotion gate is exactly the moment to close it — an approval gate on
+`deploy-prod` is worthless if anyone can push straight to `main`.
+
+**Required on `main`:**
+- Require a pull request before merging; **≥1 approving review**; dismiss stale
+  approvals on new commits.
+- Require status checks to pass: `backend`, `frontend`, `docker`, `iac`, and the
+  new `guard-promotion-source`.
+- Require branches to be up to date before merging.
+- **Block force pushes and deletion.**
+- **Do not allow bypassing the above settings** (including for admins) — an
+  admin bypass makes the gate advisory.
+- Squash merge only (linear history).
+
+**Required on `develop`:**
+- Require a pull request before merging.
+- Require status checks: `backend`, `frontend`, `docker`, `iac`.
+- Block force pushes and deletion.
+- **No required approving review** — deliberately lighter, so integration into
+  dev stays fast. That is the point of having dev.
+
+Verification command for the reviewer/human:
+```bash
+gh api repos/matvi/todo-claude-multiagent/branches/main/protection
+gh api repos/matvi/todo-claude-multiagent/branches/develop/protection
+```
+
+### 15.13 Cost impact — quantified
+
+Current baseline (from `.pipeline/infra.md`): **~$25–37/month**, idle floor
+~$21–25, dominated by the always-on Burstable Postgres server and the
+`minReplicas: 1` production frontend.
+
+**Delta introduced by this cycle** (East US / Central US, pay-as-you-go list
+prices, USD, rounded):
+
+| New/changed item | Basis | Monthly delta |
+|---|---|---|
+| **Dev PostgreSQL Flexible Server** — `Standard_B1ms` Burstable compute | ~$0.017/hr × 730 hr, always on (Postgres cannot scale to zero) | **~$12–13** |
+| **Dev Postgres storage** — 32 GiB | ~$0.115/GiB/month; backup ≤ storage size is included | **~$3.7** |
+| **Dev Container Apps compute** — `todo-api-dev` + `todo-web-dev`, both `minReplicas: 0`, 0.25 vCPU / 0.5 GiB | The Consumption free grant (180,000 vCPU-s + 360,000 GiB-s + 2M requests) is **per subscription per month** and is **already fully consumed by the production `todo-web` at `minReplicas: 1`** — so dev usage bills from the first second. At ~40 active hours/month across both apps: ~72,000 vCPU-s × $0.000024 + ~144,000 GiB-s × $0.000003 | **~$2** (range $0–5; **$0 when idle**) |
+| **Dev Container Apps Environment** (`cae-todo-demo-dev`) | Consumption-plan managed environments have **no standing charge** | **$0** |
+| **Dev Application Insights component** (`appi-todo-demo-dev`) | Workspace-based components have no standing fee; ingestion bills to the shared workspace | **$0 fixed** |
+| **Additional Log Analytics ingestion** (dev app logs + dev traces) | `PerGB2018` ~$2.76/GiB beyond the free grant, capped at 1 GiB/day for the workspace as a whole | **~$0–3** |
+| **Shared ACR** | Basic includes 10 GiB; extra tags fit comfortably | **$0** |
+| **Shared resource group / Entra identities / role assignments / OIDC** | Free | **$0** |
+| **TOTAL DELTA** | | **≈ +$18–22 / month** |
+
+**New projected total: ~$43–59/month** (idle floor ~$37–42/month, since dev
+compute is $0 at idle but the dev Postgres server is not).
+
+**The delta is ~80% the dev PostgreSQL server.** If the user wants the dev
+environment but not this cost, the only meaningful lever is §15.4.5's rejected
+alternative (shared server, `tododb_dev`, ~$16–17/month saved) — with the
+isolation losses and the mandatory hardening SQL documented there. Two smaller
+levers, both available at any time without redesign:
+
+- **Stop the dev Postgres server when unused.**
+  `az postgres flexible-server stop -g rg-todo-demo -n pg-todo-demo-dev-cus01`
+  suspends compute billing (storage still bills). Azure auto-restarts a stopped
+  server after 7 days. Manual, or a scheduled workflow — **not automated this
+  cycle** (see Q2), because a stopped dev server would make `verify-dev` fail and
+  silently block every promotion.
+- **Delete and recreate the dev stack on demand.** `main.dev.bicep` makes the
+  whole dev environment reproducible in one deploy plus Phases B–D, so a team
+  that develops in bursts can tear it down between cycles.
+
+**This cost must be surfaced explicitly for user approval at the devops PROPOSE
+step, in `changes.md`, before anything is provisioned.**
+
+### 15.14 Explicitly out of scope
+
+- **Any application code change.** No `TodoApi` change, no frontend change, no
+  new configuration key, no schema/migration. Including the runtime-config
+  refactor of `VITE_API_BASE_URL` (Q3) and any App Insights sampling key.
+- **Any change to the production runtime.** Production Container Apps, their env
+  vars, replica counts, `pg-todo-demo-cus01`, `appi-todo-demo`, and
+  `infra/main.bicep` are all untouched. The only production-facing change is
+  *when* and *how* `todo-api`/`todo-web` receive a new image.
+- **A third environment** (staging/QA/UAT). Two environments is the requirement.
+- **VNet injection, private endpoints, or internal-only ingress** for either
+  environment — contradicts the standing no-VNet cost posture (§11.9).
+- **Key Vault.** Still not instantiated; nothing in the dev stack is a secret an
+  Entra identity cannot replace (§13.6).
+- **Copying, seeding, anonymizing or restoring production data into dev.**
+- **A second Log Analytics workspace** — forbidden by the standing constraint;
+  escalation path documented in §15.4.2.
+- **Automated dev teardown/scheduling** (start/stop of dev Postgres, nightly
+  destroy) — see Q2.
+- **Automating any identity, RBAC, in-database principal, GitHub secret/variable/
+  environment, or branch-protection change** — permanently human-run (§11.6).
+- **Blue/green or canary rollout, automated production rollback, and load or
+  security testing in dev.** `verify-dev` is a smoke test, not a test suite.
+- **Custom domains, TLS certificates, or a CDN** for either environment.
+- **Disabling `passwordAuth` on either Postgres server** (§14 standing
+  constraint).
+
+### 15.15 Assumptions, risks and open questions
+
+**Assumptions (decided — implement against these; do not re-litigate):**
+
+1. "In the same azure resource" means **the same resource group** `rg-todo-demo`.
+   Every dev resource is created there. No new resource group, no new
+   subscription.
+2. Dev runs the **same infrastructure shape** as prod, at the **same SKUs**
+   (B1ms / Consumption / Basic / PerGB2018) — the point of a dev environment is
+   fidelity. The only deliberate divergences are `minReplicas: 0` on both dev
+   apps and the absence of any availability/backup guarantee.
+3. The **East US Postgres offer restriction** that pushed production to Central
+   US still applies, so the dev server is created in **Central US**. If a dev
+   deploy fails with an offer restriction, that assumption held; if a future
+   engineer finds East US now works, do **not** move production for symmetry.
+4. The Entra administrator for the dev Postgres server is the **same human
+   identity** as production's (objectId `ee31140f-3164-439c-8fa9-9f7e5dbd1b2c`,
+   tenant `6ce2ff72-…`). Reusing the human admin is correct; reusing an
+   *application* identity across servers would not be.
+5. `github.sha` is a suitable, unique, immutable image tag for both
+   environments, and the ACR retains it long enough for a promotion to occur
+   (minutes-to-days).
+6. GitHub Actions is the system of record; `azure-pipelines.yml` is maintained
+   for parity but is not wired (§11.10).
+
+**Risks to record in `changes.md`:**
+
+- **Cost.** +$18–22/month, ~80% of it the dev Postgres server. Requires explicit
+  user approval before provisioning.
+- **Shared Log Analytics daily cap.** Dev ingestion can exhaust the shared 1
+  GB/day cap and silently blind **production** telemetry for the rest of that UTC
+  day. Detection query and remediation levers in §15.4.2.
+- **GitHub plan/visibility may block the approval gate.** If the repo is private
+  on GitHub Free, `environment:`-based required reviewers are unavailable and
+  Plan B (§15.9.5) must be implemented instead. **Verify before writing the
+  workflow.**
+- **OIDC subject mismatch is the most likely first-run failure.** Declaring
+  `environment: dev` changes the federated-credential subject from the branch
+  form to `…:environment:dev`. Without that credential, `deploy-dev` fails at
+  `azure/login` with an opaque `AADSTS700213`. Phase E step 4.
+- **Bicep duplication drift.** `main.bicep` and `main.dev.bicep` can diverge over
+  time. Mitigated by both calling the same modules (all real resource shape lives
+  in `infra/modules/`) and by CI linting both. Any future module change must be
+  validated against both templates.
+- **Frontend image is rebuilt rather than promoted** (§15.9.4) — low residual
+  risk, removed permanently by Q3.
+- **Dev cold starts.** Both dev apps at `minReplicas: 0` mean the first request
+  after idle is slow; `verify-dev` must retry with backoff or it will produce
+  flaky promotion failures.
+- **Production is now deployed less often but more deliberately.** The team must
+  actually merge `develop` → `main`; a stale `main` is the new failure mode.
+
+**Open questions (do not block implementation — recommendations given):**
+
+- **Q1. Is `matvi/todo-claude-multiagent` public or private, and on which plan?**
+  Determines Plan A vs. Plan B (§15.9.5) and whether branch protection (§15.12)
+  is even configurable. *Recommendation:* the human runs
+  `gh repo view --json visibility` before the devops stage begins and records the
+  answer in `changes.md`. This is also the moment to finally verify/enable the
+  branch protection that `.pipeline/infra.md` has flagged as missing twice.
+- **Q2. Should the dev Postgres server be auto-stopped outside working hours to
+  save ~$12/month?** *Recommendation:* **no, not this cycle.** A stopped server
+  makes `verify-dev` fail and silently blocks every promotion; the failure mode
+  costs more than the saving. Revisit only with a scheduled workflow that also
+  *starts* the server at the beginning of `deploy-dev` and waits for readiness.
+- **Q3. Should the frontend move to runtime configuration of `VITE_API_BASE_URL`?**
+  *Recommendation:* **yes, as the next application cycle.** It makes `todo-web`
+  byte-for-byte promotable, closes the §15.9.4 caveat, and removes the
+  backend-before-frontend ordering constraint that has constrained every pipeline
+  in this project. It is an app change and therefore not in this infrastructure
+  cycle.
+- **Q4. Should both ACA environments move app logs from `destination:
+  log-analytics` (workspace shared key) to `destination: azure-monitor`
+  (diagnostic setting, no shared key)?** *Recommendation:* worth a follow-up for
+  full Entra purity, applied to **both** environments together so dev keeps
+  matching prod. Not now — the key is already never committed or exposed
+  (§15.4.2), so this is hardening, not a defect.
+- **Q5. Should `verify-dev` grow into a real integration/E2E suite (Playwright
+  against the dev frontend)?** *Recommendation:* yes eventually — the dev
+  environment is what makes it possible, and the gate is the natural place to run
+  it. Out of scope here; §15.9.3's four smoke checks are the minimum that proves
+  Entra DB auth, migrations, the write path and the baked API URL.
+
+### 15.16 Acceptance criteria for this cycle
+
+1. `infra/main.dev.bicep` + `infra/main.dev.parameters.json` exist, compile and
+   lint clean, reuse the four existing modules unchanged, reference the shared
+   ACR and workspace as `existing`, and declare a **second
+   `Microsoft.App/managedEnvironments`** (`cae-todo-demo-dev`) that both dev
+   Container Apps attach to.
+2. `infra/main.bicep`, `infra/modules/*`, and every production resource are
+   **byte-for-byte unchanged** by this cycle.
+3. `main.dev.bicep` contains **no** `Password=`/`Passfile=` in any connection
+   string, **no** Container Apps secret, **no** `Postgres__UseEntraAuth`, and
+   passes the admin password only as an `@secure()` parameter. No real credential
+   value appears in any `.md`, `.json` or `.bicep` file in the repo.
+4. `.github/workflows/cd.yml` triggers on `develop` **and** `main`, and its
+   `deploy-prod` job `needs:` both `deploy-dev` and `verify-dev`, carries
+   `if: github.ref == 'refs/heads/main'` and `environment: production` (or Plan B
+   is implemented and the reason recorded in `changes.md`).
+5. `deploy-prod` **does not rebuild `todo-api`** — it asserts
+   `todo-api:<sha>` exists in ACR and re-points the production app at that tag.
+6. `verify-dev` runs without any Azure credential and fails the run (blocking
+   promotion) if `/health`, `GET /api/todos`, the create/delete round-trip, or
+   the frontend check fails.
+7. `ci.yml` runs on PRs to both branches, lints both Bicep templates, gains
+   `guard-promotion-source`, and remains credential-free.
+8. `azure-pipelines.yml` mirrors the three-stage dev → verify → prod flow.
+9. `infra/README.md` documents Phases A–F (§15.11) verbatim and clearly labeled
+   **human-run**, including the OIDC subject table.
+10. `changes.md` states the **+$18–22/month** cost delta, the shared-log-cap
+    risk, and the Plan A/Plan B decision, for explicit user approval.
+11. **No agent has provisioned anything**, created any identity, federated
+    credential, role assignment, GitHub secret/variable/environment, branch
+    protection rule, or in-database principal, and no agent has pushed to `main`
+    or `develop` (PROPOSE mode, §11.8).

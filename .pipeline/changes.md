@@ -964,3 +964,229 @@ decision, not something this change can or should pre-empt.
   `Azure.Monitor.OpenTelemetry.AspNetCore` 1.6.0, `Swashbuckle.AspNetCore` 10.2.3,
   `Microsoft.AspNetCore.OpenApi` 10.0.0. No package was added, removed, or upgraded here,
   and I am aware of no CVE affecting these versions.
+
+---
+
+# Implementation Changes — Dev environment + dev→prod promotion (specs §15, 2026-08-06)
+
+Branch: `pipeline/dev-environment`.
+
+## Summary
+
+**No application code was changed this cycle. This cycle is infra-only.**
+
+I read `.pipeline/specs.md` §15 in full and audited `backend/` and `frontend/`
+against it. The application is already environment-agnostic: every value that
+differs between dev and prod (`ConnectionStrings__TodoDb`,
+`Cors__AllowedOrigins__0`, `APPLICATIONINSIGHTS_CONNECTION_STRING`,
+`VITE_API_BASE_URL`) is supplied from outside the code — Container App env vars
+at runtime for the backend, a Docker build-arg for the frontend. There is no
+environment name, resource name, FQDN or subscription/tenant identifier compiled
+into any production source file, and no code path that assumes a single
+deployment target.
+
+This matches the spec's own instruction: §15.14 lists "**Any application code
+change** … no new configuration key, no schema/migration" as explicitly out of
+scope, and §15.7/§15.8 state there is no data-model or API-surface impact. So
+the expected answer and the verified answer agree. I deliberately did **not**
+invent changes in order to have something to report.
+
+The deliverables for §15 (`infra/main.dev.bicep`,
+`infra/main.dev.parameters.json`, `.github/workflows/cd.yml`, `ci.yml`,
+`azure-pipelines.yml`, `infra/README.md`) belong to the devops agent and were
+left untouched, per this cycle's instructions and PROPOSE mode (§11.8).
+
+## Files changed/created
+
+| File | Purpose |
+|---|---|
+| `.pipeline/changes.md` | This record. **The only file I modified.** |
+
+No file under `backend/`, `frontend/`, `infra/`, `.github/workflows/` or
+`azure-pipelines.yml` was created, modified or deleted. `git status` shows no
+source changes from this cycle.
+
+## Audit performed — the three specific questions asked
+
+### 1. Hardcoded environment name, resource name, or single-target assumption? — None found.
+
+| Area | Finding |
+|---|---|
+| `Program.cs` | Reads `Cors:AllowedOrigins` from config; registers telemetry and the DbContext via extension methods that take `IConfiguration`. No literal FQDN, resource or environment name. |
+| `Data/TodoDbContextRegistration.cs` | Host, database **and Postgres username** all come from `ConnectionStrings:TodoDb`. This is what makes the §15.3 four-way identity invariant work per-environment with zero code change: dev simply gets `Username=todo-api-dev` in its env var and the same binary authenticates as the dev managed identity. TLS is force-upgraded to `Ssl Mode=Require` for any non-loopback host regardless of environment. |
+| `Data/TodoDbContextFactory.cs` | Design-time only; env var with a passwordless localhost fallback. Not used at runtime. |
+| `Observability/TelemetryRegistration.cs` | Only literal is the SDK-standard key name `APPLICATIONINSIGHTS_CONNECTION_STRING`. The exporter is added only when that value is present, so dev/prod/local all work from the same binary. |
+| `appsettings.json` | `ConnectionStrings:TodoDb` empty, `Cors:AllowedOrigins` empty array — deliberately environment-free. |
+| `appsettings.Development.json` | Localhost-only values for local dev. Never shipped as an Azure environment. |
+| `frontend/src/api.ts` | `import.meta.env.VITE_API_BASE_URL`, trailing slash trimmed. No hardcoded API host. |
+| `frontend/nginx.conf`, `Dockerfile` | Port 8080 + SPA fallback only; `VITE_API_BASE_URL` arrives as a build-arg. |
+| Production Azure identifiers | The only occurrences of production server names in app code are **test-fixture string literals** in `backend/tests/TodoApi.Tests/*` (tester-owned files, used as realistic connection-string parse inputs). They exercise no environment-specific behavior. |
+
+One cosmetic observation, deliberately **not** changed: the "Username is
+missing" exception message in `TodoDbContextRegistration.BuildEntraConnectionString`
+says "*in Azure, the `todo-api` managed identity's role*". That is prose in an
+error hint, not behavior — it does not couple the code to production. Editing it
+would be an unnecessary code change forbidden by §15.14 and would risk breaking
+a tester assertion for no functional gain. Flagged here for the reviewer.
+
+### 2. App Insights "cloud role name" — no change needed, and dev/prod telemetry is *already* distinguishable two ways.
+
+§15 does **not** call for a cloud role name or any per-environment telemetry
+tagging key — I searched the whole spec for `cloud role` / `RoleName` /
+`service.name` and there are no matches. §15.4.3 makes the separation mechanism
+explicit instead: **dev gets its own Application Insights component**
+(`appi-todo-demo-dev`), so dev telemetry never lands in the production component
+at all. That is a stronger separation than a role-name tag, and it is what the
+per-component `Monitoring Metrics Publisher` identity grant in §15.6 depends on.
+
+Beyond that, I verified empirically that `cloud_RoleName` will *also* be correct
+per environment with no code change. `Azure.Monitor.OpenTelemetry.AspNetCore`
+**1.6.0** (the pinned version) ships an Azure Container Apps resource detector —
+I confirmed the literals `CONTAINER_APP_NAME`, `CONTAINER_APP_REPLICA_NAME`,
+`CONTAINER_APP_REVISION` and `azure_container_apps` are present in the shipped
+assembly, mapped onto `service.name` / `service.instance.id` / `service.version`.
+Container Apps injects `CONTAINER_APP_NAME` into every replica, so telemetry
+resolves to `cloud_RoleName = todo-api` in production and `todo-api-dev` in dev
+automatically, because the Container App names differ (§15.3). Adding a
+config-driven role name would therefore introduce a new configuration key
+(forbidden by §15.14) in order to hardcode a value the platform already supplies
+correctly.
+
+Console logs are separable independently via the `EnvironmentName_s` /
+`ContainerAppName_s` columns in the shared Log Analytics workspace (§15.4.2).
+
+### 3. CORS — already multi-origin-capable; no code change needed.
+
+`Program.cs` binds `builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()`
+and passes the result to `policy.WithOrigins(...)`. That is the standard .NET
+array-binding path, so it already accepts `Cors__AllowedOrigins__0`,
+`__1`, `__2`, … from environment variables — the app supports N origins today
+and has since cycle 1. It also degrades safely: a missing or empty section yields
+`[]`, i.e. **deny by default**, never a wildcard.
+
+§15.8 requires exactly the opposite of multi-origin: each environment's backend
+must allow **only its own** frontend origin ("Neither allow-list ever contains
+the other environment's origin"). So the correct implementation is precisely
+what exists — one plain env var per environment, set by CD
+(`--set-env-vars "Cors__AllowedOrigins__0=https://<that env's web FQDN>"`).
+No code change; infra-level config only.
+
+One operational note for the devops agent (not an app defect): because indices
+are independent config entries, if `Cors__AllowedOrigins__1` were ever set on an
+app, later setting only `__0` would **not** remove `__1`. Today nothing sets
+index 1, so this is only a caution against future multi-origin experiments.
+
+## Deviations from specs.md
+
+None. The spec said no application change was required; the audit confirmed it,
+and none was made.
+
+## Assumptions made
+
+1. **"Infra-only" includes the tester-owned test projects.** I did not add or
+   modify tests — §15.14 excludes app changes, and test authorship belongs to the
+   tester agent. The existing suites already cover the environment-agnostic
+   seams (connection-string normalization, telemetry registration with and
+   without a connection string).
+2. **`changes.md` is cumulative.** Prior cycles append rather than overwrite, and
+   there is precedent for a no-code-change cycle (the 2026-07-24 CI/CD-readiness
+   pass), so I appended this section rather than replacing the file.
+3. **Verifying the Container Apps resource detector by inspecting the shipped
+   assembly is sufficient evidence**, since no live dev environment exists yet.
+   If the reviewer wants runtime proof, it is one Log Analytics query after the
+   first dev deploy (see "Known limitations").
+
+## Known limitations / TODOs
+
+- **Unverifiable until dev exists.** That `cloud_RoleName` actually resolves to
+  `todo-api-dev` can only be confirmed after the devops agent's Bicep is deployed
+  by a human. Post-deploy check:
+  `AppRequests | where TimeGenerated > ago(1h) | summarize count() by AppRoleName`
+  against `appi-todo-demo-dev`. If the detector does not fire, the remedy is
+  still infra-level first (set the standard `OTEL_SERVICE_NAME` env var on the
+  dev Container App) — no code change needed even then.
+- **§15.9.4 frontend promotion caveat is unresolved by design.** `todo-web` is
+  rebuilt per environment rather than promoted, because `VITE_API_BASE_URL` is
+  baked at build time. The permanent fix (Q3 — runtime config via a generated
+  `config.js`) **is** an application change and is correctly deferred to a future
+  application cycle. Nothing in this cycle reduces that residual risk; it is
+  restated here so the reviewer sees it acknowledged rather than missed.
+- **Local backend test execution needs a side-by-side SDK.** The machine-default
+  `dotnet` is 9.0.302, which cannot target `net10.0`; the .NET 10 SDK lives at
+  `C:\Users\ingda\dotnet10` (unchanged from prior cycles' note).
+
+## How to run it
+
+Nothing to build or deploy for this cycle. Regression verification performed:
+
+```bash
+# Backend — .NET 10 SDK is installed side-by-side on this machine
+C:/Users/ingda/dotnet10/dotnet.exe test backend/TodoApi.sln -c Release
+#   -> Passed!  Failed: 0, Passed: 81, Skipped: 0, Total: 81
+
+# Frontend
+cd frontend && npm test -- --run
+#   -> Test Files 6 passed (6) | Tests 37 passed (37)
+```
+
+Both suites pass on an unmodified working tree (`git status` shows no source
+changes), which is the evidence that the application needed no delta for §15.
+
+## Security & PCI DSS scope
+
+- **PCI DSS: out of scope, unchanged.** This is a Todo application. It stores
+  only `id`, `title`, `description`, `is_completed`, `created_at`, `updated_at`
+  (§2). There is no payment flow, no payment-processor integration, no
+  cardholder data, no PAN/CVV/track data anywhere in the system — nothing to
+  tokenize and no cardholder data environment. Adding a second deployment
+  environment does not change that. If a payment feature is ever added, the
+  correct pattern is a PCI-compliant processor's hosted fields / client-side
+  tokenization so that only a token ever reaches these servers.
+- **Secrets: this cycle introduces zero application runtime secrets, and I wrote
+  none anywhere.** No password, key, connection string or token value appears in
+  any file I touched. The dev Postgres admin password (`PGADMIN_PASSWORD_DEV`,
+  §15.6) is a deploy-time GitHub secret consumed by an `@secure()` Bicep
+  parameter — it never enters the repo, this file, or the application.
+- **Entra-first, verified by inspection, unchanged by the dev/prod split.** App →
+  Postgres uses an Entra token via `DefaultAzureCredential` + Npgsql
+  `UsePasswordProvider`, with **no password code path in existence** (§14) — so a
+  dev environment structurally cannot acquire one. App → Application Insights
+  authenticates with the managed identity (`options.Credential`), not the
+  connection string's embedded key. Apps → ACR use `AcrPull` on the
+  system-assigned identity. CI → Azure uses OIDC federation. No Key Vault is
+  needed because nothing left over is a secret.
+- **Transport security: no plaintext path, including dev.**
+  `BuildEntraConnectionString` force-upgrades `SslMode` to `Require` for any
+  non-loopback host, so the dev connection is TLS-protected by code even if its
+  configuration were wrong; only loopback (the local no-TLS dev container) is
+  exempt. ACA ingress is HTTPS with `allowInsecure: false`; §15.9.3's dev smoke
+  probes are all `https://`.
+- **OWASP review of the dev environment's *added* attack surface** — dev's
+  backend and frontend are publicly reachable (§15.10 rejects internal ingress),
+  and the app has **no authentication by design** (§7/§8). Dev therefore exposes
+  a second unauthenticated public CRUD API. Risk accepted for these reasons,
+  which the reviewer should confirm they agree with:
+  - *Broken access control* — dev holds only synthetic, disposable data
+    (§15.7: no production data is ever copied into dev), and CORS on
+    `todo-api-dev` allows only the dev frontend origin, never production's.
+  - *Blast radius* — dev has its **own** Postgres server and its **own** managed
+    identity, and that identity is not a `pgaadauth` principal on the production
+    server at all (§15.4.5), so a compromised dev app cannot reach production
+    data. Separate Container Apps Environments mean there is no internal-DNS path
+    to production compute either.
+  - *Injection* — unchanged: EF Core parameterized queries only, no raw SQL.
+  - *Sensitive data exposure in logs* — unchanged: the startup diagnostic logs
+    host/database/username only; the Entra token and any stripped password are
+    never logged, and a test asserts a password value never reaches a log entry.
+  - **Risk I could not close from application code:** the shared Log Analytics
+    workspace has a 1 GB/day ingestion cap that dev now shares with production
+    (§15.4.2). Dev noise can silently blind production telemetry — an
+    *insufficient logging/monitoring* failure mode — for the remainder of a UTC
+    day. Mitigation is operational (detection query, then raise the cap),
+    documented in the spec, and out of application scope.
+- **Dependency versions (unchanged this cycle, none added):** `Azure.Identity`
+  1.21.0, `Azure.Monitor.OpenTelemetry.AspNetCore` 1.6.0,
+  `Microsoft.EntityFrameworkCore` 10.0.0,
+  `Npgsql.EntityFrameworkCore.PostgreSQL` 10.0.0, `Npgsql.OpenTelemetry` 10.0.3,
+  `Microsoft.AspNetCore.OpenApi` 10.0.0, `Swashbuckle.AspNetCore` 10.2.3. I am
+  aware of no CVE affecting these versions.

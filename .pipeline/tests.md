@@ -1,254 +1,261 @@
-# Test Report — Entra-ONLY Postgres auth for the application (specs §14)
+# Test Report — Dev environment + dev→prod promotion (specs §15)
 
 ## Verdict: PASS
 
-Branch: `pipeline/entra-passwordless-connection-string`. This report supersedes
-all prior `.pipeline/tests.md` cycles (per process, this file is overwritten
-each cycle). Scope: `.pipeline/specs.md` §14 (the current cycle) as implemented
-in the "Implementation Changes — Entra-ONLY Postgres auth for the application
-(2026-08-06)" entry of `.pipeline/changes.md`.
+Branch: `pipeline/dev-environment`. This report supersedes all prior
+`.pipeline/tests.md` cycles (overwritten each cycle, per process). Scope:
+`.pipeline/specs.md` §15 as implemented in the "Implementation Changes — Dev
+environment + dev→prod promotion (specs §15, 2026-08-06)" entry of
+`.pipeline/changes.md`.
+
+**Unusual cycle**: the engineer's conclusion for §15 is that **zero
+application code changes are required** — §15.14 explicitly puts "any
+application code change" out of scope, and §15.7/§15.8 state there is no
+data-model or API-surface impact. `git status` confirms only `.pipeline/*`
+docs were touched (`architecture-memory.md`, `changes.md`, `specs.md` — all
+additions, no deletions). Per the assigned task, I independently verified
+this conclusion rather than trusting it, then ran the full existing test
+suite as a regression baseline ahead of the upcoming infra work.
 
 ---
 
-## What was verified
+## 1. Independent verification of "no code change needed"
 
-### 1. Build & full existing suite
+I re-derived the same three checks the engineer performed, against the
+actual current source (not against the engineer's narrative), plus a general
+sweep for anything they might have missed.
+
+### 1a. Hardcoded environment/resource names or single-target assumptions
+
+- `backend/src/TodoApi/Program.cs` — confirmed `Cors:AllowedOrigins` is read
+  from `IConfiguration` (`GetSection("Cors:AllowedOrigins").Get<string[]>()`,
+  defaulting to `[]`), and the DbContext/telemetry registrations are called
+  through `IConfiguration`-taking extension methods. No literal FQDN,
+  resource name, or environment name in this file.
+- `backend/src/TodoApi/Data/TodoDbContextRegistration.cs` — read in full.
+  Host, database, and Postgres `Username` all come from
+  `ConnectionStrings:TodoDb` exclusively; nothing is derived from a resource
+  or environment name in code. This is exactly what makes the §15.3
+  four-way identity invariant (Container App name == MI name == `pgaadauth`
+  role == connection-string `Username=`) work per-environment with zero code
+  change: dev supplies `Username=todo-api-dev`, prod supplies `Username=todo-api`,
+  same binary either way.
+- `backend/src/TodoApi/Observability/TelemetryRegistration.cs` — the only
+  literal is the SDK-standard key `APPLICATIONINSIGHTS_CONNECTION_STRING`;
+  the exporter is gated on that value being present/absent, not on any
+  environment name.
+- `frontend/src/api.ts` — `BASE_URL` comes from
+  `import.meta.env.VITE_API_BASE_URL` only (with a safe `?? ''` fallback and
+  trailing-slash trim). No hardcoded host.
+- Repo-wide grep of `backend/src` and `frontend/src` for
+  `todo-api|todo-web|cae-todo-demo|lemoncliff|pg-todo-demo|rg-todo-demo|
+  localhost:5173|localhost:8080` turned up exactly two hits, both harmless
+  and non-functional:
+  - `backend/src/TodoApi/Dockerfile:2` — an illustrative comment
+    (`# From repo root: docker build ... -t todo-api ./backend`), not
+    executed code.
+  - `backend/src/TodoApi/Data/TodoDbContextRegistration.cs` — the
+    "Username is missing" exception message's prose says "in Azure, the
+    `todo-api` managed identity's role" as a human-facing hint. It is static
+    text thrown regardless of which environment is actually running (dev or
+    prod); it does not gate any behavior on the literal string `todo-api`
+    and does not affect dev's connection path. The engineer flagged this
+    same item in `changes.md` and declined to touch it (editing a passing
+    error-message string would itself be an unrequested code change under
+    §15.14). I agree with that call.
+  - Confirmed `Postgres__UseEntraAuth` / `Postgres:UseEntraAuth` does not
+    exist anywhere in `backend/src` as a live config key (one doc-comment
+    mention of its historical deletion in the same registration file) — so
+    dev's Bicep omitting that key (§15.5) has nothing to bind to, which is
+    correct and consistent.
+- **Conclusion: confirmed.** No hardcoded environment/resource identifier
+  gates any runtime behavior in `backend/` or `frontend/`.
+
+### 1b. Application Insights cloud role naming — auto-differentiates per environment, no code change
+
+- `backend/src/TodoApi/TodoApi.csproj` pins
+  `Azure.Monitor.OpenTelemetry.AspNetCore` to **1.6.0** exactly as
+  `changes.md` claims.
+- I independently inspected the installed NuGet package assemblies (not
+  just trusted the claim) — the machine already had 1.6.0 restored at
+  `C:\Users\ingda\.nuget\packages\azure.monitor.opentelemetry.aspnetcore\1.6.0\lib\net10.0\Azure.Monitor.OpenTelemetry.AspNetCore.dll`
+  and its dependency `Azure.Monitor.OpenTelemetry.Exporter` 1.8.3. Since
+  .NET string literals are UTF-16LE in the IL string heap (a plain UTF-8
+  grep finds nothing), I decoded UTF-16LE candidate strings from the raw
+  assembly bytes with a small Python script and confirmed these literals
+  are genuinely present in `Azure.Monitor.OpenTelemetry.AspNetCore.dll`
+  1.6.0:
+  `CONTAINER_APP_NAME`, `CONTAINER_APP_REPLICA_NAME`, `CONTAINER_APP_REVISION`,
+  `CONTAINER_APP_JOB_NAME`, `CONTAINER_APP_JOB_EXECUTION_NAME`,
+  `azure_container_apps`, alongside the OpenTelemetry resource keys
+  `service.name`, `service.instance.id`, `service.version`,
+  `service.namespace` in the same assembly. This corroborates that the
+  distro ships an Azure Container Apps resource detector that reads the
+  platform-injected `CONTAINER_APP_NAME`/`CONTAINER_APP_REVISION`/
+  `CONTAINER_APP_REPLICA_NAME` env vars (which Azure Container Apps sets
+  automatically per replica, and which differ by construction between
+  `todo-api` and `todo-api-dev` per §15.3's naming convention) and maps them
+  onto `service.name`/`service.version`/`service.instance.id` — which is
+  what becomes `cloud_RoleName` in Application Insights.
+- I also confirmed §15 itself does not require a cloud-role-name or
+  `service.name` configuration key (grepped the full spec text — no
+  `cloud role` / `RoleName` / `service.name` requirement anywhere in §15),
+  and that the primary separation mechanism §15.4.3 actually specifies is a
+  **separate Application Insights component** (`appi-todo-demo-dev`), which
+  is a stronger and infra-level guarantee that doesn't depend on the
+  resource-detector behavior at all.
+- **Conclusion: confirmed.** No application code change is needed for
+  telemetry separation; both the primary mechanism (separate AI component,
+  infra-level) and the secondary mechanism (automatic `cloud_RoleName` via
+  the already-present resource detector) require zero backend changes. The
+  actual runtime value of `cloud_RoleName` inside a live dev Container App
+  cannot be observed until the devops agent's Bicep is deployed — this is
+  correctly flagged as a post-deploy check in `changes.md`, not something
+  testable pre-deploy.
+
+### 1c. CORS — already supports one-origin-per-environment via config
+
+- Confirmed directly in `Program.cs`: `WithOrigins(allowedOrigins)` where
+  `allowedOrigins` is bound from `Cors:AllowedOrigins` (array config
+  section), which is the standard ASP.NET Core env-var array-binding path
+  (`Cors__AllowedOrigins__0`, `__1`, …). A missing/empty section binds to
+  `[]` — deny-by-default, never a wildcard.
+- §15.8 requires each environment's backend to allow **only its own**
+  frontend origin. That is exactly what setting a single
+  `Cors__AllowedOrigins__0` env var per Container App (already the existing
+  CD pattern for prod, reused for dev) achieves — no new code path needed,
+  because the existing array-binding already supports N origins and dev
+  only ever needs N=1.
+- **Conclusion: confirmed.**
+
+### 1d. General sweep beyond the three specific questions
+
+- `git status` / `git diff --stat` show only `.pipeline/architecture-memory.md`,
+  `.pipeline/changes.md`, `.pipeline/specs.md` modified (all insertions, no
+  deletions) — no file under `backend/`, `frontend/`, `infra/`,
+  `.github/workflows/`, or `azure-pipelines.yml` was touched this cycle, as
+  claimed.
+- §15.14 ("Explicitly out of scope") lists "Any application code change" —
+  including the `VITE_API_BASE_URL` runtime-config refactor (Q3) and any App
+  Insights sampling key — as out of scope for this cycle. The engineer
+  correctly did not attempt either.
+- §15.7/§15.8 state no data-model or API-surface impact — confirmed no
+  `Migrations/`, `Models/`, `Dtos/`, or `Controllers/` changes in the diff
+  (there is no diff at all under `backend/`).
+
+**Overall independent verdict on the "no code change" conclusion: CORRECT.**
+I found no gap between what §15 requires of the application and what the
+application already does. All three specific claims were re-derived from
+source/assembly inspection, not taken on the engineer's word.
+
+---
+
+## 2. Full existing test suite — regression baseline
+
+Run from a clean, unmodified working tree (only `.pipeline/*` docs differ
+from the last-merged state).
+
+### Backend
 
 ```
-cd backend && dotnet build -c Release   → Build succeeded, 0 Warning(s), 0 Error(s)
-dotnet test  -c Release                 → Passed!  Failed: 0, Passed: 81, Skipped: 0, Total: 81
+cd backend
+export PATH="/c/Users/ingda/dotnet10:$PATH"   # side-by-side .NET 10 SDK, per prior-cycle env note
+dotnet --version                 → 10.0.302
+dotnet build TodoApi.sln -c Release
+  → Build succeeded. 0 Warning(s), 0 Error(s)
+dotnet test TodoApi.sln -c Release
+  → Passed! Failed: 0, Passed: 81, Skipped: 0, Total: 81
 ```
 
-All 81 tests pass, including the 9 pre-existing `EntraTokenPasswordProviderTests`
-(unchanged per §14.12, confirmed unchanged in the diff) and the fully rewritten
-`TodoDbContextRegistrationTests` (28 tests). The "Failed to apply database
-migrations at startup" lines seen in the console log during `ObservabilityTests`
-are the pre-existing, intentional, caught-and-logged behavior of `Migrate()`
-against the EF Core InMemory provider (it doesn't support `Migrate()`); they are
-not test failures — every test in that class reports Passed.
+Matches the count `changes.md` reported for this cycle (81/81) and the prior
+cycle's count — no regression, no test added or removed, consistent with
+"no code change."
 
-### 2. §14.10 test-by-test coverage check (all present, all passing)
+### Frontend
 
-I read `TodoDbContextRegistrationTests.cs` in full and cross-checked it against
-the explicit numbered list in specs §14.10:
+```
+cd frontend
+node --version   → v22.18.0
+npm --version    → 10.9.3
+npm ci           → added 177 packages, 0 errors (6 pre-existing dev-toolchain
+                    audit advisories, unrelated to this cycle, unchanged from
+                    prior cycles — not gated by `npm ci`/`npm test`)
+npm test -- --run
+  → Test Files  6 passed (6)
+  → Tests       37 passed (37)
+npm run build
+  → tsc && vite build succeeded, dist/ produced (148.08 kB JS, 2.44 kB CSS)
+```
 
-| Spec item | Test(s) present | Verdict |
+Matches the count `changes.md` reported (37/37) — no regression.
+
+**Result: full suite green, 118/118 tests passing (81 backend + 37
+frontend), clean baseline confirmed ahead of the devops/infra work coming
+next in this pipeline.**
+
+---
+
+## 3. Why no new test cases were written
+
+There is no new application functionality to test this cycle — §15 is an
+infrastructure/pipeline design extension, and its own acceptance criteria
+(§15.14) explicitly exclude application code changes. Writing tests against
+non-existent code would not satisfy this role's mandate ("assert real
+conditions, not just it didn't throw"); the meaningful verification for this
+cycle is the audit in §1 above (does the *existing* code already satisfy
+§15's per-environment requirements) plus the regression run in §2 (did
+nothing break). Both are documented in full above rather than invented as
+synthetic unit tests.
+
+The tests that **will** matter for §15 are the infra-level ones the spec
+itself defines as the promotion gate (§15.9.3 `verify-dev` job: `/health`,
+`GET /api/todos`, `POST`+`DELETE` round-trip, frontend FQDN bake-in check).
+Those are CD-workflow assertions against a live dev deployment, owned by the
+devops/CD stage, not unit/integration tests this role can author or run
+without that infrastructure existing yet.
+
+---
+
+## Coverage summary (mapped to specs.md §15)
+
+| §15 area | Covered how | Result |
 |---|---|---|
-| 1. Production password-shaped string does not throw | `BuildEntraAuthenticatedDataSource_WithProductionPasswordConnectionString_DoesNotThrow` | PASS — real regression test against the exact string from §14.1(a) |
-| 2. Same via DI, `NpgsqlDataSource` + `TodoDbContext` resolve | `AddTodoDbContext_WithPasswordBearingConnectionString_ResolvesDataSourceAndContext` | PASS |
-| 3-4. `Password=` / `pwd=` / `PASSWORD=` stripped | `BuildEntraConnectionString_StripsPasswordAndItsAliases` (3 cases) | PASS |
-| 5. `Passfile=` stripped | `BuildEntraConnectionString_StripsPassfile` | PASS |
-| 6. Missing `Username` → `InvalidOperationException` naming both `ConnectionStrings:TodoDb` and `Username` | `BuildEntraConnectionString_MissingUsername_Throws` (absent / empty / whitespace) | PASS |
-| 7. `Host`/`Port`/`Database`/`Trust Server Certificate`/unrelated keyword preserved | `BuildEntraConnectionString_PreservesAllOtherKeywords` (also covers `Command Timeout`, `Maximum Pool Size`) | PASS |
-| 8. Remote host + `Disable`/`Allow` → forced `Require` | `BuildEntraConnectionString_RemoteHostWithWeakSsl_ForcesRequire` | PASS |
-| 9. Remote host + `Require`/`VerifyFull`/`VerifyCA`/`Prefer`/omitted → unchanged | `BuildEntraConnectionString_RemoteHostWithAdequateSsl_LeavesItAlone` + `..._RemoteHostWithOmittedSsl_LeavesTheNpgsqlDefault` | PASS |
-| 10. Loopback exemption (`localhost`, `127.0.0.1`, also `LOCALHOST`, `::1`) | `BuildEntraConnectionString_LoopbackHostWithSslDisabled_StaysDisabled` | PASS |
-| 11. Idempotence | `BuildEntraConnectionString_IsIdempotent` | PASS |
-| 12. Exactly one `NpgsqlDataSource` singleton backs the `DbContext` | `AddTodoDbContext_RegistersExactlyOneDataSourceSingleton_BackingTheDbContext` | PASS |
-| 13. `Postgres:UseEntraAuth=true`/`false` changes nothing (flag is dead) | `AddTodoDbContext_LegacyUseEntraAuthFlag_HasNoEffect` (Theory: both values) | PASS |
-| 14. Blank/missing connection-string guard unchanged | `AddTodoDbContext_MissingConnectionString_ThrowsInvalidOperationException` / `_BlankConnectionString_...` | PASS |
-| 15. `EntraTokenPasswordProviderTests` still pass, unchanged | confirmed — file untouched in the diff, 9/9 pass as part of the 81 | PASS |
-| Additional: registration stays lazy (no credential/network work on mere registration) | `AddTodoDbContext_RegistrationIsLazy_NoDataSourceBuiltUntilResolved` | PASS |
-| Additional: startup logging, no secret leakage | 3 tests, see §3 below | PASS |
+| §15.7 no data-model impact | Diff inspection — no `Migrations/`/`Models/` changes | Confirmed, no impact |
+| §15.8 API surface impact ("none") | Diff inspection — no `Controllers/`/`Dtos/` changes; full backend test suite still 81/81 | Confirmed, no impact |
+| §15.6/§15.8 four-way identity invariant works per-environment from one binary | Source read of `TodoDbContextRegistration.cs` — `Username=` flows entirely from config | Confirmed |
+| §15.4.3 / cloud role naming, no code change needed | Assembly-level inspection of the pinned `Azure.Monitor.OpenTelemetry.AspNetCore` 1.6.0 package (UTF-16LE string extraction) | Confirmed — ACA resource-detector literals present |
+| §15.8 CORS strictly per-environment, one origin each | Source read of `Program.cs`'s CORS binding | Confirmed — existing array-binding supports it |
+| §15.14 "no application code change" | `git status`/`git diff --stat` — only `.pipeline/*` docs changed | Confirmed |
+| Regression (backend) | `dotnet build` + `dotnet test` on unmodified tree | 81/81 passed, 0 warnings/errors |
+| Regression (frontend) | `npm ci` + `npm test` + `npm run build` on unmodified tree | 37/37 passed, build clean |
 
-Also present, not separately numbered in §14.10 but required by §14.5:
-`BuildEntraConnectionString_UnparseableInput_ThrowsNamingTheConfigKey` (malformed
-input wrapped in `InvalidOperationException` naming the config key).
+## Gaps (not testable at this stage)
 
-### 3. Deep-dive: does the "no secret in logs" test actually assert anything real?
-
-Per the task's specific instruction, I inspected
-`BuildEntraAuthenticatedDataSource_LogsPrincipalAndWarnings_WithoutLeakingSecrets`
-line by line, not just its name:
-
-- It builds a data source from a connection string containing the literal
-  password value `Password=REDACTED` (the placeholder token itself, used as a
-  stand-in "secret value" for the test).
-- `RecordingLogger` is a real `ILogger` implementation that calls the actual
-  `Func<TState, Exception?, string> formatter` supplied by the structured-logging
-  call sites (`logger.LogInformation("... Username={Username}", ...)` etc.) and
-  stores the **fully rendered message string** — not the raw template, not a
-  boolean flag. This means the assertion inspects what would actually reach a
-  sink/exporter.
-- The production code (`LogStartupDiagnostics`) only ever passes `Host`,
-  `Database`, `Username`, and the *previous* `SslMode` enum value as format
-  arguments — the password/passfile value is never one of the substituted
-  arguments in any of the three possible log lines. I confirmed this by reading
-  `TodoDbContextRegistration.cs` lines 218-239 directly: no code path threads
-  `normalized.ConnectionString`, the raw input string, or any password-bearing
-  value into a log call.
-- `Assert.DoesNotContain(logger.Entries, e => e.Message.Contains("REDACTED"))`
-  therefore is not a tautology — it is checking the rendered output of real
-  logging calls against a value that (a) genuinely appears in the input to the
-  function under test and (b) would appear in the message if the production
-  code were changed to (incorrectly) interpolate the connection string or the
-  stripped password into a log line. I did **not** mutate
-  `TodoDbContextRegistration.cs` to confirm this by fault-injection — as a
-  tester I do not edit application source files, even temporarily, so this is a
-  static-analysis conclusion (verified by reading every call site of `logger.Log*`
-  in the file), not a runtime-proven mutation-kill. Given the code review found
-  no path where a password-bearing value is ever passed as a format argument,
-  the assertion is real (it exercises actual rendered log text against a value
-  that would appear if the production code regressed), but its sensitivity to a
-  hypothetical future regression is inferred from the source, not empirically
-  demonstrated by breaking and un-breaking the code.
-- Two companion tests further strengthen this: `..._CleanConnectionString_LogsInformationOnly`
-  (exactly one log entry when nothing needed correcting — proves the two warning
-  branches are genuinely conditional, not always firing) and
-  `..._NullLogger_DoesNotThrow` (the null-safety contract required by §14.5, so
-  tests/hosts without a logger don't crash).
-
-**Conclusion: the no-leak test is a real, falsifiable assertion**, not
-"it didn't throw."
-
-### 4. Config-file / dead-reference audit (repo-wide grep)
-
-Searched the whole repository (not just `backend/`) for `Postgres:UseEntraAuth`,
-`Postgres__UseEntraAuth`, and `UseEntraAuthKey`:
-
-- **Application code**: zero occurrences of `UseEntraAuthKey` and zero live
-  branches on `Postgres:UseEntraAuth` remain in `backend/src/TodoApi/`. The only
-  in-code mention is a rewritten test name/comment (`AddTodoDbContext_LegacyUseEntraAuthFlag_HasNoEffect`
-  and its XML-doc paragraph) and a doc comment in
-  `TodoDbContextRegistration.cs`'s class summary — both explicitly documenting
-  that the flag is *gone*, not using it.
-- **`infra/main.bicep`** still contains `Postgres__UseEntraAuth` (an env var on
-  `todo-api`) and **`infra/README.md`** still documents it. Per this cycle's
-  explicit scope statement (specs §14.1: *"infra/main.bicep env wiring... [is
-  covered]"*, but §14.8 assigns the actual Bicep edit to *"the devops agent —
-  author only, never apply"* as a distinct downstream step) and per the parent
-  task's explicit instruction, **this is expected, documented drift, not a
-  defect in this cycle's deliverable.** `changes.md`'s "Known limitations / TODOs"
-  section already flags it as devops's outstanding item (§14.8 item 1). I did
-  not flag it as a failure; noting it here only for completeness/traceability.
-- **`appsettings.json`**: the `"Postgres": { "UseEntraAuth": false }` block is
-  fully deleted (confirmed by reading the file — only `Logging`, `AllowedHosts`,
-  `ConnectionStrings`, `Cors` remain).
-- **`Program.cs`**: comment updated to "PostgreSQL DbContext. Entra /
-  managed-identity auth only (specs §14)." — no residual "Uses password auth by
-  default..." text.
-- No `Password=` literal remains in any committed application config: checked
-  `appsettings.Development.json`, `appsettings.json`, `docker-compose.yml`,
-  `.env.example`, `TodoDbContextFactory.cs`, `TodoApiFactory.cs`,
-  `ObservabilityTests.cs` — all passwordless, confirmed by direct read.
-
-### 5. `BuildEntraConnectionString` edge cases — additional scrutiny beyond the unit tests
-
-Independently reasoned through cases not explicitly enumerated in §14.10 to make
-sure the implementation's behavior is actually correct, not just internally
-self-consistent with its own tests:
-
-- **`pwd=` alias stripping**: `NpgsqlConnectionStringBuilder.Password` setter is
-  the canonical property backing both `Password` and `pwd` keywords in Npgsql's
-  keyword table, so setting `.Password = null` clears whichever alias was used
-  at parse time — confirmed via the passing `pwd=hunter2` theory case (test
-  re-parses via a **fresh** `NpgsqlConnectionStringBuilder`, so it is asserting
-  against the actual serialized output, not an in-memory object still holding
-  the alias).
-- **SslMode omitted on a remote host**: Npgsql's own default (`Prefer` in
-  Npgsql 10) is left untouched per the spec's literal rule (only `Disable`/
-  `Allow` are corrected) — this is a documented, reviewer-flagged risk in
-  `changes.md` (assumption 2: `Prefer` silently downgrades to plaintext if the
-  server refuses TLS) and is explicitly not something this cycle was asked to
-  change; the checked-in Azure Bicep always sets `Ssl Mode=Require` explicitly,
-  so it is unreachable in the deployed configuration. Correctly *not* silently
-  "fixed" beyond the spec's instructions.
-- **Case-insensitive loopback matching** (`LOCALHOST`) and the **bracketed
-  `[::1]` form** are both exercised/handled — `LOCALHOST` via the Theory test,
-  `[::1]` via the `IsLoopbackHost` implementation's explicit `Trim('[', ']')`
-  (code-read, no test targets the bracketed form directly — noted as a minor gap
-  below).
-- **Non-loopback IPv4 addresses that are not `127.0.0.1`** (e.g. a private
-  `10.x` address) are correctly *not* exempted (fail-safe direction, forces
-  TLS) — confirmed by reading `LoopbackHosts` array (`localhost`, `127.0.0.1`,
-  `::1` only, no wildcard/prefix matching).
-- **Malformed input** (`Host=db;NotARealKeyword=1`) throws via
-  `NpgsqlConnectionStringBuilder`'s constructor and is correctly re-wrapped —
-  confirmed the test expects `InvalidOperationException` naming
-  `ConnectionStrings:TodoDb`, matching §14.5 step 1's requirement.
-
-### 6. Regression check — nothing else broken
-
-- `git diff --stat` confirms only backend + local-dev + docs files changed; no
-  frontend files touched (matches `changes.md`'s "No frontend code changed").
-- Full existing controller/DTO/health/CORS test suite (the pre-§14 52 tests)
-  still passes unchanged as part of the 81/81 total — no regression from this
-  cycle's rewrite of `TodoDbContextRegistrationTests.cs`.
-
----
-
-## Test results summary
-
-| Suite | Passed | Failed | Skipped | Total |
-|---|---|---|---|---|
-| `TodoApi.Tests` (`dotnet test -c Release`) | 81 | 0 | 0 | 81 |
-
-Build: `dotnet build -c Release` → 0 Warning(s), 0 Error(s).
-
----
-
-## Gaps (explicitly not verifiable in this environment — matches §14.10's own scope limit)
-
-These are the same items `changes.md` and specs §14.10 already call out as
-requiring a live Azure environment or a human. I did not attempt to fake or
-mock around them, per instructions:
-
-1. **Real Entra token acquisition against Azure Postgres Flexible Server** — no
-   live server in this environment; the `EntraTokenPasswordProvider` tests
-   (unchanged, 9/9 passing) already cover the token-callback contract with a
-   fake credential, which is the maximum verifiable without Azure.
-2. **The Postgres AAD handshake / in-DB `pgaadauth` grants (§14.7)** — requires
-   a live server connection as the Entra admin; explicitly a human step.
-3. **`docker-compose.yml` `trust`-auth local container end-to-end behavior
-   (§14.6)** — I did not have Docker available to independently re-run the
-   engineer's empirical probe (Probes A/B in `changes.md`). The engineer's
-   documented method (counting-provider probe showing 0 password-provider
-   invocations under `trust`, plus a full `dotnet run` + CRUD round-trip) is
-   methodologically sound and specific enough to be credible, but I could not
-   independently reproduce it in this test pass. This is a **process gap**, not
-   a **defect** — flagging for transparency, not as a blocker.
-4. **The live cutover (§14.9)** — explicitly human-run, post-merge, against the
-   real `todo-api` Container App. `.pipeline/deployment-lessons-learned.md` §5a
-   (referenced by the spec as needing to be closed out) does not yet exist in
-   this repo; that is expected, since the live cutover has not been run yet.
-5. **`[::1]` bracketed-host loopback exemption** — implemented (`IsLoopbackHost`
-   strips `[` `]` before comparing) but not covered by a dedicated unit test
-   (only bare `::1` is tested). Low risk (same code path as `::1`), noting as a
-   minor coverage gap rather than a failure — does not change the PASS verdict.
-
-None of these gaps are testable without a live Azure subscription and are
-correctly deferred to the human-run procedures in specs §14.6/§14.7/§14.9, as
-the spec itself mandates.
-
----
-
-## Coverage vs. specs.md §14 acceptance criteria
-
-- §14.4 configuration contract (single `ConnectionStrings:TodoDb` key, all
-  `Postgres:UseEntraAuth` references deleted from app code/config) — **verified**.
-- §14.5 backend behavior (normalizer rules 1-6, startup logging, no dual mode) —
-  **verified** by unit tests + direct code read.
-- §14.6 local dev (passwordless `docker-compose.yml`/`appsettings.Development.json`/
-  `.env.example`, documented `down -v` + `az login` guidance) — **verified** by
-  direct file read; empirical Npgsql-provider-not-invoked-under-trust claim is
-  the engineer's own documented probe, not independently reproduced here (gap
-  #3 above).
-- §14.10 testing requirements — **all 15 enumerated items present and passing**,
-  plus additional logging/laziness coverage.
-- §14.11 non-functional (breaking-change disclosure, TLS enforcement, no secret
-  logging) — **verified**.
-- §14.12 out-of-scope items (server auth unchanged, `todoadmin` preserved, no
-  Key Vault, `EntraTokenPasswordProvider`/`UsePasswordProvider` untouched) —
-  **verified**: `infra/modules/postgres.bicep` was not part of this diff (only
-  `infra/main.bicep`, `main.parameters.json` mention the still-present
-  `Postgres__UseEntraAuth` env var / admin password, which is expected drift
-  per §14.8, not a code defect); `EntraTokenPasswordProvider.cs` is byte-for-byte
-  absent from `git diff --stat`, confirming it was not touched.
+- **Live dev Container Apps Environment does not exist yet.** The
+  §15.9.3 `verify-dev` smoke checks (health, list, create+delete round-trip,
+  frontend FQDN bake-in) require a deployed `cae-todo-demo-dev` +
+  `todo-api-dev`/`todo-web-dev` + `pg-todo-demo-dev-cus01`, none of which
+  exist. These are correctly the devops/CD stage's responsibility, coming
+  in a follow-up commit on this same branch (not waited for here, per
+  instructions).
+- **Actual runtime `cloud_RoleName` value for `todo-api-dev`** can only be
+  confirmed via a Log Analytics query after a real dev deploy (the
+  `AppRequests | summarize count() by AppRoleName` check `changes.md`
+  already documents as a post-deploy verification step). Assembly
+  inspection is the strongest evidence obtainable pre-deploy.
+- **Bicep/CI-CD-YAML validity** (`az bicep build`/`lint` on
+  `infra/main.dev.bicep`, the `cd.yml`/`ci.yml` job graph, the GitHub
+  Environments/required-reviewers availability check) is explicitly the
+  devops agent's deliverable, not yet authored on this branch, and out of
+  this role's scope (application-level test verification).
 
 ---
 
 ## Commit / PR
 
-Verdict is PASS. Proceeding to commit, push `pipeline/entra-passwordless-connection-string`,
-and open a PR against `main` per instructions, noting the required manual
-production cutover (§14.9) as a pre-merge-effective, not pre-merge, step.
+Verdict is PASS. Per instructions, committed and pushed the `.pipeline/*`
+doc updates (no app code exists to commit this cycle) and opened a PR
+against `main` documenting that this PR alone carries no functional/infra
+changes — architecture spec + verification record only, with the actual
+`infra/`/`.github/workflows` deliverables following in a subsequent commit
+on this same branch from the devops agent.
