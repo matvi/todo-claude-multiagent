@@ -1,12 +1,23 @@
 # CI — build / test / lint validation only. NO Azure login, NO image push,
-# NO deploy. Credential-free so it runs safely on any PR (incl. forks).
-# This is the REQUIRED status check for branch protection on `main` (specs §11.7).
+# NO deploy. Credential-free so it runs safely on any PR (including forks).
+#
+# These are the REQUIRED status checks for branch protection (specs §11.7,
+# §15.12): `backend`, `frontend`, `docker`, `iac` on both `main` and `develop`,
+# plus `guard-promotion-source` on `main` only.
+#
+# Deliberately NO `what-if` step against the dev parameters: `what-if` requires
+# an Azure login, which would make CI credentialed and therefore unsafe on fork
+# PRs. Bicep compile + lint is the credential-free validation boundary; the
+# `what-if` dry run is run by a human before the manual infra deploy instead
+# (infra/README.md).
 
 name: CI
 
 on:
+  # Both target branches: `develop` is the integration branch that feature PRs
+  # target, `main` is the production trunk that only receives promotion PRs.
   pull_request:
-    branches: [main]
+    branches: [main, develop]
   workflow_dispatch: {}
 
 # Cancel superseded runs on the same PR/branch.
@@ -55,7 +66,7 @@ jobs:
       - name: Install (clean)
         run: npm ci
       # A placeholder VITE_API_BASE_URL is fine for a build-check; the real value
-      # is baked by the CD workflow at deploy time.
+      # is baked by the CD workflow at deploy time, once per environment.
       - name: Build (tsc + vite build)
         run: npm run build
         env:
@@ -79,14 +90,75 @@ jobs:
             -t todo-web:ci ./frontend
 
   iac:
+    # NOTE: this display name is DELIBERATELY unchanged even though the job now
+    # lints two templates. A GitHub required status check is matched by the
+    # check-run NAME (this `name:` field), not by the job id — renaming it would
+    # silently invalidate any existing required-check configuration on `main`
+    # and leave PRs stuck on "Expected — waiting for status to be reported".
     name: IaC (bicep build + lint)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       # azure/setup-azcli is preinstalled on ubuntu-latest runners; ensure bicep.
+      # `az bicep build`/`lint` are entirely local — no Azure login, no network
+      # calls to ARM, so this job stays credential-free.
       - name: Install Bicep CLI
         run: az bicep install
-      - name: Bicep build (compile check)
+
+      # Production template. Unchanged by the dev-environment cycle and must
+      # stay that way — it is deployed against a live, deliberately drifted
+      # production stack.
+      - name: Bicep build — main.bicep (production)
         run: az bicep build --file infra/main.bicep --stdout > /dev/null
-      - name: Bicep lint
+      - name: Bicep lint — main.bicep (production)
         run: az bicep lint --file infra/main.bicep
+
+      # Dev template. Linting BOTH is the mitigation for the one accepted
+      # downside of having two top-level templates (§15.5): they can drift.
+      # All real resource shape lives in infra/modules/*, which both call, so a
+      # module change that breaks either template is caught here.
+      - name: Bicep build — main.dev.bicep (dev)
+        run: az bicep build --file infra/main.dev.bicep --stdout > /dev/null
+      - name: Bicep lint — main.dev.bicep (dev)
+        run: az bicep lint --file infra/main.dev.bicep
+
+  # ==========================================================================
+  # guard-promotion-source — enforces the promotion path into `main`.
+  #
+  # GitHub branch protection cannot express "only merge from `develop`", so
+  # this status check is the only thing that actually enforces it. Make it a
+  # REQUIRED check on `main` (infra/README.md Phase E) or it is decorative.
+  #
+  # Why it matters: the whole dev→prod gate assumes production only ever
+  # receives commits that have been integrated on `develop` and smoke-tested in
+  # dev. A PR straight from `feature/x` into `main` would technically still run
+  # deploy-dev first (the job graph guarantees that much), but it would bypass
+  # integration entirely and land untested-together code on the trunk.
+  #
+  # `hotfix/*` is allowed as the deliberate urgent-fix path — note it is NOT a
+  # bypass: a hotfix still goes through deploy-dev + verify-dev + the
+  # production approval, exactly like a normal promotion.
+  #
+  # On PRs into `develop` this job is skipped (GitHub reports a skipped job as
+  # neutral, so it does not block those PRs).
+  # ==========================================================================
+  guard-promotion-source:
+    name: Guard — PRs into main must come from develop or hotfix/*
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    steps:
+      - name: Check the head branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "PR: $HEAD_REF -> $BASE_REF"
+          if [[ "$HEAD_REF" == "develop" || "$HEAD_REF" == hotfix/* ]]; then
+            echo "OK  '$HEAD_REF' is an allowed promotion source for main."
+            exit 0
+          fi
+          echo "::error::PRs into 'main' must come from 'develop' or 'hotfix/*', but this PR is from '$HEAD_REF'."
+          echo "::error::Merge '$HEAD_REF' into 'develop' first, let CD deploy and verify it in the dev environment, then open a 'develop' -> 'main' promotion PR."
+          exit 1

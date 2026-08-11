@@ -1,30 +1,55 @@
-# CD — deploy to Azure Container Apps on merge to `main` (specs §11.5).
+# CD — dev → verify → prod promotion pipeline (specs §15.9).
+#
+# ONE workflow, THREE jobs, triggered on pushes to `develop` and `main`:
+#
+#     deploy-dev  ──▶  verify-dev  ──▶  deploy-prod
+#    (develop+main)   (no creds)      (main only, human-approved)
+#
+# WHY A SINGLE WORKFLOW ON BOTH BRANCHES, AND NOT TWO INDEPENDENT ONES:
+# the requirement is a SEQUENTIAL gate — the exact commit that reaches
+# production must already have been deployed to dev and smoke-tested. Two
+# unconnected workflows cannot guarantee that: a squash/merge produces a NEW
+# SHA that dev never saw. Here `deploy-prod` `needs:` a green `deploy-dev` and
+# `verify-dev` OF THE SAME RUN, i.e. of the same SHA. "Deploy to dev first,
+# then production" is enforced by the job graph, not by convention.
+#
+# On a push to `develop`: deploy-dev + verify-dev run, deploy-prod is skipped.
+# On a push to `main`:    all three run, with deploy-prod pausing for approval.
+#
+# THE HUMAN GATE is the `production` GitHub Environment's required reviewers:
+# the run PAUSES before any step of `deploy-prod` executes. That gate is
+# independent of, and stronger than, the trigger shape. It is ALSO why branch
+# protection on `main` matters: a push to `main` should only ever happen as the
+# result of a reviewed, merged PR. See infra/README.md Phase E step 1.
+#
 # Auth: OIDC / workload identity federation via azure/login@v2 — NO stored
-# client secret. Uses GitHub *variables* AZURE_CLIENT_ID / AZURE_TENANT_ID /
-# AZURE_SUBSCRIPTION_ID (no credential material).
+# client secret anywhere. Uses GitHub *variables* AZURE_CLIENT_ID /
+# AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID (identifiers, not credentials).
 #
-# Infra (Bicep) is intentionally NOT deployed here — it's provisioned once,
-# manually, per infra/README.md, and only re-applied by hand when infra
-# actually changes. This workflow only builds/pushes images and rolls the
-# two already-existing Container Apps. It assumes rg-todo-demo, the ACR, and
-# both apps already exist (see infra/README.md Phase 2).
+# !! OIDC SUBJECT WARNING — the most likely first-run failure !!
+# A job that declares `environment: <name>` gets an OIDC subject of the
+# ENVIRONMENT form (`repo:<owner>/<repo>:environment:<name>`), NOT the branch
+# form. `deploy-dev` declares `environment: dev`, so a federated credential for
+# `...:environment:dev` MUST exist or this job dies at `azure/login` with an
+# opaque `AADSTS700213: No matching federated identity record found`.
+# Phase E step 4 in infra/README.md has the exact command.
 #
-# Honors the backend-before-frontend ordering constraint (specs §4.4 / §11.5):
-# the frontend image bakes the backend FQDN at build time, so the backend is
-# built + deployed FIRST, its FQDN read back, then the frontend is built with
-# --build-arg VITE_API_BASE_URL=<backend FQDN>.
+# Infra (Bicep) is intentionally NOT deployed here (§14.2) — both environments
+# are provisioned once, by hand, per infra/README.md, and only re-applied by
+# hand when the infra itself actually changes. This workflow only builds/pushes
+# images and rolls already-existing Container Apps.
+#
+# Ordering constraint honored throughout (§4.4/§5.7, an architecture-memory
+# hard constraint): the frontend image BAKES the backend FQDN at build time, so
+# the backend is always built + deployed FIRST and its FQDN read back before the
+# frontend is built.
 
 name: CD
 
 on:
   push:
-    branches: [main]
+    branches: [develop, main]
   workflow_dispatch: {}
-
-# One deploy at a time; never let overlapping merges race a Container App revision.
-concurrency:
-  group: cd-main
-  cancel-in-progress: false
 
 permissions:
   id-token: write   # required for OIDC federated login — no secret stored
@@ -33,13 +58,31 @@ permissions:
 env:
   RESOURCE_GROUP: rg-todo-demo
 
+# NOTE: there is deliberately NO workflow-level `concurrency:` block. A single
+# workflow-wide group would make a `develop` run and a `main` run block each
+# other end-to-end. Concurrency is applied PER JOB below instead, so the two
+# environments serialize independently: two runs can never collide on the dev
+# environment, and prod deploys queue on their own.
+
 jobs:
-  deploy:
-    name: Build & deploy images to Azure Container Apps
+  # ==========================================================================
+  # JOB 1 — deploy-dev.  Runs on BOTH `develop` and `main`.
+  # On a `main` push this is the "deploy to dev first" half of the gate: the
+  # prod-bound commit is deployed to dev and smoke-tested BEFORE prod is touched.
+  # ==========================================================================
+  deploy-dev:
+    name: Deploy to dev (todo-api-dev / todo-web-dev)
     runs-on: ubuntu-latest
-    # A GitHub Environment lets deployments show in history and lets a
-    # required-reviewer rule be added later without editing this workflow.
-    environment: production
+    environment: dev          # no protection rules; changes the OIDC subject (see header)
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false   # never abandon a half-rolled environment
+    outputs:
+      api_fqdn: ${{ steps.api.outputs.fqdn }}
+      web_fqdn: ${{ steps.web.outputs.fqdn }}
+      image_tag: ${{ github.sha }}
+      acr_name: ${{ steps.infra.outputs.acr_name }}
+      acr_login_server: ${{ steps.infra.outputs.acr_login_server }}
     steps:
       - uses: actions/checkout@v4
 
@@ -51,10 +94,10 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       # ------------------------------------------------------------------
-      # 0. Look up the already-provisioned ACR (infra is deployed manually,
-      #    once — see infra/README.md). Assumes exactly one ACR in the RG.
+      # Look up the SHARED ACR. One registry serves both environments — that
+      # is what makes true artifact promotion possible later in deploy-prod.
       # ------------------------------------------------------------------
-      - name: Look up ACR
+      - name: Look up shared ACR
         id: infra
         run: |
           set -euo pipefail
@@ -68,35 +111,39 @@ jobs:
           echo "acr_login_server=$ACR_LOGIN_SERVER" >> "$GITHUB_OUTPUT"
 
       # ------------------------------------------------------------------
-      # 0b. Wire each app's system-assigned identity as its ACR credential.
-      #     The bootstrap Bicep deploy deliberately left this unset (it used
-      #     the public placeholder image, not ACR — see infra/main.bicep's
-      #     todoApiUsesAcr/todoWebUsesAcr), and CD no longer runs Bicep at
-      #     all, so nothing else ever configures it. Idempotent — safe to
-      #     run on every deploy. Requires the AcrPull grant from the
-      #     Phase 3 manual bootstrap (infra/README.md) to actually pull.
+      # Wire each DEV app's system-assigned identity as its ACR credential.
+      # The bootstrap Bicep deploy deliberately leaves this unset (it uses the
+      # public placeholder image, not ACR — see main.dev.bicep's
+      # todoApiDevUsesAcr/todoWebDevUsesAcr guard), and CD does not run Bicep,
+      # so nothing else ever configures it. Idempotent — safe every run.
+      # Requires the Phase B AcrPull grants (infra/README.md) to actually pull.
       # ------------------------------------------------------------------
-      - name: Configure Container Apps to pull from ACR via managed identity
+      - name: Configure dev Container Apps to pull from ACR via managed identity
         run: |
           set -euo pipefail
-          az containerapp registry set -n todo-api -g "$RESOURCE_GROUP" \
+          az containerapp registry set -n todo-api-dev -g "$RESOURCE_GROUP" \
             --server "${{ steps.infra.outputs.acr_login_server }}" --identity system
-          az containerapp registry set -n todo-web -g "$RESOURCE_GROUP" \
+          az containerapp registry set -n todo-web-dev -g "$RESOURCE_GROUP" \
             --server "${{ steps.infra.outputs.acr_login_server }}" --identity system
 
       # ------------------------------------------------------------------
-      # 1. Backend FIRST — build + push, deploy, read back its FQDN.
+      # BACKEND FIRST — build + push, deploy to dev, read back its FQDN.
       #
-      #    NOTE: this uses `docker build` + `docker push` instead of the
-      #    simpler `az acr build`. `az acr build` runs as an ACR Tasks cloud
-      #    build, and ACR Tasks is paused on free-trial / free-credit
-      #    subscriptions (TasksOperationsNotAllowed). If/when this
-      #    subscription is upgraded to Pay-As-You-Go, ACR Tasks should work
-      #    normally again — at that point this can be simplified back to:
-      #      az acr build --registry <name> --image todo-api:<tag> \
-      #        --file backend/src/TodoApi/Dockerfile ./backend
+      # `todo-api:<sha>` is THE PROMOTION ARTIFACT. It is environment-agnostic
+      # (nothing about dev or prod is baked into it), it is built exactly ONCE
+      # here, and deploy-prod re-points production at this identical tag
+      # without rebuilding. Do not add an environment suffix to this tag.
+      #
+      # NOTE: this uses `docker build` + `docker push` instead of the simpler
+      # `az acr build`. `az acr build` runs as an ACR Tasks cloud build, and
+      # ACR Tasks is paused on free-trial / free-credit subscriptions
+      # (TasksOperationsNotAllowed). If/when this subscription is upgraded to
+      # Pay-As-You-Go, ACR Tasks should work normally again — at that point
+      # this can be simplified back to:
+      #   az acr build --registry <name> --image todo-api:<tag> \
+      #     --file backend/src/TodoApi/Dockerfile ./backend
       # ------------------------------------------------------------------
-      - name: Build & push backend image (todo-api)
+      - name: Build & push backend image (todo-api:<sha> — the promotion artifact)
         run: |
           set -euo pipefail
           az acr login --name "${{ steps.infra.outputs.acr_name }}"
@@ -106,7 +153,285 @@ jobs:
             ./backend
           docker push "${{ steps.infra.outputs.acr_login_server }}/todo-api:${{ github.sha }}"
 
-      - name: Update backend Container App
+      - name: Update dev backend Container App (todo-api-dev)
+        id: api
+        run: |
+          set -euo pipefail
+          az containerapp update -n todo-api-dev -g "$RESOURCE_GROUP" \
+            --image "${{ steps.infra.outputs.acr_login_server }}/todo-api:${{ github.sha }}"
+          FQDN=$(az containerapp show -n todo-api-dev -g "$RESOURCE_GROUP" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          # cae-todo-demo-dev has its OWN random defaultDomain, different from
+          # production's — dev FQDNs are NOT predictable and are never hardcoded.
+          echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # FRONTEND SECOND — bake the DEV backend FQDN at build time.
+      #
+      # Tagged `todo-web:<sha>-dev`, distinct from the `-prod` tag built later,
+      # because VITE_API_BASE_URL is a BUILD-time constant inlined into the JS
+      # bundle: one frontend image physically cannot serve both environments.
+      # This is the one artifact that is rebuilt rather than promoted; see the
+      # caveat recorded in .pipeline/infra.md.
+      # Same `docker build`/`docker push` ACR-Tasks workaround as above.
+      # ------------------------------------------------------------------
+      - name: Build & push dev frontend image (todo-web:<sha>-dev)
+        run: |
+          set -euo pipefail
+          az acr login --name "${{ steps.infra.outputs.acr_name }}"
+          docker build \
+            -f frontend/Dockerfile \
+            --build-arg VITE_API_BASE_URL="https://${{ steps.api.outputs.fqdn }}" \
+            -t "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}-dev" \
+            ./frontend
+          docker push "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}-dev"
+
+      - name: Update dev frontend Container App (todo-web-dev)
+        id: web
+        run: |
+          set -euo pipefail
+          az containerapp update -n todo-web-dev -g "$RESOURCE_GROUP" \
+            --image "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}-dev"
+          FQDN=$(az containerapp show -n todo-web-dev -g "$RESOURCE_GROUP" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # Reconcile DEV CORS. Strictly per-environment: the dev allow-list holds
+      # the dev frontend origin ONLY and never a production origin.
+      # ------------------------------------------------------------------
+      - name: Reconcile dev backend CORS allow-list
+        run: |
+          set -euo pipefail
+          az containerapp update -n todo-api-dev -g "$RESOURCE_GROUP" \
+            --set-env-vars "Cors__AllowedOrigins__0=https://${{ steps.web.outputs.fqdn }}"
+
+      - name: Dev summary
+        run: |
+          {
+            echo "## Dev deploy complete"
+            echo "- Backend  (todo-api-dev): https://${{ steps.api.outputs.fqdn }}"
+            echo "- Frontend (todo-web-dev): https://${{ steps.web.outputs.fqdn }}"
+            echo "- Promotion artifact: \`todo-api:${{ github.sha }}\`"
+            echo "- Dev frontend image: \`todo-web:${{ github.sha }}-dev\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ==========================================================================
+  # JOB 2 — verify-dev.  The AUTOMATED half of the promotion gate.
+  #
+  # NO `environment:`, NO azure/login, NO credential of any kind. It only makes
+  # public HTTPS requests to the dev FQDNs produced by the previous job. If any
+  # check fails, this job fails and `deploy-prod` never starts.
+  #
+  # These four checks are chosen to prove the things that are otherwise only
+  # discoverable in production — which is exactly the §14 incident this whole
+  # cycle exists to prevent:
+  #   - GET /api/todos proves the dev managed identity actually authenticated
+  #     to the dev Postgres server over Entra AND that startup Migrate() ran.
+  #   - POST+DELETE proves the dev pgaadauth role's DML/DDL rights.
+  #   - the frontend check proves the right VITE_API_BASE_URL was baked in.
+  #
+  # Both dev apps run at minReplicas: 0, so the first request pays a cold
+  # start. Everything retries with backoff (~120 s budget) or this job becomes
+  # a flaky promotion blocker.
+  # ==========================================================================
+  verify-dev:
+    name: Verify dev (public HTTPS smoke test, no credentials)
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    # No concurrency group needed — these are read-only probes.
+    env:
+      API: https://${{ needs.deploy-dev.outputs.api_fqdn }}
+      WEB: https://${{ needs.deploy-dev.outputs.web_fqdn }}
+    steps:
+      # --- Check 1: liveness -------------------------------------------
+      - name: 'Check 1 — GET /health returns 200 and {"status":"ok"}'
+        run: |
+          set -uo pipefail
+          # Retry budget ~120 s: 12 attempts, 10 s apart. Absorbs the cold start
+          # of a minReplicas:0 app plus the revision becoming healthy.
+          for i in $(seq 1 12); do
+            BODY=$(curl -sS --max-time 20 -w '\n%{http_code}' "$API/health" || true)
+            CODE=$(printf '%s' "$BODY" | tail -n1)
+            PAYLOAD=$(printf '%s' "$BODY" | sed '$d')
+            if [ "$CODE" = "200" ] && printf '%s' "$PAYLOAD" | grep -q '"status":"ok"'; then
+              echo "OK  /health -> 200 $PAYLOAD"
+              exit 0
+            fi
+            echo "attempt $i/12: /health -> ${CODE:-no-response} (cold start?), retrying in 10s"
+            sleep 10
+          done
+          echo "::error::Dev /health never returned 200 with \"status\":\"ok\". Blocking promotion."
+          exit 1
+
+      # --- Check 2: the important one — Entra DB auth + migrations ------
+      - name: 'Check 2 — GET /api/todos returns 200 and a JSON array (proves Entra DB auth + Migrate())'
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 6); do
+            BODY=$(curl -sS --max-time 20 -w '\n%{http_code}' "$API/api/todos" || true)
+            CODE=$(printf '%s' "$BODY" | tail -n1)
+            PAYLOAD=$(printf '%s' "$BODY" | sed '$d')
+            if [ "$CODE" = "200" ] && printf '%s' "$PAYLOAD" | jq -e 'type == "array"' > /dev/null 2>&1; then
+              echo "OK  /api/todos -> 200, JSON array of $(printf '%s' "$PAYLOAD" | jq 'length') item(s)"
+              echo "    => todo-api-dev authenticated to pg-todo-demo-dev-cus01 with its"
+              echo "       managed identity over Entra, and the schema exists."
+              exit 0
+            fi
+            echo "attempt $i/6: /api/todos -> ${CODE:-no-response}, retrying in 10s"
+            sleep 10
+          done
+          echo "::error::Dev GET /api/todos failed. Most likely causes: the pgaadauth principal 'todo-api-dev' does not exist on pg-todo-demo-dev-cus01 (infra/README.md Phase D), or startup Migrate() failed. Blocking promotion."
+          exit 1
+
+      # --- Check 3: write path + DDL/DML rights of the dev role ---------
+      - name: 'Check 3 — POST then DELETE a todo (proves write path + dev role privileges)'
+        run: |
+          set -uo pipefail
+          CREATED=$(curl -sS --max-time 30 -X POST "$API/api/todos" \
+            -H 'Content-Type: application/json' \
+            -d '{"title":"cd-smoke-test"}' -w '\n%{http_code}' || true)
+          CODE=$(printf '%s' "$CREATED" | tail -n1)
+          PAYLOAD=$(printf '%s' "$CREATED" | sed '$d')
+          if [ "$CODE" != "201" ]; then
+            echo "::error::POST /api/todos returned $CODE (expected 201). Body: $PAYLOAD. Blocking promotion."
+            exit 1
+          fi
+          ID=$(printf '%s' "$PAYLOAD" | jq -r '.id')
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            echo "::error::POST /api/todos returned 201 but no id in the body: $PAYLOAD"
+            exit 1
+          fi
+          echo "OK  POST /api/todos -> 201, id=$ID"
+
+          # Always clean up: dev data is disposable, but leaving smoke-test rows
+          # behind would make the dev DB progressively noisier every deploy.
+          DCODE=$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' \
+            -X DELETE "$API/api/todos/$ID" || true)
+          if [ "$DCODE" != "204" ]; then
+            echo "::error::DELETE /api/todos/$ID returned $DCODE (expected 204). Blocking promotion."
+            exit 1
+          fi
+          echo "OK  DELETE /api/todos/$ID -> 204"
+
+      # --- Check 4: frontend served, and built against the DEV API ------
+      - name: 'Check 4 — GET / on the dev frontend returns 200 and was built with the dev API URL'
+        run: |
+          set -uo pipefail
+          API_HOST="${{ needs.deploy-dev.outputs.api_fqdn }}"
+          for i in $(seq 1 12); do
+            CODE=$(curl -sS --max-time 20 -o /tmp/index.html -w '%{http_code}' "$WEB/" || true)
+            [ "$CODE" = "200" ] && break
+            echo "attempt $i/12: GET / -> ${CODE:-no-response} (cold start?), retrying in 10s"
+            sleep 10
+          done
+          if [ "${CODE:-}" != "200" ]; then
+            echo "::error::Dev frontend never returned 200. Blocking promotion."
+            exit 1
+          fi
+          echo "OK  GET / -> 200"
+
+          # VITE_API_BASE_URL is inlined by Vite into the hashed JS BUNDLE, not
+          # into index.html — so follow index.html's script references and grep
+          # those. Grepping index.html alone would always fail.
+          FOUND=0
+          for ASSET in $(grep -oE '(src|href)="[^"]*\.js"' /tmp/index.html | sed -E 's/.*="([^"]*)"/\1/'); do
+            if curl -sS --max-time 30 "$WEB/${ASSET#/}" | grep -qF "$API_HOST"; then
+              FOUND=1
+              echo "OK  asset $ASSET was built against https://$API_HOST"
+              break
+            fi
+          done
+          if [ "$FOUND" != "1" ]; then
+            echo "::error::No dev frontend JS bundle references $API_HOST — VITE_API_BASE_URL was baked with the wrong value (a stale or production API URL). Blocking promotion."
+            exit 1
+          fi
+
+      - name: Verify summary
+        run: |
+          {
+            echo "## Dev verification passed — promotion unblocked"
+            echo "- \`GET /health\` 200"
+            echo "- \`GET /api/todos\` 200 (Entra DB auth + migrations confirmed)"
+            echo "- \`POST\`+\`DELETE\` round-trip (write path confirmed)"
+            echo "- dev frontend served and built against the dev API"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ==========================================================================
+  # JOB 3 — deploy-prod.  ONLY on `main`, ONLY after dev is green, and ONLY
+  # after a human approves the `production` GitHub Environment.
+  #
+  # `environment: production` is what creates the human approval gate: with
+  # required reviewers configured on that environment, the run PAUSES here and
+  # a reviewer must click Approve before ANY step below executes. On a
+  # `develop` push the `if:` skips this job entirely.
+  #
+  # THIS JOB NEVER REBUILDS todo-api. It asserts that the exact tag dev
+  # validated exists in ACR and re-points production at it. If that assertion
+  # fails, an un-validated image was about to reach production — fail closed.
+  # ==========================================================================
+  deploy-prod:
+    name: Promote to production (todo-api / todo-web)
+    runs-on: ubuntu-latest
+    needs: [deploy-dev, verify-dev]
+    if: github.ref == 'refs/heads/main'
+    environment: production   # <-- the human approval gate (required reviewers)
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC, no secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Look up shared ACR
+        id: infra
+        run: |
+          set -euo pipefail
+          ACR_NAME=$(az acr list -g "$RESOURCE_GROUP" --query "[0].name" -o tsv)
+          if [ -z "$ACR_NAME" ]; then
+            echo "::error::No ACR found in $RESOURCE_GROUP. Run the one-time infra deploy first (infra/README.md)." >&2
+            exit 1
+          fi
+          ACR_LOGIN_SERVER=$(az acr show -n "$ACR_NAME" -g "$RESOURCE_GROUP" --query loginServer -o tsv)
+          echo "acr_name=$ACR_NAME" >> "$GITHUB_OUTPUT"
+          echo "acr_login_server=$ACR_LOGIN_SERVER" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # PROMOTION ASSERTION — fail closed if the artifact was never built.
+      # This is what makes "promotion" mean something: the tag must be the one
+      # deploy-dev pushed and verify-dev exercised. If it is absent, something
+      # is wrong (ACR retention, a manually re-run job, a tampered graph) and
+      # production must NOT be rolled.
+      # ------------------------------------------------------------------
+      - name: Assert the dev-validated backend image exists in ACR
+        run: |
+          set -euo pipefail
+          az acr repository show \
+            -n "${{ steps.infra.outputs.acr_name }}" \
+            --image "todo-api:${{ github.sha }}" -o none \
+            || { echo "::error::todo-api:${{ github.sha }} not in ACR — dev deploy did not produce this artifact. Refusing to deploy an unvalidated image to production."; exit 1; }
+          echo "OK  todo-api:${{ github.sha }} present — this is the image verify-dev exercised."
+
+      # Idempotent, unchanged from the previous workflow.
+      - name: Configure production Container Apps to pull from ACR via managed identity
+        run: |
+          set -euo pipefail
+          az containerapp registry set -n todo-api -g "$RESOURCE_GROUP" \
+            --server "${{ steps.infra.outputs.acr_login_server }}" --identity system
+          az containerapp registry set -n todo-web -g "$RESOURCE_GROUP" \
+            --server "${{ steps.infra.outputs.acr_login_server }}" --identity system
+
+      # ------------------------------------------------------------------
+      # PROMOTE THE BACKEND — NO REBUILD. Production runs the identical image
+      # digest that verify-dev validated minutes earlier.
+      # ------------------------------------------------------------------
+      - name: Promote backend to production (re-point at the dev-validated tag)
         id: api
         run: |
           set -euo pipefail
@@ -117,46 +442,51 @@ jobs:
           echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
 
       # ------------------------------------------------------------------
-      # 2. Frontend SECOND — bake the backend FQDN at build time, then deploy.
-      #
-      #    Same `docker build`/`docker push` workaround as the backend step
-      #    above (ACR Tasks / `az acr build` is disallowed on this
-      #    subscription) — revert to `az acr build` once upgraded.
+      # REBUILD THE FRONTEND FOR PROD — the one honest caveat in this design.
+      # VITE_API_BASE_URL is baked at build time and the dev/prod API FQDNs
+      # differ, so the frontend cannot be byte-for-byte promoted. It is built
+      # from the SAME source SHA, SAME Dockerfile and SAME npm lockfile,
+      # differing only in that one build-arg — low risk, not zero risk.
+      # The permanent fix (runtime config instead of build-time) is recorded as
+      # a follow-up in .pipeline/infra.md; it is an application change.
       # ------------------------------------------------------------------
-      - name: Build & push frontend image (todo-web) with backend FQDN baked
+      - name: Build & push production frontend image (todo-web:<sha>-prod)
         run: |
           set -euo pipefail
           az acr login --name "${{ steps.infra.outputs.acr_name }}"
           docker build \
             -f frontend/Dockerfile \
             --build-arg VITE_API_BASE_URL="https://${{ steps.api.outputs.fqdn }}" \
-            -t "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}" \
+            -t "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}-prod" \
             ./frontend
-          docker push "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}"
+          docker push "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}-prod"
 
-      - name: Update frontend Container App
+      - name: Update production frontend Container App
         id: web
         run: |
           set -euo pipefail
           az containerapp update -n todo-web -g "$RESOURCE_GROUP" \
-            --image "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}"
+            --image "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}-prod"
           FQDN=$(az containerapp show -n todo-web -g "$RESOURCE_GROUP" \
             --query "properties.configuration.ingress.fqdn" -o tsv)
           echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------------
-      # 3. Reconcile CORS — ensure the backend allows the frontend origin.
-      # ------------------------------------------------------------------
-      - name: Reconcile backend CORS allow-list
+      # Production CORS holds the PRODUCTION frontend origin only — never a dev one.
+      - name: Reconcile production backend CORS allow-list
         run: |
+          set -euo pipefail
           az containerapp update -n todo-api -g "$RESOURCE_GROUP" \
             --set-env-vars "Cors__AllowedOrigins__0=https://${{ steps.web.outputs.fqdn }}"
 
-      - name: Summary
+      - name: Promotion summary
         run: |
           {
-            echo "## Deploy complete"
-            echo "- Backend  (todo-api): https://${{ steps.api.outputs.fqdn }}"
-            echo "- Frontend (todo-web): https://${{ steps.web.outputs.fqdn }}"
-            echo "- Image tag: \`${{ github.sha }}\`"
+            echo "## Production promotion complete"
+            echo "| | Dev | Production |"
+            echo "|---|---|---|"
+            echo "| Backend | https://${{ needs.deploy-dev.outputs.api_fqdn }} | https://${{ steps.api.outputs.fqdn }} |"
+            echo "| Frontend | https://${{ needs.deploy-dev.outputs.web_fqdn }} | https://${{ steps.web.outputs.fqdn }} |"
+            echo ""
+            echo "- **Backend image PROMOTED, not rebuilt**: \`todo-api:${{ github.sha }}\` — the exact image verify-dev validated."
+            echo "- Frontend rebuilt per environment: \`todo-web:${{ github.sha }}-dev\` -> \`todo-web:${{ github.sha }}-prod\` (same SHA, differs only in VITE_API_BASE_URL)."
           } >> "$GITHUB_STEP_SUMMARY"

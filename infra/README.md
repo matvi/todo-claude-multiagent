@@ -12,8 +12,10 @@ Postgres **Standard_B1ms** · ACA **Consumption** · ACR **Basic** ·
 
 | Path | Provisions |
 |---|---|
-| `main.bicep` | RG-scoped entry point; wires the modules; assembles the DB connection string as a backend Container Apps secret; emits outputs. |
-| `main.parameters.json` | Dev/demo **non-secret** parameter values. The `@secure()` `postgresAdminPassword` is **not** here — it is supplied at deploy time from a secret. |
+| `main.bicep` | **PRODUCTION** RG-scoped entry point; wires the modules; emits outputs. Not modified by the dev-environment cycle. |
+| `main.parameters.json` | Production **non-secret** parameter values. The `@secure()` `postgresAdminPassword` is **not** here — it is supplied at deploy time from a secret. |
+| `main.dev.bicep` | **DEV** RG-scoped entry point (same resource group). Creates `cae-todo-demo-dev`, `appi-todo-demo-dev`, `pg-todo-demo-dev-cus01` (+ `tododb`), `todo-api-dev`, `todo-web-dev`. References the ACR and `log-todo-demo` as `existing` — creates neither. Calls the **same `modules/*`** as `main.bicep`. |
+| `main.dev.parameters.json` | Dev **non-secret** parameter values. `postgresAdminPassword` is **not** here and never will be — it comes from `PGADMIN_PASSWORD_DEV` at deploy time and **must differ from production's password**. |
 | `modules/registry.bicep` | Azure Container Registry (Basic, admin user disabled). |
 | `modules/loganalytics.bicep` | Log Analytics workspace (PerGB2018, 30-day retention, **1 GB/day ingestion cap** — cost circuit-breaker). |
 | `modules/appinsights.bicep` | **Application Insights** component (workspace-based, reuses `log-todo-demo`; `DisableLocalAuth: true`). Outputs the connection string. |
@@ -293,16 +295,435 @@ Because `DisableLocalAuth: true` is set on the component, this grant is what let
 `todo-api` publish telemetry at all — without it, ingestion is rejected (403) and
 traces silently never land (the app itself keeps running).
 
-### Branch protection on `main` (repo-admin action — human)
+### Branch protection on `main`
 
-Settings → Branches → add a rule for `main`:
-- Require a pull request before merging; require ≥ 1 approval; dismiss stale approvals.
-- Require the **CI** workflow status check to pass; require branch up to date.
-- Disallow force-pushes and deletion; do not allow admins to bypass.
-- Squash merge preferred.
+> **Moved.** Branch protection is now **Phase E1 of the dev-environment
+> rollout** below, with the exact `gh api` command to run — it is no longer a
+> loose "Settings → Branches" note. It is a **required, early step**, not a
+> nice-to-have: the dev→prod promotion gate is meaningless if anyone can push
+> straight to `main` and skip it entirely.
 
-Without this, the human-reviews-the-PR gate this pipeline relies on is only a
-convention, not enforced by GitHub.
+---
+
+# Dev environment rollout — Phases A–F (MANUAL, human-run, once)
+
+> **No agent runs any command in this section.** No agent creates identities,
+> federated credentials, role assignments, GitHub secrets/variables/environments,
+> branch protection rules, or in-database principals. The agents authored these
+> commands; a human with the necessary Azure (Owner / `User Access
+> Administrator`) and GitHub (repo admin) privileges executes them.
+>
+> This provisions the **dev half** of the two-environment model (specs §15) into
+> the **same** resource group as production. Approved by the user in chat on
+> **2026-08-07**: Option A of `.pipeline/infra-proposal.md` — a dedicated
+> `pg-todo-demo-dev-cus01` (B1ms / 32 GiB / Central US, always on), est.
+> **+$19–25/month**, of which **~$18.18 is an unavoidable always-on floor**.
+
+## ⛔ KNOWN BLOCKER — read before starting Phase A
+
+`az deployment group what-if` on `infra/main.dev.bicep` currently fails preflight
+with:
+
+```
+MaxNumberOfGlobalEnvironmentsInSubExceeded — The subscription
+'9ba6633f-058c-4269-8b0f-086ab331ef26' cannot have more than 1 Container App
+Environments.
+```
+
+Subscription `9ba6633f-…` is a **Free Trial** (`quotaId:
+FreeTrial_2014-09-01`, spending limit ON) and is capped at **one Container Apps
+managed environment across the whole subscription** — `cae-todo-demo` already
+uses it. The cap is **global, not per-region**, so moving `cae-todo-demo-dev` to
+another region does **not** help (verified: the same deploy in `eastus2` fails
+with the global variant of the error).
+
+**The Bicep is correct — this is a subscription quota, not a template defect.**
+Everything else in the template validates cleanly (see `.pipeline/infra.md`).
+Resolve this before Phase A:
+
+```bash
+# Confirm the current quota (read-only):
+az rest --method get --url "https://management.azure.com/subscriptions/$SUB_ID/providers/Microsoft.App/locations/eastus/usages?api-version=2024-03-01" \
+  --query "value[?name.value=='ManagedEnvironmentCount']"
+```
+
+| Path | What it costs you | Verdict |
+|---|---|---|
+| **Upgrade the subscription to Pay-As-You-Go, then request a `ManagedEnvironmentCount` quota increase** (Portal → Subscription → Usage + quotas → request increase, or a support ticket) | An upgrade; quota requests are generally not granted on Free Trial | **Recommended.** Keeps the approved architecture exactly as designed. The same upgrade also re-enables **ACR Tasks** (`az acr build`), which is disabled on this subscription for the same reason — see the workaround comments in `cd.yml`. |
+| Put dev in a **second subscription** | A second subscription to manage; breaks the "same resource group" directive (§15.15.1) | Possible, but it is an architecture change — take it back to the architect. |
+| **Share `cae-todo-demo`** between dev and prod | Loses the network/identity isolation that is the entire point of §15.4.1 | **Do not do this silently.** It reverses an explicit architecture decision and needs a superseding `architecture-memory.md` entry. |
+
+## Run order (READ THIS FIRST — it is not alphabetical)
+
+**Phase E runs FIRST.** It has no dependency on any Azure resource, and Phase A
+*consumes* the `PGADMIN_PASSWORD_DEV` value that Phase E establishes. Doing it
+last — the way branch protection was deferred in previous cycles — means the
+promotion gate is unenforced during the exact window when the pipeline is being
+wired up and is at its most fragile.
+
+| Order | Phase | What | Depends on |
+|---|---|---|---|
+| **1** | **E** | **GitHub configuration — branch protection on `main` (E1) and `develop`, the `dev`/`production` Environments, the `PGADMIN_PASSWORD_DEV` secret, the `environment:dev` OIDC federated credential** | nothing |
+| 2 | A | One-time infra deploy of the dev stack | E (needs the password), and the quota blocker resolved |
+| 3 | B | `AcrPull` for both dev identities | A (identities do not exist until then) |
+| 4 | C | `Monitoring Metrics Publisher` for `todo-api-dev` | A |
+| 5 | D | In-database `pgaadauth` principal for `todo-api-dev` | A |
+| 6 | F | First real deploy through the pipeline | all of the above |
+
+Shell variables used throughout:
+
+```bash
+SUB_ID="9ba6633f-058c-4269-8b0f-086ab331ef26"
+RG="rg-todo-demo"
+REPO="matvi/todo-claude-multiagent"
+APP_ID="<the existing gh-todo-demo-cicd appId>"   # az ad app list --display-name gh-todo-demo-cicd --query "[0].appId" -o tsv
+```
+
+---
+
+## Phase E — GitHub configuration (DO THIS FIRST)
+
+### E0 — Check the repo's visibility and plan (one command, decides E1 and E3)
+
+```bash
+gh repo view "$REPO" --json visibility,isPrivate,name
+```
+
+**Branch protection and environment required-reviewers are BOTH unavailable on
+private repositories on the GitHub Free plan** — they need a public repo or
+Pro/Team/Enterprise. If this repo is private on Free, E1 and E3's reviewer rule
+will fail, and the fallback is Plan B in specs §15.9.5 (split `cd.yml` into
+`cd-dev.yml` + a `workflow_dispatch`-only `cd-prod.yml`). Record the answer in
+`.pipeline/changes.md`.
+
+### E1 — Branch protection on `main` ← REQUIRED, NOT OPTIONAL, NOT DEFERRED
+
+This is **the** gate. Everything else in this pipeline — the `deploy-dev` →
+`verify-dev` → `deploy-prod` job graph, the `production` environment approval,
+the `guard-promotion-source` check — assumes production only ever receives
+commits that arrived through a reviewed pull request. `cd.yml` triggers on
+`push: [develop, main]`, and that is only equivalent to "on merged PR" **if a
+direct push to `main` is impossible**. Without this rule, the entire gate is a
+convention the tooling happens to follow, and a single `git push origin main`
+walks straight past it.
+
+`.pipeline/infra.md` has now recorded three times that this was unverified and
+unenforced. Close it here.
+
+```bash
+gh api -X PUT "repos/$REPO/branches/main/protection" --input - <<'JSON'
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": [
+      "Backend (.NET 10 build + test)",
+      "Frontend (Vite build + vitest)",
+      "Docker build (both images, no push)",
+      "IaC (bicep build + lint)",
+      "Guard — PRs into main must come from develop or hotfix/*"
+    ]
+  },
+  "enforce_admins": true,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 1,
+    "dismiss_stale_reviews": true,
+    "require_code_owner_reviews": false
+  },
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false,
+  "required_linear_history": true,
+  "required_conversation_resolution": true
+}
+JSON
+```
+
+What each field buys, so none of it is cargo-culted:
+
+| Field | Why |
+|---|---|
+| `required_pull_request_reviews.required_approving_review_count: 1` | The human review gate. |
+| `dismiss_stale_reviews: true` | An approval must apply to the code that actually merges, not to an earlier push. |
+| `required_status_checks.contexts` | CI must be green **and** `guard-promotion-source` must confirm the PR came from `develop`/`hotfix/*`. GitHub cannot express "only merge from develop" natively — that check is the only enforcement. |
+| `strict: true` | Branch must be up to date, so CI ran against the real merge result. |
+| `enforce_admins: true` | **No admin bypass.** An admin bypass makes every rule above advisory. |
+| `allow_force_pushes` / `allow_deletions: false` | History on the production trunk cannot be rewritten or deleted. |
+| `required_linear_history: true` | Squash-merge only, matching the promotion model. |
+
+> **⚠️ The `contexts` strings must match the check-run names EXACTLY.** GitHub
+> matches on the job's `name:` field, **not** the job id — so it is
+> `"IaC (bicep build + lint)"`, not `"iac"`. A typo does not error: the check
+> simply never reports and every PR sits forever on *"Expected — waiting for
+> status to be reported."* After the first CI run on a PR, confirm the real
+> names with:
+> ```bash
+> gh api "repos/$REPO/commits/$(git rev-parse HEAD)/check-runs" --jq '.check_runs[].name'
+> ```
+
+Verify it took effect:
+
+```bash
+gh api "repos/$REPO/branches/main/protection" \
+  --jq '{admins: .enforce_admins.enabled,
+         reviews: .required_pull_request_reviews.required_approving_review_count,
+         checks: .required_status_checks.contexts,
+         force_push: .allow_force_pushes.enabled}'
+```
+
+### E2 — Create `develop` and protect it (lighter than `main`, on purpose)
+
+```bash
+git checkout main && git pull && git checkout -b develop && git push -u origin develop
+gh repo edit "$REPO" --default-branch develop   # so feature PRs target develop by default
+
+gh api -X PUT "repos/$REPO/branches/develop/protection" --input - <<'JSON'
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": [
+      "Backend (.NET 10 build + test)",
+      "Frontend (Vite build + vitest)",
+      "Docker build (both images, no push)",
+      "IaC (bicep build + lint)"
+    ]
+  },
+  "enforce_admins": false,
+  "required_pull_request_reviews": null,
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false
+}
+JSON
+```
+
+**No required approving review on `develop`** — deliberately lighter so
+integration stays fast. That is the point of having a dev environment.
+
+### E3 — GitHub Environments
+
+```bash
+# `dev` — no protection rules; it should be fast and unattended.
+gh api -X PUT "repos/$REPO/environments/dev"
+
+# `production` — REQUIRED REVIEWERS. This is what pauses deploy-prod before any
+# step runs. Without it, `environment: production` only affects the OIDC subject
+# and the deployment history; it gates nothing.
+USER_ID=$(gh api "users/<your-github-username>" --jq .id)
+gh api -X PUT "repos/$REPO/environments/production" \
+  -F "reviewers[][type]=User" -F "reviewers[][id]=$USER_ID"
+
+gh api "repos/$REPO/environments/production" --jq '.protection_rules'   # verify
+```
+
+### E4 — The deploy-time dev Postgres password
+
+```bash
+gh secret set PGADMIN_PASSWORD_DEV --repo "$REPO"   # prompts; never pass on the command line
+```
+
+**It MUST be a different value from production's `PGADMIN_PASSWORD`.** A dev
+credential leak must not reach production. This is a *deploy-time* secret only —
+the application has no password path to Postgres at all (§14); it is the
+break-glass `psql` login for the dev server.
+
+### E5 — OIDC federated credential for `environment:dev` ← the most likely first-run failure
+
+Declaring `environment: dev` on the `deploy-dev` job changes the OIDC **subject
+claim** from the branch form to the environment form. Azure matches the subject
+as an **exact string**, so without this credential `deploy-dev` dies at
+`azure/login` with an opaque `AADSTS700213: No matching federated identity
+record found`.
+
+```bash
+# Same immutable-subject caveat as Phase 1 above — if this repo uses the
+# immutable format, the subject is repo:<owner>@<ownerId>/<repo>@<repoId>:...
+OWNER_ID=$(gh api "users/$(echo "$REPO" | cut -d/ -f1)" --jq .id)
+REPO_ID=$(gh api "repos/$REPO" --jq .id)
+GH_SUBJECT_REPO="$(echo "$REPO" | cut -d/ -f1)@${OWNER_ID}/$(echo "$REPO" | cut -d/ -f2)@${REPO_ID}"
+
+az ad app federated-credential create --id "$APP_ID" --parameters '{
+  "name": "gh-todo-demo-env-dev",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:'"$GH_SUBJECT_REPO"':environment:dev",
+  "audiences": ["api://AzureADTokenExchange"]
+}'
+```
+
+Required subjects for the implemented design (**Plan A**):
+
+| Consumer | Required subject | Status |
+|---|---|---|
+| `deploy-dev` (`environment: dev`) | `repo:<subject-repo>:environment:dev` | **NEW — add it** |
+| `deploy-prod` (`environment: production`) | `repo:<subject-repo>:environment:production` | already exists (Phase 1b) |
+| `verify-dev` | none — it performs no Azure login at all | n/a |
+
+If you had to fall back to **Plan B** (§15.9.5, private repo on GitHub Free),
+the subjects revert to the branch form: `…:ref:refs/heads/develop` and
+`…:ref:refs/heads/main`.
+
+Fastest way to resolve a subject mismatch: trigger the workflow once — the
+`azure/login` failure message contains the **exact** subject GitHub presented,
+which can be pasted straight into the credential above.
+
+**No new RBAC is needed for the CD service principal.** It already holds
+`Contributor` on `rg-todo-demo`, and every dev resource lives in that same
+resource group. Only Phases B and C are new grants, precisely because
+`Contributor` cannot write role assignments.
+
+---
+
+## Phase A — one-time infra deploy of the dev stack
+
+> Blocked until the Container Apps environment quota above is resolved.
+> Dry-run first; `what-if` and `validate` change nothing.
+
+```bash
+read -rs PGPWD_DEV; export PGPWD_DEV   # the same value set as PGADMIN_PASSWORD_DEV in E4
+
+# Dry run (no changes applied):
+az deployment group what-if -g "$RG" \
+  --template-file infra/main.dev.bicep \
+  --parameters infra/main.dev.parameters.json \
+  --parameters containerTargetPort=80 \
+  --parameters postgresAdminPassword="$PGPWD_DEV"
+
+# The real thing:
+az deployment group create -g "$RG" -n main-dev \
+  --template-file infra/main.dev.bicep \
+  --parameters infra/main.dev.parameters.json \
+  --parameters containerTargetPort=80 \
+  --parameters postgresAdminPassword="$PGPWD_DEV"
+```
+
+**`containerTargetPort=80` is required for this bootstrap deploy only.** Both
+images default to the public `mcr.microsoft.com/k8se/quickstart` placeholder,
+which listens on **80**; the real app images listen on **8080**. Get this wrong
+and the revision never passes its health probe and provisioning times out. After
+the first CD run has replaced both images, re-deploy without the override (or
+just let CD keep managing the images — CD does not apply Bicep).
+
+Capture the outputs — Phases B, C and D consume them:
+
+```bash
+API_DEV_PID=$(az deployment group show -g "$RG" -n main-dev --query properties.outputs.todoApiDevPrincipalId.value -o tsv)
+WEB_DEV_PID=$(az deployment group show -g "$RG" -n main-dev --query properties.outputs.todoWebDevPrincipalId.value -o tsv)
+APPI_DEV_ID=$(az deployment group show -g "$RG" -n main-dev --query properties.outputs.appInsightsDevId.value -o tsv)
+PG_DEV=$(az deployment group show -g "$RG" -n main-dev --query properties.outputs.postgresDevServerName.value -o tsv)
+ACR_NAME=$(az deployment group show -g "$RG" -n main-dev --query properties.outputs.sharedAcrName.value -o tsv)
+```
+
+## Phase B — `AcrPull` for both dev identities on the shared ACR
+
+The CD service principal holds only `Contributor` and cannot write role
+assignments, which is why this is manual — same convention as production Phase 3.
+
+```bash
+ACR_ID=$(az acr show -n "$ACR_NAME" -g "$RG" --query id -o tsv)
+az role assignment create --role AcrPull --assignee "$API_DEV_PID" --scope "$ACR_ID"
+az role assignment create --role AcrPull --assignee "$WEB_DEV_PID" --scope "$ACR_ID"
+```
+
+Until this exists, `cd.yml`'s `az containerapp registry set` steps succeed but
+the image pull fails and the revision never becomes healthy.
+
+## Phase C — `Monitoring Metrics Publisher` for `todo-api-dev`
+
+Scoped to the **dev** App Insights component **only** — `todo-api-dev` must never
+be able to publish to production's component.
+
+```bash
+az role assignment create --role "Monitoring Metrics Publisher" \
+  --assignee "$API_DEV_PID" --scope "$APPI_DEV_ID"
+```
+
+`DisableLocalAuth: true` on the component means this grant is what allows
+telemetry at all; without it ingestion is rejected 403 and traces silently
+vanish (the app itself keeps running).
+
+## Phase D — the in-database Entra principal for `todo-api-dev`
+
+No ARM/Bicep surface exists for this; it is permanently a human step. Connect to
+the **dev** server as the Entra admin — `az account get-access-token
+--resource-type oss-rdbms` produces the token that `psql` takes as the password,
+over TLS:
+
+```bash
+export PGPASSWORD=$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)
+psql "host=${PG_DEV}.postgres.database.azure.com port=5432 dbname=postgres sslmode=require user=<entra-admin-upn>"
+```
+
+```sql
+-- Connected to `postgres` on pg-todo-demo-dev-cus01 AS the Entra admin:
+SELECT * FROM pgaadauth_list_principals(false);              -- inspect before creating
+SELECT * FROM pgaadauth_create_principal('todo-api-dev', false, false);
+
+-- Then connect to `tododb` ON THE DEV SERVER and grant what startup Migrate() needs:
+\c tododb
+GRANT CONNECT ON DATABASE tododb TO "todo-api-dev";
+GRANT ALL ON SCHEMA public TO "todo-api-dev";
+ALTER SCHEMA public OWNER TO "todo-api-dev";
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO "todo-api-dev";
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO "todo-api-dev";
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO "todo-api-dev";
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO "todo-api-dev";
+```
+
+The principal name **must** be exactly `todo-api-dev` — the four-way invariant:
+Container App name == system-assigned MI name == `pgaadauth` role == `Username=`
+in `ConnectionStrings__TodoDb`. A mismatch fails auth.
+
+> **Run this ONLY against the dev server.** Do **not** create `todo-api-dev` on
+> `pg-todo-demo-cus01`, and do not create `todo-api` on the dev server.
+> `pgaadauth` principals are **server-global**, and keeping the two sets
+> disjoint is the isolation guarantee this whole cycle is built on.
+
+## Phase F — first real deploy through the pipeline
+
+1. Merge something into `develop`. `deploy-dev` + `verify-dev` run; `deploy-prod`
+   is skipped by its `if:`.
+2. Confirm `verify-dev` is green. Its `GET /api/todos` check is the one that
+   proves Phase D actually worked.
+3. Open the `develop` → `main` PR. CI + `guard-promotion-source` must pass, and a
+   reviewer must approve (E1).
+4. On merge, the same workflow runs `deploy-dev` → `verify-dev` again for the
+   merge SHA, then pauses on `deploy-prod` for the `production` environment
+   approval (E3).
+5. Approve. `deploy-prod` asserts `todo-api:<sha>` is in ACR and re-points
+   production at that exact tag — no rebuild.
+
+### ACR housekeeping (occasional)
+
+Every run pushes three tags (`todo-api:<sha>`, `todo-web:<sha>-dev`,
+`todo-web:<sha>-prod`). Basic SKU includes 10 GiB. Prune old ones periodically:
+
+```bash
+az acr repository show-tags -n "$ACR_NAME" --repository todo-api --orderby time_asc -o tsv
+az acr repository delete    -n "$ACR_NAME" --image todo-api:<old-sha> --yes
+```
+
+Do **not** delete a tag that production is currently running, and keep at least
+the last known-good tag so a manual rollback (`az containerapp update -n todo-api
+--image .../todo-api:<previous-sha>`) stays possible.
+
+### Shared Log Analytics daily cap — inherited risk, now shared with dev
+
+`log-todo-demo` has a **1 GB/day** ingestion cap and dev now shares it. If dev
+ingestion exhausts it, **production telemetry silently stops** for the rest of
+that UTC day. Detect:
+
+```kusto
+Usage
+| where TimeGenerated > ago(7d) and IsBillable == true
+| summarize IngestedGB = sum(Quantity) / 1000 by bin(TimeGenerated, 1d), DataType
+| order by TimeGenerated desc
+```
+
+Respond by raising the cap (CD does not apply Bicep, so change **both**):
+`dailyQuotaGb: 2` in `modules/loganalytics.bicep`, and
+`az monitor log-analytics workspace update -g rg-todo-demo -n log-todo-demo --quota 2`.
+Only if it recurs should a dedicated `log-todo-demo-dev` workspace be
+considered — that contradicts a standing constraint and needs a superseding
+`architecture-memory.md` entry first.
 
 ---
 
@@ -332,3 +753,34 @@ az deployment group what-if --resource-group rg-todo-demo \
   --template-file infra/main.bicep --parameters infra/main.parameters.json \
   --parameters postgresAdminPassword="$PGPWD"
 ```
+
+## …and the dev stack (`main.dev.bicep`)
+
+Same shape, different template, different password, and **steady state uses the
+default `containerTargetPort` (8080)** — the `=80` override is only for the very
+first placeholder-image bootstrap (Phase A).
+
+```bash
+read -rs PGPWD_DEV; export PGPWD_DEV   # PGADMIN_PASSWORD_DEV — NOT production's password
+
+az deployment group create -g rg-todo-demo -n main-dev \
+  --template-file infra/main.dev.bicep \
+  --parameters infra/main.dev.parameters.json \
+  --parameters postgresAdminPassword="$PGPWD_DEV"
+
+# Dry-run alternatives (no changes applied):
+az deployment group validate -g rg-todo-demo \
+  --template-file infra/main.dev.bicep --parameters infra/main.dev.parameters.json \
+  --parameters postgresAdminPassword="$PGPWD_DEV"
+az deployment group what-if -g rg-todo-demo \
+  --template-file infra/main.dev.bicep --parameters infra/main.dev.parameters.json \
+  --parameters postgresAdminPassword="$PGPWD_DEV"
+```
+
+> Applying `main.dev.bicep` **never touches production** — every resource it
+> declares is either `-dev`-suffixed or referenced as `existing`. A `what-if` run
+> confirming exactly that (7 `Create`, every production resource `Ignore`) is
+> recorded in `.pipeline/infra.md`.
+>
+> The converse is **not** symmetric: `main.bicep` is deployed against a live,
+> deliberately drifted production stack. Do not re-apply it casually.

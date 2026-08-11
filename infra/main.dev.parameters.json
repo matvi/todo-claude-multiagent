@@ -1,0 +1,61 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "_comment": "DEV environment NON-SECRET parameters only (specs.md §15). postgresAdminPassword is @secure() and is NOT here and never will be: it is supplied at deploy time from the GitHub secret PGADMIN_PASSWORD_DEV via -p postgresAdminPassword=... It MUST be a different value from production's PGADMIN_PASSWORD — a dev credential leak must not reach production. Image tags default to the public mcr.microsoft.com/k8se/quickstart placeholder for the one-time bootstrap deploy and are overridden by CD with the real ACR images (todo-api:<sha> / todo-web:<sha>-dev); for that bootstrap deploy also pass -p containerTargetPort=80, because the placeholder listens on 80 while the real images listen on 8080. postgresLocation and postgresServerName are pinned to centralus / pg-todo-demo-dev-cus01 because Postgres location and name are immutable after creation AND because this subscription has a Postgres Flexible Server offer restriction in East US (the same restriction that put production in Central US). The postgresEntraAdmin* values are NON-SECRET identity metadata (an object ID and a UPN are not credentials) and are deliberately the SAME HUMAN admin as production's: reusing the human admin across servers is correct, reusing an application identity across servers is forbidden. acrName and logAnalyticsName name resources that already exist and are SHARED with production; this template references them as `existing` and creates neither.",
+  "parameters": {
+    "location": {
+      "value": "eastus"
+    },
+    "postgresLocation": {
+      "value": "centralus"
+    },
+    "namePrefix": {
+      "value": "todo-demo"
+    },
+    "acrName": {
+      "value": "acrtododemo3bkqjv23abtua"
+    },
+    "logAnalyticsName": {
+      "value": "log-todo-demo"
+    },
+    "acaEnvironmentDevName": {
+      "value": "cae-todo-demo-dev"
+    },
+    "appInsightsDevName": {
+      "value": "appi-todo-demo-dev"
+    },
+    "postgresServerName": {
+      "value": "pg-todo-demo-dev-cus01"
+    },
+    "databaseName": {
+      "value": "tododb"
+    },
+    "postgresAdminUser": {
+      "value": "todoadmin"
+    },
+    "postgresEntraAdminObjectId": {
+      "value": "ee31140f-3164-439c-8fa9-9f7e5dbd1b2c"
+    },
+    "postgresEntraAdminPrincipalName": {
+      "value": "ing.david.mata.az_outlook.com#EXT#@ingdavidmataazoutlook.onmicrosoft.com"
+    },
+    "postgresEntraAdminPrincipalType": {
+      "value": "User"
+    },
+    "postgresEntraAdminTenantId": {
+      "value": "6ce2ff72-209a-447d-bf53-9579c52c03f5"
+    },
+    "apiMinReplicas": {
+      "value": 0
+    },
+    "apiMaxReplicas": {
+      "value": 1
+    },
+    "webMinReplicas": {
+      "value": 0
+    },
+    "webMaxReplicas": {
+      "value": 1
+    }
+  }
+}
