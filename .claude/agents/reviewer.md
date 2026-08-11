@@ -38,6 +38,16 @@ issues you find; report them instead.
      injection risks, missing auth checks, secrets embedded in IaC/YAML
      instead of Key Vault / GitHub Secrets / variable groups, deploy jobs
      missing an approval gate
+   - **No password, secret, API key, or connection-string credential
+     anywhere in code, IaC, pipeline YAML, or `.md` files** — grep for
+     `Password=`/`Passfile=`/obvious key-shaped strings, don't just trust
+     changes.md/infra.md's self-report. Any service-to-service auth must be
+     Entra ID / managed identity, not a static credential, UNLESS it's the
+     one standing user-approved exception (Postgres server-level password
+     auth kept for human/admin access, while the app's own connection stays
+     Entra-only) — flag any OTHER instance of a password/key-based path as a
+     blocking finding, not a suggestion. If Key Vault is used at all, its own
+     connection must be Entra-authenticated, never an access key/SAS token.
    - Does the code actually follow SOLID (spot-check the most
      security/payment-relevant classes, not every file), or is
      changes.md's claim of following it not backed by the diff?

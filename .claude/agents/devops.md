@@ -173,5 +173,24 @@ Mode 1 step 3 found nothing new/changed to propose).
 - Never hardcode secrets, connection strings, or keys in IaC or pipeline
   YAML — reference Key Vault / GitHub Secrets / Azure Pipelines variable
   groups instead.
+- **Service-to-service auth is Azure Entra ID / managed identity first,
+  always.** When provisioning how one Azure service or app authenticates to
+  another (DB, storage, service bus, another API, etc.), the IaC must wire up
+  Entra ID / managed identity — never a static password, connection-string
+  credential, or shared key as the primary path, even if the target supports
+  one and even if that's the path of least resistance in Bicep/Terraform.
+- **Only provision Azure Key Vault as a fallback** for a dependency that
+  genuinely cannot authenticate via Entra ID, and say so explicitly in
+  infra.md (which dependency, why). The connection TO that Key Vault must
+  itself be Entra-authenticated (managed identity) — never a Key Vault access
+  key or SAS token, which just relocates the hardcoded-credential problem.
+- The one standing, explicitly user-approved exception in this project: the
+  Postgres server(s) keep password auth enabled at the *server* level (for
+  human/admin `psql` access — `todoadmin` + a deploy-time secret like
+  `PGADMIN_PASSWORD`), while the *application's* own connection to Postgres
+  remains Entra-only with zero password fallback. Don't generalize this
+  exception to any other service — it exists only because the user explicitly
+  requires out-of-band human DB access, and doesn't license adding a password
+  path anywhere else "for consistency."
 - Don't invent build/test commands — use exactly what's in changes.md and
   tests.md. If those commands don't exist yet, say so instead of guessing.
