@@ -5,14 +5,34 @@ This document also covers the **CI/CD + Infrastructure-as-Code extension**
 (added 2026-07-24, review cycle 1 of up to 3 for the extended scope). The
 extension lives in **§11**; §1–§10 describe the already-implemented app and are
 unchanged except for the two items in §8 that this cycle moves **into** scope.
-Later cycles appended **§12** (observability), **§13** (identity/secrets policy)
-and **§14** (Entra-ONLY Postgres auth for the app — *current cycle*).
+Later cycles appended **§12** (observability), **§13** (identity/secrets policy),
+**§14** (Entra-ONLY Postgres auth for the app) and **§16** (end-user
+authentication with Microsoft Entra External ID — *current cycle*).
 Author: Architect agent
-Date: 2026-08-06 (§14); 2026-07-27 (§12/§13); 2026-07-24 (§11); app spec 2026-07-23
+Date: 2026-08-12 (§16); 2026-08-06 (§14); 2026-07-27 (§12/§13); 2026-07-24 (§11);
+app spec 2026-07-23
 
-> **Current cycle = §14 only.** §1–§13 are historical/settled and reproduced
-> unchanged. **§14 supersedes parts of §13.4** (application DB auth + connection
-> string) and **§6.2/§6.3** (local dev DB auth). Where they disagree, **§14 wins**.
+> **Current cycle = §16 only.** §1–§14 are historical/settled and reproduced
+> unchanged; read them for context, do not re-implement them.
+>
+> **Supersession map — read this before resolving any apparent conflict:**
+> - **§14 supersedes parts of §13.4** (application DB auth + connection string)
+>   and **§6.2/§6.3** (local dev DB auth). Where they disagree, **§14 wins**.
+> - **§16 supersedes every "no authentication" statement** in the older
+>   sections: **§1** (overview: "There is no authentication"), **§7** ("Auth:
+>   none"), the **§8** out-of-scope bullet "Authentication, authorization, user
+>   accounts, multi-tenancy", and **assumption §9.2**. End users now authenticate.
+>   Those four statements are historical only and must not be cited as current.
+>   *Multi-tenancy remains out of scope* — only the auth half of that §8 bullet
+>   moves into scope.
+> - **§16 does NOT supersede §14.** The application's *own* connection to
+>   PostgreSQL stays Entra/managed-identity-only, passwordless, one code path.
+>   §16 authenticates **end users of the application**, which is a different
+>   concern from how the app authenticates to its database. Nothing in §16 may
+>   add a password, a Container Apps secret, or a second connection string to the
+>   database path.
+> - §15 is **reserved** for the unmerged dev-environment branch (see the note at
+>   the top of §16). There is intentionally no §15 in this file.
 
 ---
 
@@ -503,6 +523,13 @@ az containerapp create -g rg-todo-demo -n todo-api --environment cae-todo-demo \
 
 ### 6.2 docker-compose (local Postgres)
 
+> **SUPERSEDED by §14.6.** The password-based local setup below is historical and
+> **must not be implemented**. Local Postgres now runs with
+> `POSTGRES_HOST_AUTH_METHOD: trust` and **no** `POSTGRES_PASSWORD`, so local dev
+> uses the same single Entra code path with zero passwords. The literal value that
+> used to appear here has been replaced with a placeholder — no credential-shaped
+> value belongs in this document.
+
 `docker-compose.yml` at repo root runs **only Postgres** (backend and frontend
 run on the host via `dotnet run` / `npm run dev` for fast iteration):
 
@@ -511,8 +538,8 @@ services:
   db:
     image: postgres:16
     environment:
-      POSTGRES_USER: todo
-      POSTGRES_PASSWORD: todo
+      POSTGRES_USER: <username>
+      POSTGRES_PASSWORD: ***        # REMOVED — see §14.6 (trust auth, no password)
       POSTGRES_DB: tododb
     ports:
       - "5432:5432"
@@ -524,10 +551,13 @@ volumes:
 
 ### 6.3 Run instructions
 
-Local connection string (dev): 
-`Host=localhost;Port=5432;Database=tododb;Username=todo;Password=todo` — placed
-in `backend/src/TodoApi/appsettings.Development.json` under
-`ConnectionStrings:TodoDb` (no SSL locally).
+Local connection string (dev) — **SUPERSEDED by §14.6**, which requires a
+**passwordless** value in `backend/src/TodoApi/appsettings.Development.json` under
+`ConnectionStrings:TodoDb`:
+`Host=localhost;Port=5432;Database=tododb;Username=<local-role>` (loopback host, so
+the §14.5 SSL exemption applies). **No `Password=` / `Passfile=` in any
+environment.** The historical password-bearing form is intentionally not reproduced
+here.
 
 1. **Start Postgres**: `docker compose up -d`
 2. **Backend**: from `backend/src/TodoApi`:
@@ -2084,3 +2114,1355 @@ check) and 14.9 (live check) only. `tests.md` must state that the feature is
   validating auth shim so local and Azure are truly identical? *Recommendation:*
   no — cost/complexity far exceeds the benefit for a demo; revisit only if local
   auth drift causes a real defect.
+
+---
+
+## 16. Authentication & authorization — Microsoft Entra External ID + Postgres roles (extension — **this cycle's scope**)
+
+**Cycle date:** 2026-08-12. **Branch:** `pipeline/entra-external-id-auth`.
+
+> **Section numbering:** §15 (dev environment + dev→prod promotion) is authored and
+> validated on the unmerged branch `pipeline/dev-environment` (commit `37f8aa5`,
+> paused on a Container Apps Environment quota limit). That number is **reserved**;
+> this cycle is **§16** so the two can merge without renumbering. §16 assumes the
+> current single (production) environment. Where §15 later lands, everything in §16
+> must be duplicated per environment — see 16.14.
+>
+> **§16 does NOT supersede §14.** The application's PostgreSQL connection stays
+> Entra/managed-identity-only, passwordless, plain env var, zero fallback. §16 adds
+> *application-level* authentication of **end users** and authorization on top of it.
+> Nothing about the *transport* to Postgres changes. Where §16 and §13/§14 appear to
+> disagree about secrets, see **16.6**, which reconciles them explicitly.
+
+### 16.1 Overview
+
+The Todo app is currently anonymous: anyone who can reach `todo-web` can read and
+mutate every todo through `todo-api`, which accepts unauthenticated requests
+(specs §8, "No auth", was an explicit initial out-of-scope item). This cycle
+closes that: end users **self-register and sign in** through a new **Microsoft
+Entra External ID** (CIAM) tenant — either with an email + password local account
+(collecting name and phone at sign-up) or with a **Google** account federated into
+the same sign-in page — and every `todo-api` request must now carry a valid
+Entra-issued access token. **Entra proves *who* the caller is; PostgreSQL decides
+*what they may do*:** a new `users` table maps each Entra object ID to a profile
+and exactly one of two roles, `User` or `Admin`, and a server-side claims
+transformation re-derives that role from the database on **every** request before
+authorization runs. The SPA gains MSAL (silent SSO on load, interactive fallback,
+a "Continue with Google" shortcut) and hides admin-only routes, while the API
+enforces them.
+
+**Scope:** backend (token validation, claims transformation, provisioning, users
+endpoints, EF migration), frontend (MSAL, routing, role-aware UI), one new Azure
+resource (**Key Vault**, custodial — see 16.6), Bicep + workflow env/build-arg
+wiring, and a large **human-run bootstrap** in the external tenant, Google Cloud,
+and Postgres. **No change to compute topology, SKUs, regions, or the Postgres
+server.**
+
+### 16.2 Verified live state (read-only `az` + current source, 2026-08-12) — do not re-derive
+
+| Fact | Verified value |
+|---|---|
+| Workforce subscription / tenant | `9ba6633f-058c-4269-8b0f-086ab331ef26` / `6ce2ff72-209a-447d-bf53-9579c52c03f5` |
+| `todo-api` Container App | FQDN `todo-api.lemoncliff-b3b8a3d9.eastus.azurecontainerapps.io`, SystemAssigned MI principalId `05c60b63-dda9-4a3e-be87-ac8350600b79` |
+| `todo-web` Container App | FQDN `todo-web.lemoncliff-b3b8a3d9.eastus.azurecontainerapps.io`, SystemAssigned MI principalId `2ac8f48e-aa7a-405e-b8e5-a4aaea2da90b` |
+| Backend CORS | `Cors__AllowedOrigins__0 = https://<todo-web FQDN>`, policy `AllowAnyHeader().AllowAnyMethod()` (so `Authorization` is already permitted) |
+| Backend pipeline order | `UseCors` → `MapGet("/health")` → `MapControllers` (no auth middleware today) |
+| Frontend | React 19 + Vite, **no router dependency**, `VITE_API_BASE_URL` baked at build time via `--build-arg` (`frontend/Dockerfile`, `cd.yml` step "frontend") |
+| Frontend serving | nginx, `try_files $uri $uri/ /index.html` → **client-side deep links already work** (no change needed for `/admin`) |
+| Existing Entra usage | Workforce tenant only: Container App managed identities (ACR pull, Postgres, App Insights) + CI/CD OIDC federation. **No end-user identity of any kind exists yet.** |
+| Key Vault | **None provisioned** (§13.6 specified the pattern but deliberately did not instantiate it) |
+
+**Two tenants, and they are not interchangeable.** Everything above lives in the
+**workforce** tenant `6ce2ff72-…`. The customer identities in this cycle live in a
+**new, separate external tenant**. A managed identity is bound to the tenant that
+issued it, so **`todo-api`'s managed identity cannot authenticate to the external
+tenant** — this single fact drives several design decisions below (16.5, 16.6,
+16.13).
+
+### 16.3 Architecture
+
+#### 16.3.1 Components
+
+| # | Component | Where it lives | New? | Purpose |
+|---|---|---|---|---|
+| 1 | **Entra External ID tenant** (`Microsoft.AzureActiveDirectory/ciamDirectories`) | Own directory; ARM resource linked to sub `9ba6633f-…`, RG `rg-todo-demo` | **NEW** | Customer identity store + hosted sign-up/sign-in pages |
+| 2 | **`todo-web-spa` app registration** | External tenant | **NEW** | Public client (SPA, auth code + PKCE). No secret. |
+| 3 | **`todo-api-app` app registration** | External tenant | **NEW** | Protected resource. Exposes delegated scope `Todos.ReadWrite`. No secret. |
+| 4 | **`SignUpSignIn` user flow** | External tenant | **NEW** | Email+password and Google, collects Given Name / Surname / phone at sign-up |
+| 5 | **Google identity provider** (`socialIdentityProvider`) | External tenant | **NEW** | Holds the Google client ID + client secret |
+| 6 | **Google Cloud OAuth 2.0 Web client** | Google Cloud (outside Azure) | **NEW** | Issues the client ID/secret consumed by #5 |
+| 7 | **`kv-todo-demo…` Key Vault** | `rg-todo-demo`, eastus | **NEW** | *Custodial* store of record for the Google client secret (16.6). **No application identity has access.** |
+| 8 | **`users` table** | Existing `tododb` Postgres | **NEW** | Profile + role (`User`/`Admin`) keyed by Entra object ID |
+| 9 | **JWT bearer auth + `RoleClaimsTransformation`** | `todo-api` | **NEW** | Validates tokens, re-derives role from Postgres, provisions on first sign-in |
+| 10 | **MSAL React integration** | `todo-web` | **NEW** | Silent SSO, login UI, token attachment, admin route guard |
+
+No new compute. No change to ACA, ACR, Log Analytics, App Insights, or the
+Postgres server. Region posture unchanged (ACA/KV `eastus`, Postgres `centralus`).
+
+#### 16.3.2 End-to-end auth flow
+
+```
+┌──────────────────────────── BROWSER ────────────────────────────┐
+│ todo-web (React SPA + @azure/msal-react)                        │
+│                                                                 │
+│ (1) on load: instance.ssoSilent({ scopes:[api://…/Todos.ReadWrite] })
+│       └─ hidden iframe → https://<sub>.ciamlogin.com/<tenantId>/oauth2/v2.0/authorize
+│          ?prompt=none  … succeeds only if an IdP session cookie exists
+│                                                                 │
+│ (2) InteractionRequiredAuthError ⇒ render <LoginScreen>          │
+│       ├─ [Sign in / Sign up]  → loginRedirect({ scopes })        │
+│       └─ [Continue with Google]→ loginRedirect({ scopes,          │
+│                extraQueryParameters:{ domain_hint:'google.com' }})│
+└─────────────────────────────────┬───────────────────────────────┘
+                                  │ TLS (browser redirect)
+                                  ▼
+┌──────────── ENTRA EXTERNAL ID TENANT (separate directory) ───────┐
+│ user flow "SignUpSignIn" (Microsoft-hosted pages)                │
+│   • Email + password  (local account, self-service password reset)│
+│   • "Sign in with Google" ──► accounts.google.com ──► back        │
+│   • FIRST sign-up only: attribute collection page                 │
+│       Given Name, Surname, phoneNumber (custom attribute)         │
+│   • creates the user object in the external tenant                │
+│ returns: authorization code (PKCE) → /token                       │
+│   id_token  (aud = todo-web-spa client id)                        │
+│   access_token (aud = api://<todo-api-app client id>,             │
+│                 iss = https://<tenantId>.ciamlogin.com/<tenantId>/v2.0,
+│                 oid = stable user object id, scp = Todos.ReadWrite)│
+└─────────────────────────────────┬───────────────────────────────┘
+                                  │
+   (3) SPA: acquireTokenSilent → Authorization: Bearer <access_token>
+                                  │ HTTPS (ACA ingress, TLS terminated at ingress)
+                                  ▼
+┌──────────────────────────── todo-api (ACA) ─────────────────────┐
+│ UseCors → UseAuthentication → UseAuthorization → endpoints       │
+│                                                                  │
+│ (4) JwtBearer / Microsoft.Identity.Web validates:                │
+│       signature   ← JWKS from                                    │
+│         https://<sub>.ciamlogin.com/<tenantId>/v2.0/.well-known/openid-configuration
+│       issuer, audience (api://<api client id>), lifetime,        │
+│       tid == configured tenant, scp contains Todos.ReadWrite     │
+│                                                                  │
+│ (5) RoleClaimsTransformation (runs AFTER validation, EVERY req):  │
+│       oid ← "oid" claim                                          │
+│       DROP every inbound role/roles claim  ← anti-escalation      │
+│       SELECT role FROM users WHERE entra_object_id = oid          │
+│         └─ miss ⇒ INSERT (role='User', profile from claims)       │
+│       ADD role claim (value from the DB row, never from token)    │
+│                                                                  │
+│ (6) [Authorize] everywhere (fallback policy) ·                    │
+│     [Authorize(Policy="AdminOnly")] on admin endpoints            │
+│                                                                  │
+│ (7) EF Core / Npgsql ── Entra token from the todo-api MANAGED     │
+│     IDENTITY (unchanged §14) ── TLS ──► Postgres (tododb)         │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+Two independent Entra relationships are in play and must not be confused:
+
+* **End user → external tenant** (this cycle): OIDC/OAuth 2.0, tokens in the
+  `Authorization` header.
+* **`todo-api` → Postgres / App Insights / ACR** (§13/§14, unchanged): managed
+  identity in the **workforce** tenant. The `users` table is read and written over
+  that same, single, existing `NpgsqlDataSource`. **Do not create a second DB
+  connection, connection string, or auth path.**
+
+#### 16.3.3 Why Entra External ID (and not the alternatives)
+
+| Option | Verdict |
+|---|---|
+| **Entra External ID external tenant** | **CHOSEN.** The current Microsoft CIAM product; supports self-service sign-up with attribute collection, local email+password accounts, and Google/Facebook/Apple/OIDC federation out of the box; free for the first 50,000 MAU (this demo will have single-digit MAU → **$0**); first-class MSAL support in React and `Microsoft.Identity.Web` support in .NET. |
+| **Azure AD B2C** | **REJECTED — explicitly out of scope by user directive.** It is the legacy CIAM product (no new tenants after 2025-05-01; docs and blogs still reference it, which is a trap). Do not copy B2C patterns (`b2clogin.com`, `p=B2C_1_…` policy query params, `tfp` claim) into this design. |
+| Users in the existing **workforce** tenant | Rejected: workforce tenants are for employees; self-service consumer sign-up + Google federation + per-MAU billing are external-tenant features, and consumer sign-ups would pollute the directory that holds our subscription and managed identities. |
+| Roll our own (ASP.NET Core Identity + password hashes) | Rejected: puts password material, reset flows, lockout, and MFA in our codebase — the opposite of this project's zero-secret posture. |
+
+### 16.4 Data model
+
+#### 16.4.1 Table `users`
+
+Storage choice: the **existing** `tododb` PostgreSQL Flexible Server / `public`
+schema. No new database, server, or store. Created by an **EF Core code-first
+migration** (§3.4 convention), applied by the existing startup `Migrate()` running
+as the `todo-api` pgaadauth role.
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | `uuid` | PK | Internal surrogate key, generated in C# (`Guid.NewGuid()`), matching the `todos` pattern. Never exposed to Entra. |
+| `entra_object_id` | `uuid` | **NOT NULL, UNIQUE** | The token's **`oid`** claim. The join key between Entra and this table. |
+| `email` | `text` | NULL | From the `email` / `preferred_username` claim when present. Informational only — **never** used for authorization. |
+| `display_name` | `text` | NULL | `name` claim, else `given_name + ' ' + family_name`. |
+| `phone_number` | `text` | NULL | From the phone custom-attribute claim (16.5.4) when present; otherwise user-supplied via `PUT /api/users/me`. |
+| `role` | `text` | **NOT NULL**, default `'User'`, `CHECK (role IN ('User','Admin'))` | The single source of truth for authorization. |
+| `created_at` | `timestamptz` | NOT NULL | Set at provisioning. |
+| `updated_at` | `timestamptz` | NOT NULL | Bumped on profile/role change. |
+
+Indexes: PK on `id`; **unique index on `entra_object_id`** (`ix_users_entra_object_id`)
+— this is both the lookup path for every authenticated request and the race guard
+for concurrent first-login provisioning across replicas.
+
+Column widths: the three PII columns are Postgres `text` (unbounded) by design —
+an IdP-supplied value must never be truncated or rejected at the DB layer. Bounds
+are enforced at the **API** edge instead, on the only path a client can write them
+(`PUT /api/users/me`): `displayName` ≤ **256** chars, `phoneNumber` ≤ **64** chars,
+both via data annotations so a violation is a `400 ValidationProblemDetails`
+consistent with §3.5. `role` is `text` + CHECK, never a Postgres `ENUM` (16.4.2).
+
+**`oid`, not `sub` — this is a correctness requirement, not a preference.** The
+`sub` claim in Microsoft identity platform tokens is **pairwise**: the same human
+gets a *different* `sub` per application. Keying on `sub` would create a second row
+for the same person as soon as a second client (or the ID token vs. the access
+token) is involved, silently splitting their profile and role. `oid` is the
+directory object ID: stable per user per tenant, identical across all apps in the
+tenant. Use `oid`. If `oid` is absent from a validated token, that is a
+misconfiguration — **reject with 401**, do not fall back to `sub`.
+
+#### 16.4.2 Entity / EF mapping
+
+* `TodoApi/Models/AppUser.cs` — named `AppUser` (not `User`) to avoid colliding with
+  `System.Security.Claims`/ASP.NET `User` in controllers. Table name stays `users`.
+* `TodoApi/Models/UserRole.cs` — `enum UserRole { User = 0, Admin = 1 }`, mapped with
+  `.HasConversion<string>()` so the DB stores `'User'`/`'Admin'` (readable in psql,
+  which matters for the bootstrap in 16.11). **Do not** use a Postgres `ENUM` type —
+  EF migrations handle text + CHECK far more cleanly.
+* `TodoDbContext` gains `DbSet<AppUser> Users`, snake_case column mapping consistent
+  with the existing `todos` mapping, and the CHECK constraint via
+  `ToTable(t => t.HasCheckConstraint("ck_users_role", "role IN ('User','Admin')"))`.
+* Migration name: `AddUsers`. It must be additive only — **it must not touch
+  `todos`**.
+
+#### 16.4.3 Relationship to `todos` — deliberately none
+
+`todos` gets **no `owner_id` column** and no FK to `users` in this cycle. Todos
+remain a single shared list visible to every authenticated user. Per-user todo
+ownership is a different feature (data migration for existing rows, per-row
+authorization, list filtering, admin override semantics) and is **explicitly out of
+scope** (16.15). Stating this loudly because "add auth" is usually assumed to imply
+"and now todos are per-user" — it does not here, and the engineer must not add it.
+
+### 16.5 The identity provider — what gets created in the external tenant
+
+Everything in 16.5 happens **inside the external tenant** and is **human-run**
+(Portal or Microsoft Graph). See 16.13 for the exhaustive IaC-vs-human split and
+16.11 for the ordered runbook.
+
+#### 16.5.1 The tenant
+
+* Created from the **Microsoft Entra admin center** → Entra ID → Overview → Manage
+  tenants → **Create → External**, by an account holding the **Tenant Creator**
+  role scoped to subscription `9ba6633f-…` (or to `rg-todo-demo`).
+* Choose **"Use Azure Subscription"** (not the 30-day trial): link it to
+  subscription `9ba6633f-…`, resource group **`rg-todo-demo`** (one-RG convention).
+  Country/Region **United States** — *this cannot be changed later*.
+* Tenant/domain name: pick a globally-unique prefix, e.g. `tododemoext`, giving
+  primary domain `tododemoext.onmicrosoft.com`, **tenant subdomain `tododemoext`**,
+  and login host **`tododemoext.ciamlogin.com`**. Creation takes up to ~30 minutes.
+* Record and hand to the engineer/devops: **tenant ID (GUID)** and **subdomain**.
+  Both are non-secret identifiers.
+* **Cost:** External ID Basic includes the first **50,000 MAU free**; beyond that it
+  is per-MAU. This demo is expected to stay in single digits → **$0/month**. It does
+  create a billable *link* to the subscription, so the tenant must be linked to
+  `9ba6633f-…` and must not be left orphaned.
+
+> **IaC honesty.** An ARM/Bicep resource type does exist —
+> `Microsoft.AzureActiveDirectory/ciamDirectories@2023-05-17-preview` (name
+> `<prefix>.onmicrosoft.com`, `properties.createTenantProperties.{countryCode,displayName}`,
+> a `sku`). It is **preview**, it creates **only the empty directory** (no app
+> registrations, no user flow, no IdP, no attributes), and it **cannot be deployed
+> by the CD service principal or a managed identity** — reports and Microsoft Q&A
+> threads confirm CIAM directory creation requires an interactive **user** principal
+> with Tenant Creator, and failed/orphaned `ciamDirectories` resources are awkward to
+> clean up. **Decision: do not add it to `infra/main.bicep`.** The portal flow is the
+> supported path and this is a one-time bootstrap. Devops MAY author an optional,
+> clearly-labelled `infra/bootstrap/externalid-tenant.bicep` for reference, but it
+> must be excluded from the CD deployment and documented as "human, `az login` as a
+> user, run once".
+
+#### 16.5.2 App registration — `todo-api-app` (the protected API)
+
+* Supported account types: **Accounts in this organizational directory only**.
+* **Expose an API** → Application ID URI: accept `api://<api-client-id>`.
+* Add **one delegated scope**: `Todos.ReadWrite` (admin consent display name
+  "Access the Todo API on behalf of the signed-in user"). Do **not** add app roles
+  or application permissions — there is no daemon client, and every unused
+  permission is attack surface.
+* Manifest: `accessTokenAcceptedVersion = 2` (v2 tokens; `scp` claim).
+* **Token configuration → optional claims (Access token):** add `email`,
+  `given_name`, `family_name`, and the **directory extension** claim for the phone
+  attribute (16.5.4). Where a claims-mapping edit requires it, set
+  `acceptMappedClaims = true` on this registration.
+* **No client secret and no certificate is created for this registration.** The API
+  only *validates* tokens (public JWKS); it never *acquires* one. If anyone is about
+  to create a secret here, the design has been misunderstood.
+
+#### 16.5.3 App registration — `todo-web-spa` (the SPA)
+
+* Supported account types: same tenant only. Platform: **Single-page application**
+  (this is what enables auth code + PKCE and refuses the implicit flow).
+* Redirect URIs:
+  * `https://todo-web.lemoncliff-b3b8a3d9.eastus.azurecontainerapps.io/`
+  * `http://localhost:5173/` — the **only** permitted non-TLS URI, allowed because
+    it is strictly loopback (consistent with the §14.5 loopback exemption). Never
+    register a non-loopback `http://` URI.
+* API permissions: Microsoft Graph `openid`, `offline_access`, `profile`, `email`
+  (delegated) + `todo-api-app` → `Todos.ReadWrite`. Then **Grant admin consent** —
+  in an external tenant, end users cannot consent for themselves, so without this
+  step every sign-in fails at the consent screen.
+* **Public client. No secret, ever.** A secret in a SPA is a published secret.
+
+#### 16.5.4 User flow `SignUpSignIn` and the phone attribute
+
+* External Identities → User flows → **New user flow**, name `SignUpSignIn`.
+* Identity providers: **Email Accounts → "Email with password"** (gives the
+  email/password login the requirement asks for, plus self-service password reset)
+  **and** Google (only selectable after 16.5.5 is done — order matters).
+* User attributes to collect: **Email Address** (implicit), **Given Name**,
+  **Surname**, and **`phoneNumber`**.
+* **Finding — there is no built-in phone attribute.** The built-in collectable set
+  in external tenants is exactly: City, Country/Region, Display Name, Email Address,
+  Given Name, Job Title, Postal Code, State/Province, Street Address, Surname.
+  **Phone is not in it.** So `phoneNumber` must be created first as a **custom user
+  attribute** (External Identities → Custom user attributes → Add: name
+  `phoneNumber`, data type **String**, input type **TextBox**), then selected in the
+  user flow. It is stored as a directory extension on the `b2c-extensions-app` and
+  is surfaced in tokens as
+  `extension_<b2cExtensionsAppId-without-hyphens>_phoneNumber`.
+  * Consequence: **the phone claim name is tenant-specific and only knowable after
+    the tenant exists.** The API must not hard-code it — see 16.7.4.
+  * `phoneNumber` is a free-text string, **not** a verified phone number and **not**
+    an MFA method. No SMS verification in this cycle (16.15).
+* **Add both applications to the user flow** (`todo-web-spa` and `todo-api-app`).
+  An application can be associated with only one user flow.
+* Google sign-ups: the attribute-collection page is expected to appear on the
+  **first** Google sign-in for attributes the IdP does not supply (i.e. phone), with
+  name/email pre-filled from Google. **Assumption A3 (16.16) — verify empirically.**
+  The design degrades safely if it does not: `phone_number` is nullable and
+  `PUT /api/users/me` lets the user fill it in.
+
+#### 16.5.5 Google as a federated identity provider
+
+Two halves. The first is **outside Azure entirely and cannot be automated by any
+agent or pipeline** — it needs a human with a Google account.
+
+**(a) Google Cloud console (console.cloud.google.com) — human:**
+1. Create a project (e.g. `todo-demo-auth`).
+2. **APIs & Services → OAuth consent screen**: User type **External**; app name;
+   user support email; **Authorized domains: `ciamlogin.com` and
+   `microsoftonline.com`**; developer contact email. Save.
+3. **Credentials → Create credentials → OAuth client ID → Web application.**
+4. **Authorized redirect URIs** (substitute the real `<tenant-ID>` GUID and
+   `<tenant-subdomain>`; all seven, exactly):
+   * `https://login.microsoftonline.com`
+   * `https://login.microsoftonline.com/te/<tenant-ID>/oauth2/authresp`
+   * `https://login.microsoftonline.com/te/<tenant-subdomain>.onmicrosoft.com/oauth2/authresp`
+   * `https://<tenant-ID>.ciamlogin.com/<tenant-ID>/federation/oidc/accounts.google.com`
+   * `https://<tenant-ID>.ciamlogin.com/<tenant-subdomain>.onmicrosoft.com/federation/oidc/accounts.google.com`
+   * `https://<tenant-subdomain>.ciamlogin.com/<tenant-ID>/federation/oauth2`
+   * `https://<tenant-subdomain>.ciamlogin.com/<tenant-subdomain>.onmicrosoft.com/federation/oauth2`
+5. Record the **client ID** (non-secret identifier) and **client secret**
+   (**secret** — handle per 16.6; do not paste it into chat, a PR, an issue, a
+   `.env`, or this file).
+
+**(b) External tenant — human:** External Identities → All identity providers →
+Built-in → **Google → Configure** → name `Google`, paste client ID + client secret →
+Save. (Graph/PowerShell equivalent: `New-MgIdentityProvider` with
+`@odata.type = microsoft.graph.socialIdentityProvider`, `identityProviderType = "Google"`.)
+Then add **Google** to the `SignUpSignIn` user flow's identity providers.
+
+**Where the Google client secret ends up:** inside the external tenant's
+`socialIdentityProvider` object, which is **write-only over Graph** (it is never
+readable back). **No component we build ever reads it** — not `todo-api`, not
+`todo-web`, not CI/CD. See 16.6.
+
+### 16.6 Secrets — reconciling the user's request with §13/§14 (read this before wiring anything)
+
+The request said: *"Create an Azure Key Vault; put the Google client secret and the
+Postgres connection string in it; API's managed identity gets read permission."*
+Applying that literally would **regress** two hard-won invariants. Here is the
+honest accounting, per item:
+
+**(1) The Postgres connection string — requirement does not apply. Do not put it
+in Key Vault.**
+Since §14 the application's connection string is **passwordless**
+(`Host=…;Port=5432;Database=tododb;Username=todo-api;Ssl Mode=Require;…`) and
+contains **no credential at all** — authentication happens at connection-open time
+with an Entra token fetched by `todo-api`'s managed identity. It is therefore not a
+secret, and §13.2/§14.4 require it to be a **plain env var**. Moving a non-secret
+into Key Vault would (a) add a runtime dependency and failure mode for zero security
+gain, (b) contradict §14.4's "single source of truth, plain env var" contract, and
+(c) invite a future reader to "restore" a password into it. **Decision: unchanged
+from §14. The DB half of requirement 3 is not applicable, by design, because the
+thing it was protecting no longer exists.** The `users` table is reached over that
+exact same existing `NpgsqlDataSource` — no second connection string, no second auth
+path.
+
+**(2) The Google client secret — a real secret, and the reason Key Vault is now
+justified.**
+It is issued by **Google**, a third party with no relationship to Entra ID. It
+cannot be replaced by a managed identity, a workload-identity federation, or any
+Entra construct — this is precisely the "dependency that genuinely cannot
+authenticate via Entra ID" case in which Key Vault is the correct fallback. But note
+*who consumes it*: **Entra External ID does**, once, at IdP configuration time. Our
+applications never do.
+
+**Decision:** provision **one Key Vault** (`kv-todo-…`, `rg-todo-demo`, eastus,
+Standard, **RBAC authorization**) as the **custodial store of record** for the Google
+OAuth client secret, so the value has a rotation-safe home that is not a chat
+message, a sticky note, or a git-tracked file.
+
+* Secret name: `google-oauth-client-secret`. (The Google **client ID** is not secret
+  and may live in plain documentation/config if ever needed.)
+* **Access model — Entra RBAC only.** `enableRbacAuthorization: true` (never legacy
+  access policies). The **human operator** who administers the external tenant gets
+  **`Key Vault Secrets Officer`** on the vault, granted out-of-band by a human
+  (§11.6: agents never create role assignments). Access to Key Vault is itself
+  Entra-authenticated via that human's Entra identity — **no vault access key, no
+  SAS token, no shared credential of any kind.**
+* **Deliberately: neither `todo-api`'s nor `todo-web`'s managed identity is granted
+  any role on this vault.** The request asked for API read permission; the API has
+  no use for this secret, and granting it would violate least privilege and create a
+  path by which a compromised API could exfiltrate the Google credential. **This is a
+  documented, intentional deviation from the literal request.**
+* Secrets are written by a human (`az keyvault secret set --vault-name <kv> --name
+  google-oauth-client-secret --value <paste>`), never by an agent, never by CI/CD.
+* Purge protection: `enableSoftDelete: true`, `softDeleteRetentionInDays: 7`,
+  `enablePurgeProtection: false` — soft delete gives recoverability; purge protection
+  is irreversible and unnecessary for a demo (documented tradeoff, revisit for prod).
+* Cost: ~$0.03 per 10,000 operations, and this vault sees a handful of operations per
+  *year*. Effectively **$0/month**.
+
+**(3) Everything else stays secretless.** Neither app registration has a client
+secret (the SPA is a public client with PKCE; the API only validates tokens). The
+external tenant IDs, client IDs, authority URLs and scope names are **public
+identifiers**, not credentials — they ship in the SPA bundle by necessity and are
+plain env vars on the API.
+
+**If a future feature needs the app to read a Key Vault secret**, the mandatory
+pattern is still §13.6: Container Apps Key Vault *reference* secret
+(`keyVaultUrl` + `identity: system`), with `Key Vault Secrets User` granted to the
+Container App's managed identity — Entra-authenticated, never a vault key. Record any
+such secret in `architecture-memory.md`.
+
+**Net effect on the §13 per-secret classification table:** unchanged for every
+existing row; **one new row** — *Google OAuth client secret → consumed by Entra
+External ID, custodied in Key Vault, read by humans only, never by an application.*
+**Application runtime secrets remain: zero.**
+
+### 16.7 Backend design (`todo-api`)
+
+#### 16.7.1 Packages and configuration
+
+Add `Microsoft.Identity.Web` (which pulls
+`Microsoft.AspNetCore.Authentication.JwtBearer`). Do not hand-roll JWT validation.
+
+New configuration keys — **all non-secret, all plain env vars** (never Container
+Apps secrets, never Key Vault):
+
+| Config key | Env var | Example shape | Required |
+|---|---|---|---|
+| `AzureAd:Instance` | `AzureAd__Instance` | `https://<tenant-subdomain>.ciamlogin.com/` | yes |
+| `AzureAd:TenantId` | `AzureAd__TenantId` | external tenant GUID | yes |
+| `AzureAd:ClientId` | `AzureAd__ClientId` | `todo-api-app` client ID (GUID) | yes |
+| `AzureAd:Audience` | `AzureAd__Audience` | `api://<todo-api-app client ID>` | yes |
+| `AzureAd:Scopes` | `AzureAd__Scopes` | `Todos.ReadWrite` | yes |
+| `Users:PhoneClaimName` | `Users__PhoneClaimName` | `extension_<appIdNoHyphens>_phoneNumber` | optional (16.7.4) |
+
+**Fail fast at startup** if **any of the five required keys** — `Instance`,
+`TenantId`, `ClientId`, `Audience`, **`Scopes`** — is missing or blank, with an
+`InvalidOperationException` that names *every* missing key. Same philosophy as
+§14.5. An API that boots without auth configuration is an API that serves
+unauthenticated traffic, which is exactly the failure mode this cycle exists to
+remove. `/health` must still respond (see 16.7.7).
+
+`Scopes` is deliberately in the fail-fast list even though it is not a token-
+validation parameter: it is the value the `[RequiredScope]` enforcement in 16.7.2a
+binds to, so a blank value would silently disable the scope check — an invisible
+security downgrade. (An earlier draft of this section listed only four keys; the
+five-key list above is authoritative.)
+
+Shape validation, additionally, at startup:
+* `Instance` must parse as an **absolute `https://` URI** — reject `http://`
+  outright; token metadata is always fetched over TLS (16.10).
+* `TenantId` must parse as a **GUID**.
+
+`Users:PhoneClaimName` is optional and must **never** be part of the fail-fast
+list: its value cannot be known until the external tenant exists (16.5.4).
+
+#### 16.7.1a Backend file inventory (authoritative — engineer and tester bind to these names)
+
+New/changed files under `backend/src/TodoApi/` (extends the §3.2 layout, which
+otherwise stays exactly as it is):
+
+```
+Auth/
+  EntraAuthOptions.cs          # binds + validates the AzureAd section (fail fast)
+  UserProfileOptions.cs        # binds the Users section (PhoneClaimName)
+  AuthenticationRegistration.cs# AddTodoApiAuthentication(): JwtBearer + policies + DI
+  RoleClaimsTransformation.cs  # IClaimsTransformation (scoped) — 16.7.3
+  IUserProvisioningService.cs  # get-or-create contract
+  UserProvisioningService.cs   # get-or-create implementation — 16.7.5
+  ProfileClaimsReader.cs       # email / name / phone claim extraction — 16.7.4
+  ClaimsPrincipalExtensions.cs # oid / tid / failure-marker read helpers
+  AuthOutcomeMiddleware.cs     # turns a transformation failure into 401/503 — 16.7.6
+  TodoClaimTypes.cs            # todo:role_source, todo:auth_failure constants
+Controllers/
+  UsersController.cs           # NEW — 16.8
+  TodosController.cs           # CHANGED — attributes only (16.7.2a); payloads unchanged
+Models/
+  AppUser.cs, UserRole.cs      # NEW — 16.4
+Dtos/
+  UserResponse.cs, UpdateUserProfileRequest.cs, UpdateUserRoleRequest.cs  # NEW
+Data/
+  TodoDbContext.cs             # CHANGED — DbSet<AppUser> + users mapping (16.4.2)
+Migrations/                    # NEW migration `AddUsers` (additive only)
+Program.cs                     # CHANGED — registration + middleware order (16.7.6)
+```
+
+**Claim types this application mints itself** (namespaced `todo:` so a token can
+never spoof them; `RoleClaimsTransformation` is the only writer):
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `TodoClaimTypes.RoleSource` | `todo:role_source` = `"db"` | The role claim was read from PostgreSQL. Doubles as the idempotence guard (16.7.3 step 2). |
+| `TodoClaimTypes.AuthFailure` | `todo:auth_failure` | The principal passed JWT validation but must not be treated as a user of this app. Consumed by `AuthOutcomeMiddleware` (16.7.6). |
+| ↳ value `invalid_principal` | | Wrong `tid`, or no usable `oid` ⇒ **401**. |
+| ↳ value `role_source_unavailable` | | The role could not be read from Postgres ⇒ **503**, fail closed. |
+
+#### 16.7.2 Token validation
+
+```csharp
+builder.Services
+    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddMicrosoftIdentityWebApi(builder.Configuration.GetSection("AzureAd"));
+```
+
+Binding requirements (assert these explicitly in code where they are not already the
+framework default, and cover them with tests):
+
+* `RequireHttpsMetadata = true` (default — **never** set false).
+* `ValidateIssuer = true`, `ValidateAudience = true`, `ValidateLifetime = true`,
+  `ValidateIssuerSigningKey = true`. **Never** set any of these to false, and never
+  supply a custom `IssuerValidator` that returns unconditionally.
+* Audience = `api://<api-client-id>` (and/or the bare client ID). This is what makes
+  an **ID token** (audience = the SPA's client ID) unusable against the API — a
+  common and serious bypass if audience validation is loose.
+* `ClockSkew` — leave the default (5 min).
+
+**Known External ID issuer gotcha (call this out to the engineer).** The
+configured authority uses the *subdomain* host
+(`https://<sub>.ciamlogin.com/<tenantId>/v2.0`) while the token's `iss` uses the
+*tenant GUID* host (`https://<tenantId>.ciamlogin.com/<tenantId>/v2.0`).
+`Microsoft.Identity.Web`'s issuer validator is expected to accept this via the
+discovery document's `issuer` template — **verify against a real token during
+implementation**. If it fails with `IDX10205`, the **only** acceptable fix is to add
+both concrete issuer strings to `TokenValidationParameters.ValidIssuers` via a
+`Configure<JwtBearerOptions>` post-configuration step. **Disabling issuer validation
+is not an acceptable fix** and must be rejected in review.
+
+Additionally, as defence in depth, the claims transformation (16.7.3) **must** verify
+that the `tid` claim equals `AzureAd:TenantId` and fail the request otherwise.
+
+#### 16.7.2a Scope enforcement — required, and required *everywhere*
+
+Audience validation proves the token was minted **for this API**; it does not prove
+the user consented to the delegated permission. §16.8 requires `scp` to contain
+`Todos.ReadWrite` on **every non-anonymous endpoint**, so state the mechanism
+explicitly rather than leaving it to each controller author:
+
+* Use `Microsoft.Identity.Web`'s **`[RequiredScope(RequiredScopesConfigurationKey =
+  "AzureAd:Scopes")]`** — bound to configuration, never a hard-coded literal.
+* It must be applied to **`UsersController` *and* `TodosController`**. A partial
+  application is a real gap: a token issued for this audience but without the
+  scope would still reach `/api/todos`. `TodosController` therefore changes in
+  this cycle — **attributes only**; its routes, DTOs and payloads are untouched
+  (the §3.5 contract still holds for authenticated callers).
+* Any future controller inherits authentication from the fallback policy but
+  **not** the scope check, so adding `[RequiredScope(...)]` alongside the class-
+  level `[Authorize]` is part of "adding a controller" in this codebase. Reviewers
+  must check for it.
+* Insufficient scope ⇒ **`403`** (`insufficient_scope`), not `401` — the caller is
+  authenticated, just not permitted.
+* `/health` is `[AllowAnonymous]` and carries no scope requirement (16.7.7).
+
+#### 16.7.3 Role attachment — `RoleClaimsTransformation` (Entra proves identity, Postgres decides role)
+
+Implement `TodoApi/Auth/RoleClaimsTransformation.cs` as an `IClaimsTransformation`,
+registered **scoped** (it needs the request-scoped `TodoDbContext`). It runs after
+token validation and before authorization, on every authenticated request.
+
+Required behaviour, in order:
+
+1. If the principal is not authenticated, return it untouched.
+2. **Idempotence guard.** `IClaimsTransformation.TransformAsync` may be invoked more
+   than once per request. If the identity already carries our marker
+   (`todo:role_source == "db"`), return immediately — no second DB round trip.
+3. Read `tid`; if it is missing or ≠ `AzureAd:TenantId`, **do not** add any role and
+   mark the principal as rejected (the endpoint filter/handler returns 401). A token
+   from another tenant that somehow passed signature validation must not become a
+   local user.
+4. Read `oid` (`http://schemas.microsoft.com/identity/claims/objectidentifier` or
+   `oid`). Missing/unparseable as a GUID ⇒ same rejection as (3). **Never fall back
+   to `sub`, `email`, or `preferred_username` as the identity key.**
+5. **Strip every inbound role claim** — all claims whose type is `roles`, `role`, or
+   `ClaimTypes.Role` — from the cloned identity **before** adding ours. Today the
+   tenant issues none; this makes it structurally impossible for a future app-role
+   assignment, a claims-mapping change, or a mis-scoped token to grant `Admin`.
+6. **Get-or-create** the `users` row (16.7.5) and read its `role`.
+7. Add exactly one role claim, using the identity's own `RoleClaimType`
+   (`((ClaimsIdentity)principal.Identity).RoleClaimType`) so that both
+   `User.IsInRole(...)`, `[Authorize(Roles = "Admin")]` and policy-based checks
+   agree regardless of how MIW configured the mapping. Add the
+   `todo:role_source = "db"` marker claim.
+8. Return a **cloned** `ClaimsPrincipal` (never mutate the validated identity in
+   place).
+
+Authorization policies, registered in `Program.cs`:
+
+```csharp
+builder.Services.AddAuthorization(options =>
+{
+    options.FallbackPolicy = new AuthorizationPolicyBuilder()
+        .RequireAuthenticatedUser()
+        .Build();                                   // secure by default
+    options.AddPolicy("AdminOnly", p => p.RequireRole("Admin"));
+});
+```
+
+The **fallback policy** is deliberate: any endpoint added in the future is
+authenticated unless someone *explicitly* writes `[AllowAnonymous]`. The alternative
+(remembering to add `[Authorize]` to each new controller) is the classic way auth
+silently regresses.
+
+**Rejected alternatives (record in review):**
+
+| Alternative | Why rejected |
+|---|---|
+| Put the role in an Entra **app role** / group claim | The API would have to *write* roles into the external tenant to promote a user — i.e. Graph write access from `todo-api`. Its managed identity lives in the **workforce** tenant and cannot authenticate to the external tenant, so this would require an app registration **with a client secret** in the external tenant: a new stored application secret, directly contradicting §13/§14. Postgres-held roles keep the zero-secret posture. It also contradicts the explicit requirement ("Postgres decides permissions"). |
+| Trust a role claim the SPA sends (header/body/localStorage) | Trivial privilege escalation. The client is never authoritative for authorization. |
+| Cache the role in the token (only re-read at login) | A demotion would not take effect until the token expires (up to ~1 h). Re-deriving per request makes revocation immediate. |
+| Custom middleware instead of `IClaimsTransformation` | Would have to run after `UseAuthentication` and re-implement principal replacement; `IClaimsTransformation` is the framework-sanctioned hook and composes with `[Authorize(Roles=…)]` for free. |
+| In-memory role cache | Deferred, not rejected: correctness first. A short (30–60 s) `IMemoryCache` keyed by `oid` is the documented optimisation **if** the per-request indexed lookup ever shows up in traces; it trades immediate revocation for latency and must be a conscious, documented change. |
+
+#### 16.7.4 Reading the profile claims
+
+* `email` ← `email`, else `preferred_username` (if it looks like an email).
+* `display_name` ← `name`, else `"{given_name} {family_name}".Trim()`, else null.
+* `phone_number` ← the claim named by `Users:PhoneClaimName` when configured;
+  otherwise **the first claim whose type ends with `_phoneNumber`** (this survives
+  the tenant-specific `extension_<appId>_phoneNumber` naming from 16.5.4 without
+  hard-coding a GUID). If neither is found, leave it null — this is normal, not an
+  error, and must not fail the request.
+* All three are **informational profile data only**. None of them may influence
+  authorization in any way.
+
+#### 16.7.5 First-login provisioning — get-or-create inside the transformation
+
+**Decision: the profile row is created lazily, server-side, on the first
+authenticated request, inside the same code path that reads the role. There is no
+`/api/auth/provision` endpoint.**
+
+Mechanism (`TodoApi/Auth/UserProvisioningService.cs`):
+
+```
+row = SELECT * FROM users WHERE entra_object_id = @oid
+if (row == null):
+    INSERT users(id, entra_object_id, email, display_name, phone_number,
+                 role, created_at, updated_at)
+    VALUES (newGuid, @oid, @email, @name, @phone, 'User', now, now)
+    on unique-violation (23505, concurrent replica):
+        row = SELECT ... again      // the other request won; use its row
+return row
+```
+
+* `role` is **always** the server-side literal `'User'` on insert. It is never read
+  from the request, the token, or configuration. There is **no "first user becomes
+  Admin"** rule — that is a land-grab race (whoever registers first, including an
+  attacker, becomes Admin). Bootstrap is a deliberate human DB action (16.11).
+* The unique index on `entra_object_id` plus the 23505 catch makes this safe across
+  the up-to-3 `todo-api` replicas.
+* Existing rows: only `updated_at`-worthy profile drift is ignored here (a returning
+  user's changed name is not re-synced on every request — that would make every
+  request a write). `PUT /api/users/me` is the update path.
+* Log at `Information` **once per creation**: `"Provisioned new user {Oid} with role
+  User."` — log the `oid` only. **Never** log the token, email, or phone.
+
+**Rejected alternative — `POST /api/auth/provision` called by the SPA after login.**
+It is skippable: any authenticated caller (curl, a second client, a returning user
+whose SPA call failed) could reach `/api/todos` with no row, so every other endpoint
+would need a "row missing" fallback anyway — i.e. we would implement get-or-create
+regardless, plus an extra endpoint and an extra round trip. It also puts a
+client-triggered write on the auth path. Lazy server-side provisioning has exactly
+one code path and cannot be bypassed. (Cost: the auth path touches the DB on every
+request; accepted, see 16.14.)
+
+#### 16.7.6 Middleware order
+
+```
+UseCors(CorsPolicyName)      // MUST stay first: answers preflight before auth,
+                             // and puts CORS headers on 401/403 so the browser
+                             // surfaces a real status instead of an opaque failure
+UseAuthentication()
+UseAuthOutcome()             // AuthOutcomeMiddleware — see below. Between
+                             // UseAuthentication() and UseAuthorization().
+UseAuthorization()
+MapGet("/health").AllowAnonymous()
+MapControllers()
+```
+
+**`AuthOutcomeMiddleware` — why it exists and what it must do.** `RequireAuthenticatedUser()`
+is satisfied by *any* validated token. A principal that carried the wrong `tid`, or
+no usable `oid`, or whose role could not be read from Postgres, is still
+"authenticated" — it just has no role — so without this middleware it would sail
+past the fallback policy and be refused (or, worse, allowed) somewhere further in,
+inconsistently. The transformation therefore **marks** such principals
+(`todo:auth_failure`, 16.7.1a) instead of throwing, and this middleware converts the
+marker into a response **before authorization runs**:
+
+| `todo:auth_failure` value | Status | Body |
+|---|---|---|
+| `invalid_principal` (wrong `tid`, missing/unparseable `oid`) | **401** + `WWW-Authenticate: Bearer` | `ProblemDetails`, generic — never echo the claim, the token, or which check failed in detail |
+| `role_source_unavailable` (Postgres unreachable) | **503** | `ProblemDetails`, "Authorization data is temporarily unavailable. Please retry." |
+
+Rules:
+* Endpoints carrying `IAllowAnonymous` metadata (only `/health`) are **skipped**, so
+  a caller presenting a broken token can never take the health probe down.
+* Log a `Warning` for a refused authenticated caller with **path + method only** —
+  never the token, the `Authorization` header, or any claim value (16.10).
+* This middleware is the **only** place that maps an auth-outcome marker to a
+  status. Do not duplicate the mapping in controllers or filters.
+
+#### 16.7.7 `/health` stays anonymous
+
+`GET /health` keeps returning `{ "status": "ok" }` with **no** token required —
+Container Apps probes cannot present one, and gating it would take the app down.
+With the fallback policy in place this now requires an explicit `.AllowAnonymous()`.
+It must not leak anything: no user counts, no config, no claim echo. It also must not
+touch the DB (unchanged from today).
+
+### 16.8 API surface
+
+All endpoints are HTTPS-only (ACA ingress) and, except `/health`, require
+`Authorization: Bearer <access token>` with `scp` containing `Todos.ReadWrite`.
+
+| Method | Path | Auth | Behaviour |
+|---|---|---|---|
+| GET | `/health` | **Anonymous** | Unchanged: `{ "status": "ok" }` |
+| GET | `/api/todos` | Authenticated | Unchanged payload |
+| GET | `/api/todos/{id}` | Authenticated | Unchanged |
+| POST | `/api/todos` | Authenticated | Unchanged |
+| PUT | `/api/todos/{id}` | Authenticated | Unchanged |
+| DELETE | `/api/todos/{id}` | Authenticated | Unchanged |
+| GET | `/api/users/me` | Authenticated | **NEW** — the caller's provisioned profile + role |
+| PUT | `/api/users/me` | Authenticated | **NEW** — self-service profile update (`displayName`, `phoneNumber` only) |
+| GET | `/api/users` | **AdminOnly** | **NEW** — list all users (demo scale: unpaged, ordered by `created_at`) |
+| PATCH | `/api/users/{id}/role` | **AdminOnly** | **NEW** — promote/demote |
+
+**Shapes** (camelCase JSON, consistent with existing DTOs):
+
+```jsonc
+// GET /api/users/me  → 200
+{
+  "id": "b0a1…",                 // internal uuid
+  "entraObjectId": "7f3c…",      // oid
+  "email": "<user@example.com>",
+  "displayName": "<name>",
+  "phoneNumber": "<phone or null>",
+  "role": "User",                // "User" | "Admin"
+  "createdAt": "2026-08-12T10:00:00Z"
+}
+
+// PUT /api/users/me   body → 200 (same shape as above)
+{ "displayName": "<name>", "phoneNumber": "<phone>" }
+// `role`, `email`, `id`, `entraObjectId` in the body are IGNORED (never bound).
+// Use a dedicated request DTO with only the two mutable fields — do NOT bind the
+// entity directly (mass-assignment / privilege escalation).
+
+// GET /api/users      → 200  [ { …same shape… }, … ]
+
+// PATCH /api/users/{id}/role   body → 200 (updated user)
+{ "role": "Admin" }              // 400 if not exactly "User" or "Admin"
+```
+
+**Status codes / rules:**
+
+* `401` — missing, expired, malformed, wrong-audience, wrong-issuer, wrong-tenant
+  token, or a validated token with no usable `oid`. Includes the standard
+  `WWW-Authenticate: Bearer` header.
+* `403` — authenticated but **role or scope** insufficient: a `User` calling
+  `GET /api/users`, or any caller whose token lacks `scp = Todos.ReadWrite`
+  (16.7.2a). **The response body must not reveal whether the resource exists.**
+* `503` — the role could not be read from PostgreSQL (fail closed, 16.7.6). Never
+  degrade to "assume `User`", and categorically never to "assume `Admin`".
+* `PATCH /api/users/{id}/role` guards:
+  * `409 Conflict` if the caller targets **their own** row with `"User"`
+    (self-demotion → instant lockout of the only admin during a demo).
+  * `409 Conflict` if the change would leave **zero** `Admin` rows.
+  * `404` if `{id}` does not exist.
+  * Emit an `Information` audit log line: `"Role change: {ActorOid} set user {TargetId}
+    from {OldRole} to {NewRole}."` — object IDs only, no PII.
+* Every error uses `ProblemDetails`/`ValidationProblemDetails`, matching the existing
+  `MalformedId` convention so the frontend's `extractErrorMessage` keeps working.
+
+### 16.9 Frontend design (`todo-web`)
+
+#### 16.9.1 Dependencies and configuration
+
+Add `@azure/msal-browser`, `@azure/msal-react`, and `react-router-dom` (there is no
+router today; "admin routes" needs one, and nginx's `try_files` already supports deep
+links).
+
+New **build-time** Vite variables (baked into the bundle — all are public
+identifiers, none is a secret):
+
+| Variable | Example |
+|---|---|
+| `VITE_ENTRA_TENANT_SUBDOMAIN` | `tododemoext` |
+| `VITE_ENTRA_TENANT_ID` | external tenant GUID |
+| `VITE_ENTRA_SPA_CLIENT_ID` | `todo-web-spa` client ID |
+| `VITE_API_SCOPE` | `api://<todo-api-app client ID>/Todos.ReadWrite` |
+
+`frontend/Dockerfile` gains four more `ARG`/`ENV` pairs alongside
+`VITE_API_BASE_URL`, and both workflows must pass them as `--build-arg`. **This
+extends the existing build-arg/deployment-ordering constraint** (memory, 2026-07-23)
+— the frontend image is environment-specific and must be rebuilt whenever any of
+these change.
+
+```ts
+// frontend/src/authConfig.ts
+export const msalConfig = {
+  auth: {
+    clientId: import.meta.env.VITE_ENTRA_SPA_CLIENT_ID,
+    authority: `https://${sub}.ciamlogin.com/${tenantId}`,
+    knownAuthorities: [`${sub}.ciamlogin.com`],   // REQUIRED for ciamlogin hosts
+    redirectUri: window.location.origin,
+    navigateToLoginRequestUrl: true,
+  },
+  cache: { cacheLocation: 'sessionStorage', storeAuthStateInCookie: false },
+};
+export const loginRequest = { scopes: [import.meta.env.VITE_API_SCOPE] };
+```
+
+`knownAuthorities` is not optional — without it MSAL rejects the non-standard
+`*.ciamlogin.com` authority. `sessionStorage` (not `localStorage`) is chosen to
+shrink the XSS blast radius: tokens die with the tab. Tradeoff: a brand-new tab
+re-runs `ssoSilent` (a hidden-iframe round trip against the IdP session cookie),
+which is the intended behaviour anyway.
+
+#### 16.9.2 Startup and login UX
+
+1. `main.tsx` wraps `<App/>` in `<MsalProvider instance={pca}>` after
+   `await pca.initialize()` and `await pca.handleRedirectPromise()`.
+2. **Silent SSO first.** On load, if no account is cached, call
+   `instance.ssoSilent(loginRequest)`. Render a neutral "Checking sign-in…" state
+   while it runs.
+3. On `InteractionRequiredAuthError` (or any failure) render `<LoginScreen>` with
+   **two** actions:
+   * **"Sign in / Sign up"** → `instance.loginRedirect(loginRequest)` → the
+     Microsoft-hosted `SignUpSignIn` page, which itself shows the email + password
+     form **and** a Google button, plus the "No account? Sign up" link.
+   * **"Continue with Google"** →
+     `instance.loginRedirect({ ...loginRequest, extraQueryParameters: { domain_hint: 'google.com' } })`.
+     **Assumption A4 (16.16):** `domain_hint` is documented to route straight to the
+     federated IdP; External ID user-flow behaviour must be **verified empirically**.
+     If it does not bypass the picker, the button still lands on the hosted page
+     where Google is one click away — **implement it so an unsupported hint degrades
+     to the normal page, never to an error**.
+4. Redirect (not popup) flows throughout: popups are blocked by default in many
+   browsers and complicate the container/nginx setup for no benefit here.
+
+#### 16.9.3 Calling the API
+
+* A small `useAccessToken` hook wraps `instance.acquireTokenSilent({ ...loginRequest,
+  account })`, catching `InteractionRequiredAuthError` → `acquireTokenRedirect`.
+* `api.ts` stays framework-agnostic: add
+  `export function configureApiAuth(getToken: () => Promise<string | null>)`, and in
+  `request()` attach `Authorization: Bearer <token>` when a provider is configured.
+  With no provider configured (existing unit tests) behaviour is unchanged — **no
+  test rewrite churn**.
+* On `401` from the API, clear local state and drop back to `<LoginScreen>` (the
+  token was rejected; re-authenticate rather than retry-loop).
+
+#### 16.9.4 Role-aware UI
+
+* After authentication, fetch `GET /api/users/me` once and put it in a
+  `UserContext` (`{ user, role, loading, error }`).
+* Routes: `/` (todos, any authenticated user) and `/admin` (user list + promote/demote
+  UI). `<RequireAdmin>` renders a "not authorized" panel and does not call admin APIs
+  when `role !== 'Admin'`; the admin nav link is hidden.
+* **State plainly in code comments and in `changes.md`: hiding the link is UX, not
+  security.** A user who types `/admin` gets the panel but every admin API call still
+  returns `403`, because the server re-derives the role from Postgres. The SPA must
+  never gate on anything it can compute locally from a token claim.
+
+### 16.10 Non-functional requirements
+
+**Authentication / authorization**
+* End users: OIDC/OAuth 2.0 authorization code + **PKCE** (public client, no secret),
+  tokens validated on every API request against the external tenant's JWKS.
+* Service-to-service (`todo-api` → Postgres / App Insights / ACR): **unchanged
+  Entra managed identity** (§13/§14). No new service credential is introduced.
+* Authorization data (`role`) is **always** re-derived server-side from Postgres.
+* Application runtime secrets: **still zero.** The one new secret in the system (the
+  Google client secret) is consumed by Entra External ID and custodied in Key Vault
+  for humans (16.6).
+
+**Transport security**
+* All hops TLS: browser→ACA ingress, browser→`ciamlogin.com`, ACA→JWKS endpoint,
+  `todo-api`→Postgres (`Ssl Mode=Require`). The only non-TLS endpoint anywhere in
+  the design is the loopback dev redirect URI `http://localhost:5173/`.
+* `RequireHttpsMetadata = true`. Metadata is fetched over TLS and cached by the
+  handler with automatic refresh — no key material is stored by us.
+
+**Token lifetime / session**
+* Access token ~60–90 min (service default; do **not** try to shorten it in a
+  custom token-lifetime policy this cycle).
+* SPA refresh tokens obtained via the authorization-code flow in a browser are capped
+  at **24 h** by the identity platform — after that the user re-authenticates
+  (silently, if the IdP session cookie is still alive).
+* The IdP's "Stay signed in?" prompt is default user-flow behaviour; suppressing it
+  requires a Conditional Access session policy — **out of scope**.
+* Role changes take effect on the **next request** (no token round trip needed),
+  because the role is not in the token.
+
+**CORS**
+* `Cors__AllowedOrigins__0` (the `todo-web` FQDN) and `AllowAnyHeader()` already
+  cover the new `Authorization` header. **No CORS config change is required** —
+  but note the behavioural change: every API call is now a *non-simple* request, so
+  the browser issues an `OPTIONS` preflight for each distinct path/method. `UseCors`
+  must stay **before** `UseAuthentication`/`UseAuthorization` (16.7.6) so preflights
+  are answered without a token, and so `401`/`403` responses carry CORS headers.
+* Do **not** add `AllowCredentials()` — the token travels in a header, not a cookie.
+* Keep the origin allow-list exact; never `AllowAnyOrigin()`.
+
+**Scaling / performance**
+* `todo-api` stays 0–3 replicas, 0.25 vCPU / 0.5 GiB. Every authenticated request now
+  adds **one indexed single-row `SELECT`** on `users` (plus, once per user ever, one
+  `INSERT`). At demo scale this is noise; it is traced automatically by the existing
+  Npgsql OTel instrumentation (§12), so the cost is measurable in App Insights if it
+  ever matters. Optimisation lever, if needed: the short-TTL role cache (16.7.3).
+* Scale-to-zero still applies: the first request after a cold start additionally pays
+  the OIDC metadata fetch (~1 round trip, then cached per replica).
+
+**Observability**
+* Existing OTel/App Insights tracing covers the new endpoints and the `users` query
+  for free. **Never** log tokens, `Authorization` headers, passwords, email or phone.
+  Log the `oid` (a pseudonymous GUID) when a user must be identified in a log line.
+* The `users` table holds **PII** (email, name, phone). Keep it out of traces and
+  logs; do not add it to custom telemetry dimensions.
+
+**Payment / cardholder data — none exists in this application (verified)**
+* This is a Todo application. As of this cycle there is **no payment processing,
+  no order/checkout flow, no cardholder data, no PAN/CVV, no payment-provider
+  integration, and no payment-related endpoint or column anywhere** in the
+  backend, frontend, database, or infrastructure. Verified 2026-08-12 against the
+  full source tree and §1–§14 of this document. The PCI DSS guidance in the repo
+  `README.md` describes the **pipeline's engineering standards** for projects that
+  do process payments; it does not describe this application's current scope.
+  Do not add payment-related tables, endpoints, or scope handling in this cycle —
+  it is not requested and is out of scope (16.15).
+* Consequently there is **no payment endpoint for §16 to protect**, and the two
+  roles (`User`, `Admin`) carry **no payment-related meaning**. `Admin` grants
+  exactly two things: `GET /api/users` and `PATCH /api/users/{id}/role`. Nothing
+  else. It must not be treated as a general-purpose "elevated" role by any future
+  feature.
+* **Forward constraints if payments are ever added** (binding on the feature that
+  adds them, so this design does not have to be retrofitted):
+  1. Cardholder data must not be stored in `users` or `todos`, or in any column of
+     `tododb`. Use a processor's hosted fields/tokenization so the backend only
+     ever sees a token (README PCI guidance); full PAN/CVV/track data is never
+     stored, even encrypted.
+  2. `Admin` must **not** implicitly grant access to payment or cardholder data. A
+     payment feature introduces its **own** authorization policy and its own
+     server-side check, re-derived from Postgres exactly as 16.7.3 does — adding a
+     third role, if needed, is a spec change (16.15).
+  3. Every payment-related endpoint is authenticated by the fallback policy
+     (16.7.3) plus an explicit, dedicated policy; `[AllowAnonymous]` is never
+     acceptable on one (webhook callbacks would need a separately-specified,
+     signature-verified path, not an anonymous carve-out).
+  4. Payment-provider credentials are third-party secrets that cannot use Entra
+     auth, so they follow the **§13.6 Key Vault pattern** (Container Apps Key
+     Vault reference + `Key Vault Secrets User` on the Container App managed
+     identity) — never a Container Apps raw secret, never a committed value. Note
+     this is a *different* pattern from the custodial-only vault use in 16.6.
+  5. Payment data must never enter logs or telemetry dimensions — the same
+     discipline already required for `users` PII below.
+
+**Availability / failure modes**
+* If Postgres is unreachable, the claims transformation cannot determine a role. It
+  must **fail closed** (`500`/`503`, no role claim) — never "assume User", and
+  categorically never "assume Admin".
+* If the external tenant's metadata endpoint is unreachable at cold start, token
+  validation fails ⇒ `401`s. `/health` still returns 200, so ACA does not restart-loop.
+
+**Cost:** External ID ≤50k MAU = **$0**; Key Vault ≈ **$0** (a few operations/year);
+no compute/SKU change. **Total incremental cost ≈ $0/month**, consistent with the
+demo posture (§11.9).
+
+**Region:** external tenant in **United States**; Key Vault in **eastus**
+(`rg-todo-demo`). ACA `eastus` and Postgres `centralus` unchanged — do not "fix" that
+mismatch (§14.11).
+
+### 16.11 Human-run bootstrap runbook (agents MUST NOT run any of this)
+
+Ordering matters — several steps depend on IDs produced by earlier ones.
+
+| # | Step | Where | Produces / needs |
+|---|---|---|---|
+| 1 | Create the external tenant (16.5.1) | Entra admin center (human w/ **Tenant Creator**) | **tenant ID**, **subdomain** |
+| 2 | Register `todo-api-app`, set App ID URI, add scope `Todos.ReadWrite`, set `accessTokenAcceptedVersion=2` | External tenant | **API client ID** |
+| 3 | Register `todo-web-spa` (SPA platform + redirect URIs), add API permissions, **Grant admin consent** | External tenant | **SPA client ID** |
+| 4 | Create custom user attribute `phoneNumber` (String/TextBox) | External tenant | extension attribute |
+| 5 | Google Cloud: project, consent screen, OAuth **Web** client, 7 redirect URIs (16.5.5a) | console.cloud.google.com | **Google client ID + secret** |
+| 6 | `az keyvault secret set … --name google-oauth-client-secret` | Key Vault (after 16.12 deploys it) | secret custodied |
+| 7 | Configure the **Google** built-in identity provider with the client ID/secret | External tenant | federation live |
+| 8 | Create user flow `SignUpSignIn`: Email-with-password + Google; attributes Given Name, Surname, `phoneNumber`; **add both apps** | External tenant | sign-up/sign-in live |
+| 9 | Add optional access-token claims on `todo-api-app`: `email`, `given_name`, `family_name`, extension `phoneNumber` | External tenant | claim names — **record the exact `extension_…_phoneNumber` string** |
+| 10 | Grant a human **`Key Vault Secrets Officer`** on the vault | Azure RBAC (human) | KV access (never an app identity) |
+| 11 | Deploy backend+frontend (CD) and apply the live env-var/build-arg updates (16.12) | Azure | app running with auth |
+| 12 | **Sign in once** through the SPA (creates the row with role `User`) | Browser | your `oid` in `users` |
+| 13 | **Promote yourself to Admin** — connect to `tododb` as the Postgres **Entra admin** and run the UPDATE below | psql | first Admin exists |
+| 14 | Verify end to end (16.17) | Browser + curl | acceptance criteria met |
+
+Step 13 — the only manual DB write, deliberately not exposed as an API:
+
+```sql
+-- as the Postgres Entra administrator (token as password, Ssl Mode=Require,
+-- from an IP allowed by the server firewall — lessons §4a)
+select id, entra_object_id, email, role from users order by created_at;
+update users set role = 'Admin', updated_at = now()
+ where entra_object_id = '<your-oid-from-the-select-above>';
+```
+
+After that, every further promotion/demotion happens in-app via
+`PATCH /api/users/{id}/role`.
+
+**Do not** create an "elevate me" endpoint, a bootstrap admin env var, or a
+"first user is Admin" rule — each is a privilege-escalation path that outlives the
+bootstrap.
+
+### 16.12 Infra / pipeline changes (devops agent — author only, PROPOSE mode)
+
+**(1) NEW `infra/modules/keyvault.bicep`** — Standard SKU,
+`enableRbacAuthorization: true`, `enableSoftDelete: true`,
+`softDeleteRetentionInDays: 7`, `enablePurgeProtection: false`, public network access
+enabled (demo; no VNet exists). **No access policies. No role assignments in Bicep**
+(§11.6 — humans grant RBAC). Name must be globally unique and ≤24 chars: derive from
+the existing `uniqueSuffix` pattern, e.g. `kv-todo-${take(uniqueSuffix, 12)}`.
+Wire it into `infra/main.bicep` and output its name + URI.
+
+**(2) `infra/main.bicep` — `todo-api` env vars.** Add five **plain** (non-secret)
+env vars: `AzureAd__Instance`, `AzureAd__TenantId`, `AzureAd__ClientId`,
+`AzureAd__Audience`, `AzureAd__Scopes`, fed by new top-level params
+(`externalTenantSubdomain`, `externalTenantId`, `apiClientId`) supplied via
+`main.parameters.json`. These are identifiers, **not** `@secure()`. Leave
+`ConnectionStrings__TodoDb` and `APPLICATIONINSIGHTS_CONNECTION_STRING` exactly as
+they are. (Note: the branch `pipeline/dev-environment` also removes the dead
+`Postgres__UseEntraAuth` env var per §14.8 — do not duplicate or revert that change;
+if it has not merged yet, leave it alone here.)
+
+**(3) `frontend/Dockerfile`** — add `ARG`/`ENV` for the four new `VITE_ENTRA_*` /
+`VITE_API_SCOPE` variables next to `VITE_API_BASE_URL`.
+
+**(4) `.github/workflows/cd.yml`** — pass those four values as `--build-arg` in the
+frontend `docker build` step, sourced from **GitHub repository variables** (not
+secrets — they are public identifiers): `ENTRA_TENANT_SUBDOMAIN`, `ENTRA_TENANT_ID`,
+`ENTRA_SPA_CLIENT_ID`, `ENTRA_API_CLIENT_ID` (the scope string is composed from the
+last one). Same in `.github/workflows/ci.yml` for the build-validation step (dummy
+values are fine there) and in `azure-pipelines.yml` for parity.
+
+**(5) `infra/README.md`** — add the 16.11 runbook, the KV custodial-secret rule
+("no application identity gets a role on this vault"), and the live env-var update
+below.
+
+**(6) Live config runbook (mandatory — lessons §2c: CD does not apply Bicep, so
+Bicep alone changes nothing on the running app).** The env vars must be applied
+imperatively **before or with** the image that requires them, or the new revision
+fails startup validation (16.7.1):
+
+```bash
+RG=rg-todo-demo; APP=todo-api
+PREV_REV=$(az containerapp revision list -g $RG -n $APP \
+  --query "[?properties.active]|[0].name" -o tsv); echo "rollback target: $PREV_REV"
+
+az containerapp update -g $RG -n $APP --set-env-vars \
+  "AzureAd__Instance=https://<subdomain>.ciamlogin.com/" \
+  "AzureAd__TenantId=<external-tenant-guid>" \
+  "AzureAd__ClientId=<api-client-id>" \
+  "AzureAd__Audience=api://<api-client-id>" \
+  "AzureAd__Scopes=Todos.ReadWrite"
+# rollback if the new revision misbehaves:
+#   az containerapp revision activate -g $RG -n $APP --revision "$PREV_REV"
+```
+
+**Explicitly NOT devops work / must not be attempted:** creating the external tenant,
+app registrations, user flows, custom attributes, the Google IdP, optional claims,
+admin consent, any RBAC role assignment, any Key Vault *secret value*, and the
+bootstrap SQL. **Cost delta of everything above: ≈ $0.**
+
+### 16.13 IaC-authorable vs. unavoidably human — the exhaustive split
+
+This table drives the rest of the pipeline. Anything in the right column must not be
+handed to devops as a Bicep task.
+
+| Item | IaC (Bicep, devops PROPOSE) | Human / Portal / Graph | Notes |
+|---|---|---|---|
+| Key Vault resource | ✅ `infra/modules/keyvault.bicep` | — | RBAC-authorization mode |
+| Key Vault **role assignment** | ❌ | ✅ human (`az role assignment create`) | §11.6 standing rule |
+| Key Vault **secret value** | ❌ | ✅ human (`az keyvault secret set`) | agents never touch secret material |
+| `todo-api` auth env vars | ✅ Bicep **and** ✅ imperative `az containerapp update` | — | both, per lessons §2c |
+| Frontend build args / workflows | ✅ | — | extends the build-arg ordering constraint |
+| EF migration for `users` | ✅ (code, applied by startup `Migrate()`) | — | no manual DDL |
+| **External ID tenant** | ⚠️ preview `ciamDirectories` type exists, but **not usable from CD** (needs an interactive user principal; MI/SPN cannot create it) → **treat as human** | ✅ Entra admin center | one-time; optional reference-only bicep allowed, excluded from CD |
+| App registrations (`todo-api-app`, `todo-web-spa`) | ❌ in practice | ✅ Portal or Graph/PowerShell | The Microsoft Graph Bicep extension (`Microsoft.Graph/applications`) targets **the tenant of the deploying credential**. Our deployments authenticate to the *workforce* tenant, so it would create the app in the wrong directory. MI-as-federated-credential is documented as **workforce-tenant only**. |
+| Exposed scope / App ID URI / `accessTokenAcceptedVersion` | ❌ | ✅ | part of the app registration |
+| Admin consent grant | ❌ | ✅ | requires a tenant admin |
+| **User flow** (`SignUpSignIn`) | ❌ | ✅ Portal, or Graph `/identity/authenticationEventsFlows` (`externalUsersSelfServiceSignUpEventsFlow`) | scriptable, but human-run |
+| Custom attribute `phoneNumber` | ❌ | ✅ Portal / Graph `identityUserFlowAttribute` | must exist before the user flow references it |
+| **Google IdP** federation | ❌ | ✅ Portal or `New-MgIdentityProvider` | consumes the Google client secret |
+| Optional/extension token claims | ❌ | ✅ Portal (Token configuration / Attributes & Claims) | record the resulting claim names |
+| **Google Cloud OAuth client** | ❌ (not Azure at all) | ✅ human at console.cloud.google.com | hard external prerequisite; no agent can do it |
+| Postgres bootstrap admin promotion | ❌ | ✅ human `psql` UPDATE | 16.11 step 13 |
+| Postgres `pgaadauth` principal / grants | ❌ (unchanged from §14.7) | ✅ already done | verify only |
+
+**Bottom line for the engineer and devops agents: everything inside the external
+tenant, plus the Google OAuth client, plus every secret value and role assignment, is
+human/Portal/Graph work. Bicep's share of this feature is one Key Vault, five plain
+env vars, and build-arg plumbing.**
+
+### 16.14 Interaction with §15 (dev environment), if/when it merges
+
+* §15's dev environment would need **its own** SPA/API app registrations and redirect
+  URIs (`https://todo-web-dev…`, `http://localhost:5173/`). Two supported options:
+  (a) one external tenant, two pairs of app registrations + two user flows; or
+  (b) two external tenants. **Recommendation: (a)** — a second tenant doubles the
+  bootstrap and the MAU accounting for no isolation benefit at demo scale. Record the
+  choice in memory when §15 lands.
+* The dev `todo-api` gets the same five plain env vars with dev values; the dev
+  frontend image is built with dev `VITE_ENTRA_*` build args (its image is therefore
+  **not** promotable byte-for-byte to prod — which collides with §15.9.4's
+  "promote the exact SHA-tagged image" model for the **frontend**. Flag this
+  explicitly to whoever finishes §15; the backend image stays promotable because its
+  config is env vars.)
+* One Key Vault (`rg-todo-demo`) serves both; the Google client secret is shared, or a
+  second Google OAuth client is created for dev origins.
+
+### 16.15 Explicitly out of scope
+
+* **Per-user todo ownership / row-level authorization.** Todos stay a shared list
+  (16.4.3). No `owner_id`, no data migration, no per-user filtering.
+* **Payments, checkout, orders, or cardholder data of any kind.** None exists in
+  this application today (verified — see 16.10, "Payment / cardholder data"), and
+  none is added here. `Admin` carries no payment meaning. If payments are ever
+  added, the forward constraints in 16.10 are binding on that feature.
+* **Any change to the `/api/todos` request/response contract.** `TodosController`
+  changes in this cycle by **attributes only** (16.7.2a); §3.5's payloads, status
+  codes and ordering are unchanged for authenticated callers.
+* **Any additional role beyond `User` and `Admin`.** Exactly two, by requirement.
+* **Self-service admin promotion by any means other than an existing Admin** (and the
+  one manual bootstrap UPDATE).
+* MFA, Conditional Access, SMS/phone verification, custom-domain login pages, custom
+  branding of the hosted pages, and language customisation.
+* Additional identity providers (Facebook, Apple, custom OIDC, Entra-to-Entra).
+* Native authentication (in-app sign-in UI without the hosted page) — the
+  browser-delegated flow is what MSAL React supports and what this design uses.
+* Microsoft Graph calls from `todo-api` (would require a cross-tenant app credential —
+  see 16.7.3 rejected alternatives).
+* Storing app roles/groups in Entra; syncing Entra ↔ Postgres profile data beyond
+  first-login capture.
+* Account deletion/GDPR erasure flows, audit tables, refresh-token revocation UI,
+  session-management UI.
+* Frontend RUM / App Insights JS SDK (still out of scope per §12.7).
+* Granting any application identity access to Key Vault (16.6) and provisioning any
+  secret into Container Apps secrets.
+* Disabling Postgres password auth or changing anything about §14's DB connection.
+* Automating anything in 16.13's right-hand column.
+
+### 16.16 Assumptions, risks and open questions
+
+**Assumptions (implement against these; verify where marked):**
+* **A1.** A new external tenant can be created in subscription `9ba6633f-…` — the
+  Container Apps Environment quota that paused §15 is specific to ACA and does not
+  apply here. *Verify at step 1; if a Tenant Creator/subscription-policy block
+  appears, the 30-day trial tenant is the fallback for demo purposes.*
+* **A2.** `oid` is present in every access token the user flow issues, and is stable
+  across local and Google-federated accounts. *Verify by decoding a real token at
+  jwt.ms for both account types.*
+* **A3.** Attribute collection (phone) runs on the first **Google** sign-up, not just
+  local sign-up. *Verify. If it does not, `phone_number` stays null until the user
+  sets it via `PUT /api/users/me` — no code change needed.*
+* **A4.** `domain_hint=google.com` routes straight to Google from an External ID user
+  flow. *Verify. Must degrade to the normal hosted page, never to an error.*
+* **A5.** `Microsoft.Identity.Web` accepts the External ID issuer/authority host
+  mismatch out of the box. *Verify against a real token; remedy is explicit
+  `ValidIssuers`, never disabled validation.*
+* **A6.** The optional claims (`email`, `given_name`, `family_name`, extension phone)
+  actually appear in the **access** token (not only the ID token). *Verify; if the
+  access token lacks them, the profile fields are simply null until the user edits
+  them — authorization is unaffected because it never depends on these claims.*
+* **A7.** The existing `todo-api` managed identity's Postgres role can create the new
+  table (it owns `public` per §14.7 Phase 4 grants), so startup `Migrate()` succeeds.
+* **A8.** The External ID user flow issues the delegated permission as a
+  space-separated **`scp`** claim (v2 tokens, `accessTokenAcceptedVersion = 2`), which
+  is what `[RequiredScope]` reads. *Verify by decoding a real access token at jwt.ms.*
+  If the claim were absent, every call would `403` — a **fail-closed** outcome, which
+  is the correct direction; the remedy is to fix the app registration/user flow, never
+  to remove the scope check (16.7.2a).
+
+**Risks (must be reflected in `changes.md`):**
+* **Breaking change / release window.** The moment the new backend is live, the
+  *old* frontend image gets `401` on every call, and a new frontend against an old
+  backend is equally broken. CD deploys backend → frontend in one run, so there is a
+  short window of a broken app. Accepted for a demo; rollback is
+  `az containerapp revision activate` on **both** apps (capture both revision names
+  first).
+* **Missing/incorrect auth env vars ⇒ the API fails to start** (by design, 16.7.1).
+  Mitigated by applying the env vars imperatively before/with the deploy (16.12 item
+  6) and by capturing the rollback revision.
+* **PII arrives in the database for the first time** (email, name, phone). No
+  encryption-at-rest change is needed (Postgres Flexible Server encrypts at rest by
+  default), but logging discipline is now a real requirement, not a nicety.
+* **A single Admin.** Losing access to the bootstrap account means editing the DB
+  again. The self-demotion and last-admin guards (16.8) reduce, not eliminate, this.
+* **External tenant lifecycle.** Deleting a `ciamDirectories` resource is known to be
+  awkward; create it once, deliberately, with the intended name/region (region is
+  immutable).
+
+**Open questions (do not block implementation):**
+* **Q1.** Should the role lookup be cached (30–60 s) once real usage exists?
+  *Recommendation: no for now; revisit only with trace evidence, and document the
+  revocation-delay tradeoff if adopted.*
+* **Q2.** Should `todos` eventually become per-user? *Recommendation: a separate
+  cycle; it is a data-model + migration change, not an auth change.*
+* **Q3.** One external tenant or two when §15 lands? *Recommendation: one (16.14).*
+* **Q4.** Should `last_login_at` be tracked? *Recommendation: no — it converts every
+  authenticated request into a write. If needed, do it as a coarse (daily) update.*
+* **Q5.** Should the Google client secret also be mirrored anywhere for DR?
+  *Recommendation: no. It is re-issuable from Google Cloud in minutes; Key Vault
+  custody plus soft-delete is enough.*
+
+### 16.17 Acceptance criteria (maps 1:1 to the requested verification)
+
+1. **Self-registration works.** A new visitor can sign up with email + password,
+   supplying name and phone on the sign-up page, and lands back in the SPA
+   authenticated.
+2. **Google sign-in works.** "Continue with Google" (or the Google button on the
+   hosted page) completes sign-up/sign-in with a Google account and lands back
+   authenticated.
+3. **Profile auto-provisioned.** After the first sign-in of either kind, `users`
+   contains exactly one row for that person, keyed by `oid`, with `role = 'User'`;
+   a second sign-in creates no duplicate.
+4. **Unauthenticated calls are rejected.** `curl https://<api-fqdn>/api/todos`
+   without a token ⇒ `401`. `curl https://<api-fqdn>/health` ⇒ `200`.
+5. **A `User` is blocked from admin functionality.** `GET /api/users` and
+   `PATCH /api/users/{id}/role` ⇒ `403` for a `User` token, and `/admin` in the SPA
+   shows the not-authorized panel (link hidden).
+6. **Bootstrap promotion works.** After the manual `UPDATE users SET role='Admin'`,
+   the same user's **next** request is admin-authorized with **no re-login**
+   (proves the role is re-derived server-side, not carried in the token).
+7. **The Admin can reach admin pages/endpoints.** `/admin` renders the user list;
+   `GET /api/users` ⇒ `200`; `PATCH /api/users/{id}/role` promotes another user, who
+   gains access on their next request.
+8. **Escalation attempts fail.** A forged/modified role claim in the token, a `role`
+   field in a `PUT /api/users/me` body, and a token issued for a different audience
+   (the SPA's ID token) are all rejected — `403`/ignored/`401` respectively.
+9. **No secrets anywhere.** `todo-api` has **zero** Container Apps secrets; the only
+   Key Vault secret is `google-oauth-client-secret`, readable by a human role
+   assignment only; no secret appears in git, in `appsettings*.json`, in workflow
+   files, or in this document.
+
+### 16.18 Testing requirements (tester agent)
+
+All of the following run with **no Azure, no external tenant, no real token, no
+database**. Anything that cannot be proven here must be listed in `tests.md` as
+"live-verification only" (16.17) rather than faked.
+
+**Backend — token validation wiring (`WebApplicationFactory`):**
+1. `GET /api/todos` with **no** `Authorization` header ⇒ `401`.
+2. `GET /health` with no header ⇒ `200` and body `{"status":"ok"}` (proves the
+   `AllowAnonymous` carve-out survives the fallback policy).
+3. A request bearing a token signed by a **test** key is accepted only when the test
+   host has deliberately swapped the JWT scheme for a test scheme — i.e. assert the
+   production configuration does **not** accept unsigned/`alg=none` tokens.
+4. Startup fails fast with a message naming the missing key when `AzureAd:TenantId`
+   (or `Instance`/`ClientId`/`Audience`) is blank.
+5. Configuration asserts: `RequireHttpsMetadata`, `ValidateIssuer`,
+   `ValidateAudience`, `ValidateLifetime`, `ValidateIssuerSigningKey` are all `true`
+   after `AddMicrosoftIdentityWebApi` binding (regression guard against someone
+   "fixing" a local dev problem by turning validation off).
+
+**Backend — `RoleClaimsTransformation` (pure-ish unit tests with an in-memory /
+SQLite-backed context or a faked provisioning service):**
+6. Unknown `oid` ⇒ a row is created with `role = User`; the returned principal has
+   role `User`.
+7. Known `oid` with `role = Admin` ⇒ principal has role `Admin`; **no** insert.
+8. **Anti-escalation:** a principal arriving with `roles = Admin` (or
+   `ClaimTypes.Role = Admin`) but a DB row of `User` ⇒ the resulting principal is
+   **`User`** and carries exactly one role claim.
+9. `tid` ≠ configured tenant ⇒ no role claim, request rejected.
+10. Missing/unparseable `oid` ⇒ rejected; **no** fallback to `sub`/`email`, and no
+    row is created.
+11. Idempotence: calling `TransformAsync` twice on the same principal performs one DB
+    lookup and yields one role claim.
+12. Concurrency: two simultaneous first requests for the same `oid` produce exactly
+    one row (simulate the unique-violation path and assert it re-reads rather than
+    throwing).
+13. DB failure ⇒ **fails closed** (no role claim / error), never a default `User` or
+    `Admin`.
+
+**Backend — endpoint authorization:**
+14. `GET /api/users` as `User` ⇒ `403`; as `Admin` ⇒ `200`.
+15. `PATCH /api/users/{id}/role` as `User` ⇒ `403`.
+16. `PATCH` self → `"User"` ⇒ `409`; last remaining Admin → `"User"` ⇒ `409`.
+17. `PATCH` with an invalid role value ⇒ `400`.
+18. `PUT /api/users/me` with a body containing `role`/`email`/`entraObjectId` ⇒ those
+    fields are **not** persisted (mass-assignment guard); only `displayName` and
+    `phoneNumber` change.
+19. `GET /api/users/me` returns the provisioned row for the caller and never another
+    user's row.
+
+**Backend — profile claim extraction:**
+20. Phone claim resolved from `Users:PhoneClaimName` when set, and by
+    `_phoneNumber`-suffix match when not; absent ⇒ null, no exception.
+
+**Backend — regression:**
+21. All existing `TodosControllerTests` still pass once the test host supplies an
+    authenticated principal; the *payload* contracts are unchanged.
+22. `TodoApiFactory` must be extended with a test authentication scheme + a stubbed
+    role source. This is the one place where editing existing test infrastructure is
+    correct — state the reason in `tests.md`.
+23. `TodoDbContextRegistrationTests` and `EntraTokenPasswordProviderTests` are
+    **untouched and must still pass** — §14 behaviour is not modified by this cycle.
+
+**Frontend (vitest + RTL, MSAL mocked — never a live IdP):**
+24. Unauthenticated state renders `<LoginScreen>` with both a sign-in/sign-up action
+    and a "Continue with Google" action.
+25. "Continue with Google" calls `loginRedirect` with
+    `extraQueryParameters.domain_hint === 'google.com'`.
+26. `ssoSilent` success path skips the login screen; `InteractionRequiredAuthError`
+    falls back to it (and does not crash).
+27. `api.ts` attaches `Authorization: Bearer <token>` when a token provider is
+    configured, and sends **no** such header when it is not (proves existing tests
+    stay valid).
+28. A `401` from the API returns the app to the unauthenticated state (no retry loop).
+29. Role gating: `role === 'User'` hides the admin link and `<RequireAdmin>` renders
+    the not-authorized panel **without** issuing admin API calls;
+    `role === 'Admin'` renders the admin view.
+
+**Backend — scope enforcement and auth-outcome mapping (added with 16.7.2a/16.7.6):**
+30. A principal with a valid token but **no `scp` claim** (or a `scp` not containing
+    `Todos.ReadWrite`) ⇒ `403` on **both** `/api/todos` and `/api/users/me` — proving
+    `[RequiredScope]` is on `TodosController` as well as `UsersController`.
+31. Startup fails fast naming `AzureAd:Scopes` when that key is blank (same guard as
+    test 4), and `AzureAd:Instance = http://…` (non-TLS) or a non-GUID
+    `AzureAd:TenantId` also fail fast.
+32. A principal marked `todo:auth_failure = invalid_principal` ⇒ `401` with a
+    `WWW-Authenticate: Bearer` header and a body that echoes **no** claim value;
+    `role_source_unavailable` ⇒ `503`. Both assert the response is `ProblemDetails`.
+33. `/health` still returns `200` when the caller presents a **broken/failed** token
+    (the `AllowAnonymous` skip in `AuthOutcomeMiddleware`), so a bad client can never
+    take the probe down.
+
+**Explicitly NOT verifiable here (say so in `tests.md`; do not fake it):** real
+tenant creation, real token issuance/validation against `ciamlogin.com`, Google
+federation, attribute collection, `domain_hint` behaviour, admin consent, Key Vault
+RBAC, and the bootstrap SQL promotion. Those are covered by 16.11 and 16.17 only.
+`tests.md` must state that this feature is **not** verified end to end until 16.17
+has been executed against the live deployment and the result recorded.

@@ -1,305 +1,226 @@
-# Infrastructure proposal — 2026-07-28
+# Infrastructure proposal — 2026-08-12
 
-Feature cycle: **Observability / distributed tracing (§12) + managed-identity-first
-identity & secrets policy (§13)**, branch `pipeline/appinsights-tracing` (off
-`main`). PROPOSE mode — nothing here is provisioned; this is authored + costed for
-SKU/decision sign-off before any Bicep is written.
+Feature cycle: **End-user authentication with Microsoft Entra External ID (specs
+§16)**, branch `pipeline/entra-external-id-auth`. **INFRA-PROPOSE mode** — nothing
+here is provisioned and **no file under `infra/` has been touched**. This document
+exists to get SKU/tier sign-off before any Bicep is written (that happens in the
+INFRA-APPLY pass).
 
-> This is a **new proposal for a new cycle**, not an amendment. The resources in
-> the prior proposal (ACR Basic, ACA Consumption env, Postgres B1ms, two Container
-> Apps, Log Analytics `log-todo-demo`) are **already-deployed production reality on
-> `main`** and are NOT re-proposed here. Only the *delta* this feature introduces is
-> below. Everything not listed as **new** or **changed** stays exactly as deployed.
+> **This replaces the previous `infra-proposal.md`**, which covered the
+> already-merged observability/§13 cycle. Everything that cycle proposed
+> (Application Insights, Postgres Entra admin, dropping the `todo-db-connection`
+> secret) is deployed reality on `main` and is **not** re-proposed here.
 
-Grounded against the actual deployed IaC: `infra/main.bicep`,
-`infra/main.parameters.json`, and `infra/README.md` (bootstrap Phases 1–3) as they
-stand today — not the original spec draft.
+Grounded against the **actual IaC on disk**, not against the narrative in the stale
+`.pipeline/infra.md`. Verified by reading:
+
+- `infra/main.bicep` — RG-scoped; provisions ACR (Basic), Log Analytics (30d),
+  App Insights (workspace-based), ACA managed environment, Postgres Flexible
+  Server + `tododb` + firewall rule, and the two Container Apps.
+- `infra/main.parameters.json` — non-secret dev/demo params;
+  `postgresAdminPassword` is `@secure()` and supplied at deploy time.
+- `infra/modules/` — `registry.bicep`, `loganalytics.bicep`, `appinsights.bicep`,
+  `acaEnvironment.bicep`, `postgres.bicep`, `containerApp.bicep`.
+  **There is no `keyvault.bicep`.**
+- `frontend/Dockerfile` — has exactly one build arg, `VITE_API_BASE_URL`.
+- `.github/workflows/cd.yml` — logs in with OIDC, builds/pushes images and runs
+  `az containerapp update`. It does **not** run `az deployment group create`, so
+  Bicep changes do not reach the running apps on their own (specs 16.12 item 6).
 
 ---
 
-## 0. What this cycle changes vs. the deployed infra (the diff)
+## 0. The diff — specs §16 vs. what `infra/` actually provisions today
 
-| Resource / setting | State | This cycle |
+| Resource / setting | State on disk | This cycle |
 |---|---|---|
-| ACR (Basic), ACA env, Log Analytics `log-todo-demo`, `todo-web` | deployed | **unchanged** |
-| **Application Insights `appi-todo-demo`** | does not exist | **NEW** — workspace-based, backed by existing `log-todo-demo` |
-| **Role assignment: `todo-api` MI → `Monitoring Metrics Publisher` on `appi-todo-demo`** | does not exist | **NEW** |
-| **Postgres Flexible Server `pg-todo-demo-cus01`** | password auth only | **CHANGED** — enable Entra auth + set Entra administrator (server side, Bicep) |
-| **`todo-api` Container App secret `todo-db-connection`** | present, `ConnectionStrings__TodoDb` = `secretref` | **DROPPED** — becomes a passwordless, non-secret plain env var |
-| **`todo-api` App Insights connection** | did not exist as infra | **NEW, non-secret** — `APPLICATIONINSIGHTS_CONNECTION_STRING` as a plain env var (NOT a Container Apps secret) |
-| **`todo-api` env `Postgres__UseEntraAuth`** | absent (backend defaults to `false`) | **NEW** — set to `true` so the backend takes its Entra-token DB path (backend code already merged, §13.4) |
-| **Key Vault** | never provisioned | **still not provisioned** — see §6, no application secret requires it |
+| ACR (Basic), Log Analytics, App Insights, ACA environment, `todo-web` | deployed, in Bicep | **unchanged** |
+| Postgres Flexible Server `pg-todo-demo-cus01` (B1ms, centralus) | deployed, in Bicep | **unchanged** — §16 explicitly does not touch §14's DB auth or the server |
+| `todo-api` Container App (0–3 replicas, 0.25 vCPU / 0.5 GiB) | deployed, in Bicep | **changed — config only.** Five new *plain, non-secret* env vars (`AzureAd__Instance`, `__TenantId`, `__ClientId`, `__Audience`, `__Scopes`). No SKU/scale/replica change. |
+| **Azure Key Vault** | **does not exist** (no `keyvault.bicep`, no reference in `main.bicep`) | **NEW** — custodial store for the Google OAuth client secret (§16.6). **SKU decision required — §1 below.** |
+| **Entra External ID tenant** (customer directory) | **does not exist** — the only Entra usage today is workforce-tenant managed identities + CI/CD OIDC | **NEW** — human-created, but it carries a billing link to the subscription. **Tier/linking decision required — §2 below.** |
+| `frontend/Dockerfile` build args | one (`VITE_API_BASE_URL`) | **changed** — four more `VITE_ENTRA_*` / `VITE_API_SCOPE` args. No cost. |
+| `ci.yml` / `cd.yml` / `azure-pipelines.yml` | build-arg plumbing for one var | **changed** — pass the four new build args from GitHub repo *variables* (public identifiers, not secrets). No cost. |
+| Container Apps **secrets** on `todo-api` | zero | **still zero** — §16 adds none. Invariant preserved. |
+| App runtime secrets anywhere | zero | **still zero** — the one new secret (Google client secret) is consumed by Entra External ID and read by humans only. |
 
-Net secret count on the deployed system after this cycle: **zero application runtime
-secrets** (the `todo-db-connection` Container Apps secret is removed and nothing
-replaces it). The only remaining credential anywhere is `PGADMIN_PASSWORD`, which is
-a **deploy-time CI/CD secret**, not an app-runtime secret (§13.9) — out of scope, unchanged.
-
----
-
-## 1. New / changed resources — concrete SKU/tier + rationale
-
-### 1a. Application Insights `appi-todo-demo` — **NEW**
-
-- **Type / "SKU":** `Microsoft.Insights/components`, `kind: web`,
-  `Application_Type: web`, **workspace-based** (`IngestionMode: LogAnalytics`,
-  `WorkspaceResourceId` → the **existing** `log-todo-demo` workspace's resource id).
-  Workspace-based App Insights has **no independent pricing SKU** of its own — it has
-  no fixed monthly fee; all billing flows through the backing Log Analytics
-  workspace's tier, which is already `PerGB2018` (pay-as-you-go) at 30-day retention.
-  So the only "tier" decision is *reuse the existing workspace*, which the spec
-  (§12.6) mandates.
-- **`DisableLocalAuth: true`** — per §13.5, this turns off shared-key (instrumentation
-  key) ingestion so the embedded key in the connection string stops being a usable
-  credential; ingestion then requires an Entra identity with the publisher role
-  (1b below). This is the single setting that makes "connection string = non-secret"
-  true rather than aspirational.
-- **Region:** `eastus` (same as `log-todo-demo` / the ACA env). App Insights follows
-  its workspace's region; this is independent of the Postgres `centralus`
-  region-restriction (§12.6) — **no contradiction** with architecture-memory.
-- **Rationale:** one new resource satisfies the whole §12 tracing requirement; reusing
-  the single existing workspace keeps the "single of everything" posture, one queryable
-  telemetry store, and adds no second retention setting or cost center.
-- **IaC shape (to be authored in Mode 2, not now):** new `infra/modules/appinsights.bicep`
-  taking the workspace id in and emitting `connectionString` as an output; wired in
-  `main.bicep` off `logAnalytics.outputs.id`. **No second Log Analytics workspace.**
-
-### 1b. Role assignment: `todo-api` MI → `Monitoring Metrics Publisher` on `appi-todo-demo` — **NEW**
-
-- **Role:** `Monitoring Metrics Publisher`
-  (`3913510d-42f4-4e42-8a64-420c390055eb`), scoped to the `appi-todo-demo` component,
-  assigned to `todo-api`'s **existing system-assigned managed identity** (its
-  `principalId` is already a `main.bicep` output). This is what lets the backend's
-  `DefaultAzureCredential` publish telemetry once local auth is disabled (1a).
-- **Placement — decision point, see §3c.** Recommendation: apply it as a **manual
-  human bootstrap step**, consistent with how the existing `AcrPull` grants are
-  handled in this repo (excluded from the CD-runnable Bicep because a `Contributor`
-  principal can't write role assignments — `infra/README.md` Phase 3). The spec
-  (§13.10) says "Bicep, AcrPull pattern already there," but in *this* repo the AcrPull
-  pattern is a manual Phase-3 grant, not Bicep — so following the real convention means
-  a manual grant. Cost: **free**.
-
-### 1c. Postgres `pg-todo-demo-cus01` — enable Entra auth + set Entra administrator — **CHANGED**
-
-- **No SKU/tier change.** Stays Burstable `Standard_B1ms`, PG16, 32 GiB, no HA, LRS
-  backup, `centralus`, public access + "allow Azure services" firewall + TLS — all
-  exactly as deployed. Immutable properties (name `pg-todo-demo-cus01`, `centralus`)
-  are untouched (they must stay pinned per `main.parameters.json`).
-- **What changes (server side, in Bicep):**
-  - Set `properties.authConfig` to **enable Entra (Azure AD) authentication**
-    alongside password auth: `activeDirectoryAuth: 'Enabled'`,
-    `passwordAuth: 'Enabled'` (dual-auth — keep the admin password as break-glass;
-    Entra-only is the optional hardening in §3d, not recommended for this demo).
-  - Add the `Microsoft.DBforPostgreSQL/flexibleServers/administrators` child resource
-    to set the **Entra administrator** (an Entra user or group — the identity that then
-    runs the manual `pgaadauth_create_principal` step). Requires `objectId`,
-    `principalName`, `principalType`, and `tenantId` — these are **inputs a human must
-    supply** (see §3b).
-- **Rationale:** §13.4 mandate — `todo-api` authenticates to Postgres with its managed
-  identity via an Entra token (backend code already merged), which requires the server
-  to accept Entra auth and to have an admin who can create the MI's DB role. Cost: **free**.
-- **NOT in Bicep (cannot be):** the in-database `pgaadauth_create_principal` + grants —
-  those run *inside* Postgres as the Entra admin and are a manual human step (§4).
-
-### 1d. `todo-api` Container App env/secret wiring — **CHANGED**
-
-- **DROP** the `todo-db-connection` Container Apps secret entirely, and the
-  `Password=…` from the connection string. `ConnectionStrings__TodoDb` becomes a
-  **plain (non-secret) env var**, passwordless, with `Username=` set to the managed
-  identity's Postgres role name (not `todoadmin`):
-  `Host=<server>.postgres.database.azure.com;Port=5432;Database=tododb;Username=<mi-role-name>;Ssl Mode=Require;Trust Server Certificate=true`.
-- **ADD** `APPLICATIONINSIGHTS_CONNECTION_STRING` as a **plain (non-secret) env var**
-  (value = `appinsights.outputs.connectionString`). Flat name, no `__` (§12.5). NOT a
-  Container Apps secret, NOT Key Vault.
-- **ADD** `Postgres__UseEntraAuth=true` plain env var so the merged backend code takes
-  its Entra-token DB path in Azure (it defaults to `false` = local password path).
-- **No change to `todo-web`** — it holds no credentials.
-- **Cost:** none (env var changes are free); the `@secure() postgresAdminPassword`
-  param stays only for server *provisioning*, not app runtime.
+**Two decisions need approval: the Key Vault SKU (§1) and the External ID tenant
+tier/linking model (§2).** Everything else in the table is config plumbing with no
+SKU choice and no cost delta.
 
 ---
 
-## 2. Cost estimate for the NEW resource (Application Insights ingestion)
+## 1. Azure Key Vault (new)
 
-**Fixed monthly cost added by this cycle: ~$0.** Workspace-based App Insights has **no
-fixed fee**; the role assignment and managed-identity auth are **free**; enabling
-Entra auth on Postgres is **free**; dropping a Container Apps secret is **free**. This
-cycle is cost-neutral-to-negative on the §11.9 posture (it removes a stored secret and
-provisions no Key Vault).
+**Why this service:** the Google OAuth client secret (§16.5.5) is issued by Google,
+a third party with no Entra relationship. It cannot be replaced by a managed
+identity or workload-identity federation, so it is exactly the "genuinely cannot
+authenticate via Entra" case in which §13.6 mandates Key Vault as the fallback.
+Note *who consumes it*: **Entra External ID**, once, at IdP configuration time. No
+application of ours ever reads it — per §16.6 neither `todo-api`'s nor `todo-web`'s
+managed identity gets any role on this vault. The vault is **custodial only**: it
+gives the value a rotation-safe home instead of a chat message or a sticky note.
 
-**The only variable is telemetry ingestion**, billed usage-based through the existing
-`log-todo-demo` workspace at the Log Analytics per-GB rate:
+> Cost figures below are **rough estimates**, US-East list prices in USD as of
+> 2026-08, and are region- and usage-dependent. Verify against the Azure pricing
+> calculator before sign-off.
 
-- **Free grant: ~5 GB/month** before ingestion is billed (per the spec §12.9 framing;
-  region/account-dependent). A low-volume single-user demo with scale-to-zero backend
-  is expected to sit **well inside** the free grant → **real-world cost ≈ $0/month**.
-- **Beyond the grant:** roughly **~$2.30–$3.00 per GB** ingested (region-dependent;
-  **estimate only** — confirm against the Azure Monitor pricing page for the actual
-  region). At, say, a hypothetical 10 GB/month you'd pay for ~5 GB over the grant ≈
-  **~$12–15/month** — not expected at demo traffic, shown only to make the pricing
-  model explicit rather than silently assumed.
-- **Retention cost: $0.** The workspace keeps its existing **30-day** retention, which
-  is within Log Analytics' included ~31-day retention — no added retention charge, and
-  we do **not** raise it (§11.9).
+| Option | Est. monthly cost | Suited for | Limits |
+|---|---|---|---|
+| **Key Vault Standard** (software-protected) | **~$0.00** — $0.03 per 10,000 secret operations; this vault sees a handful of operations *per year* (a human writes the secret once, Entra never re-reads it from here). Effectively free. | Secrets and certificates that don't need FIPS 140-2 Level 3 hardware protection. Exactly our case: one string, written by a human, read by a human. | No HSM-backed keys. Public endpoint unless you add a private endpoint (extra cost + a VNet we don't have). Soft-delete retention 7–90 days. |
+| **Key Vault Premium** | **~$0.00 for our usage** — same $0.03/10k operation price; the premium delta is **$1.00 per HSM-protected key per month**, and we are storing a **secret**, not a key. So Premium would cost the same *and* deliver nothing. | Workloads needing HSM-backed *cryptographic keys* (FIPS 140-2 L3), BYOK, key-wrapping for storage/SQL CMK. | Premium's HSM protection applies to **keys only — secrets are stored identically to Standard**. Buying Premium for a secret is a pure no-op. |
+| **Azure Key Vault Managed HSM** | **~$3,000–3,700/month** (dedicated HSM pool, ~$4.85/hr for the standard pool, billed whether used or not) | Regulated workloads needing single-tenant, FIPS 140-2 L3 HSM with full administrative isolation. | Absurdly out of proportion for one demo secret; minimum 3-partition pool; no scale-to-zero. Listed only to close the option space. |
+| *(sub-option)* add a **private endpoint** to any of the above | **+~$7.30/month** per endpoint + ~$0.01/GB processed | Vaults that must not be reachable from the public internet. | Requires a VNet + subnet, which this architecture deliberately does not have (§5.4, §8: no VNet/private endpoints). Would be the single largest line item in the whole demo. |
 
-**Pricing model, stated so it isn't assumed:** you pay per **GB ingested** into the
-workspace, not per request/trace; the levers that control that volume are **sampling**
-(§3a) and an optional **daily ingestion cap** (§3e). If projected ingestion ever
-becomes non-trivial, that gets flagged in `changes.md` per the §11.9 "no silent
-costlier choices" rule.
+**Recommendation: Key Vault Standard**, with `enableRbacAuthorization: true`,
+`enableSoftDelete: true`, `softDeleteRetentionInDays: 7`,
+`enablePurgeProtection: false`, public network access enabled, **no role
+assignments and no secret values in Bicep**.
 
----
+Reasoning tied to the spec's actual requirements, not "pick the middle one":
 
-## 3. Decision points (more than one reasonable choice exists)
+- The object being protected is a **secret string**, and Premium's only
+  differentiator (HSM-protected *keys*) does not apply to secrets. Premium is
+  strictly more expensive-per-feature with zero benefit here — choosing it would be
+  cargo-culting "more secure = better tier".
+- §16.10 budgets this cycle at **≈$0 incremental cost** and §11.9 mandates the
+  cheapest reasonable SKU. Standard is the only option that holds that line.
+- **RBAC authorization, never legacy access policies** (§16.6): access to the vault
+  is itself Entra-authenticated via a human's identity — no vault access key, no
+  SAS token, no shared credential.
+- **Purge protection off** is a deliberate, documented tradeoff: soft-delete (7 days)
+  gives recoverability, while purge protection is irreversible and would make a
+  mis-named demo vault impossible to clean up. Revisit for production.
+- **Public network access** because there is no VNet in this architecture; a private
+  endpoint would cost ~2× the entire rest of the demo's monthly bill and is out of
+  scope per §8.
+- Name: derived from the existing `uniqueSuffix` pattern, e.g.
+  `kv-todo-${take(uniqueSuffix, 12)}` → 20 chars, inside Key Vault's 24-char global
+  limit.
 
-### 3a. Azure Monitor exporter sampling percentage
-- **Options:** 100% (capture every trace) · fixed sampling (e.g. 25–50%) · adaptive sampling.
-- **Recommendation: 100%** for this low-traffic demo — full fidelity, and volume is
-  trivially inside the free grant, so no reason to drop traces. **The lever exists**:
-  if traffic ever grows enough that ingestion approaches the free grant, switch to fixed
-  or adaptive sampling on the exporter (a backend `TelemetryRegistration` change, not an
-  infra change) to cap ingestion cost. Note this is a **backend-code** knob, not Bicep —
-  called out here so the reviewer knows where the cost dial lives.
-
-### 3b. Postgres Entra administrator identity (human input required)
-- **Options:** an individual **Entra user** (simplest for a demo) · an **Entra group**
-  (better — survives staff changes, lets several people administer without editing infra).
-- **Recommendation: an Entra group** if one is readily available, else the deploying
-  human's own user. Either way the human must supply `objectId` / `principalName` /
-  `principalType` (`User` or `Group`) / `tenantId` as Bicep params — these are **not
-  guessable** and are a required input before Mode 2 can author/validate the Postgres change.
-
-### 3c. Where the `Monitoring Metrics Publisher` role assignment lives
-- **Options:** (a) authored in `main.bicep` (spec §13.10's literal wording) · (b) a
-  **manual human Phase-3 grant** like the existing `AcrPull` grants.
-- **Recommendation: (b), manual grant.** It matches this repo's actual established
-  convention (`infra/README.md` deliberately keeps role assignments out of the
-  CD-runnable Bicep because a `Contributor` principal can't create them). Putting it in
-  Bicep would only be safe if the *infra-deploy* identity holds `User Access
-  Administrator`/`Owner`; since infra here is human-deployed and role grants are already
-  a documented manual Phase 3, adding one more `az role assignment create` there is the
-  consistent, lowest-surprise choice. Flagging the spec-vs-repo discrepancy explicitly.
-
-### 3d. Postgres dual-auth vs. Entra-only
-- **Options:** **dual** (`passwordAuth: Enabled` + `activeDirectoryAuth: Enabled`) ·
-  **Entra-only** (`passwordAuth: Disabled`).
-- **Recommendation: dual-auth.** Keeps the admin password as a break-glass path and
-  avoids a hard cutover for a live app (§13.4 lists Entra-only as *optional* hardening).
-  Entra-only would also strand `PGADMIN_PASSWORD` and any password-based break-glass —
-  defer it to a later hardening cycle.
-
-### 3e. Optional daily ingestion cap on `log-todo-demo`
-- **Options:** no cap (default) · a small daily cap (e.g. 1 GB/day) as a cost circuit-breaker.
-- **Recommendation: no cap** for the demo (a cap can *drop* telemetry once hit, which is
-  worse than a few dollars). Noted as an available guardrail if ingestion ever spikes.
+**Explicitly *not* proposed** (and must not be added in INFRA-APPLY): any role
+assignment in Bicep (§11.6 — humans grant RBAC), any secret *value* in Bicep or a
+parameter file, and any grant to `todo-api`/`todo-web`'s managed identity. The API
+has no use for the Google secret; granting it would be an exfiltration path and a
+least-privilege violation. This is a deliberate, documented deviation from the
+literal original request ("API's managed identity gets read permission").
 
 ---
 
-## 4. Manual / human-only bootstrap steps this cycle adds
+## 2. Microsoft Entra External ID tenant (new)
 
-These are **run once, by a human** with the right privileges — **never by an agent**
-(PROPOSE mode, §11.8 / §13.10). They extend the existing `infra/README.md` Phase 3 and
-follow the exact same "manual, human-run" convention as the OIDC/RBAC and `AcrPull`
-bootstrap already documented there. In Mode 2 these get written verbatim into
-`infra/README.md`; listed here for sign-off.
+**Why this service:** end users need self-service sign-up, email+password local
+accounts, and Google federation. §16.3.3 rejects the alternatives (Azure AD B2C is
+legacy/closed to new tenants; workforce-tenant users are the wrong product and would
+pollute the directory holding our subscription and managed identities; rolling our
+own puts password material in our codebase).
 
-**(A) Postgres Entra admin — supply inputs, then the Bicep server-side change sets it.**
-A human provides the Entra admin `objectId` / `principalName` / `principalType` /
-`tenantId` (§3b) as deploy params; the Bicep `administrators` child resource + `authConfig`
-do the server-side enablement. (Bicep-authored, human-applied — same as all infra here.)
+**Important honesty note:** this is **not a devops/Bicep deliverable**. §16.5.1 and
+§16.13 establish that the `Microsoft.AzureActiveDirectory/ciamDirectories` ARM type
+is preview, creates only an empty directory, and **cannot be deployed by the CD
+service principal or a managed identity** — it needs an interactive user principal
+with Tenant Creator. It is listed here anyway because it is a **new billable link to
+subscription `9ba6633f-…`** and the tier/linking model is a genuine cost decision
+that needs the same sign-off as any SKU.
 
-**(B) Create the managed identity's Postgres role + grant it schema/DDL rights
-(cannot be done in Bicep — runs inside the database).** Connect to the **`postgres`**
-database **as the Entra administrator** and run:
-```sql
--- run as the Entra admin, connected to the `postgres` database
-select * from pgaadauth_create_principal('<todo-api-managed-identity-name>', false, false);
--- then, connected to tododb, grant the new role what startup Migrate() needs:
---   CONNECT on tododb, USAGE/CREATE on the schema, and table DDL/DML rights
---   (schema ownership is simplest for the demo's auto-migrate-at-startup path).
-```
-`<todo-api-managed-identity-name>` is the name of `todo-api`'s system-assigned managed
-identity (this becomes the `Username=` in the passwordless connection string, §1d).
-This mirrors the §11.6 OIDC bootstrap in style and labeling: **manual, run once, by a human.**
+> Estimates again — External ID is MAU-priced and the published rates move; verify
+> before sign-off.
 
-**(C) Grant `Monitoring Metrics Publisher` (per §3c recommendation — manual Phase-3 grant):**
-```bash
-# Human with User Access Administrator/Owner, after the AI component + app identity exist:
-az role assignment create \
-  --assignee "<todo-api-managed-identity-principalId>" \
-  --role "Monitoring Metrics Publisher" \
-  --scope "<appi-todo-demo resource id>"
-```
+| Option | Est. monthly cost | Suited for | Limits |
+|---|---|---|---|
+| **30-day free trial tenant** | **$0** for 30 days, then the tenant expires | Kicking the tires on External ID with zero subscription linkage | Hard 30-day expiry; **users, app registrations, user flows and the Google IdP config are all lost** when it lapses; not linked to a subscription, so it cannot become the long-lived demo tenant. Only acceptable as the fallback if a Tenant Creator/policy block prevents option 2 (spec assumption A1). |
+| **Subscription-linked, External ID "Core" (P1-equivalent)** | **~$0** at this scale — first **50,000 MAU free**, then roughly **$0.03/MAU** for the next band. This demo is expected in single-digit MAU. | Exactly this feature set: self-service sign-up with attribute collection, local email+password accounts with SSPR, Google/Facebook/Apple/OIDC federation, MSAL React + `Microsoft.Identity.Web` support. | No risk-based Conditional Access / Identity Protection. Country/region is **immutable** after creation. Deleting a `ciamDirectories` resource is known to be awkward — create it once, deliberately (§16.16 risk). |
+| **Subscription-linked, External ID "Premium" (P2-equivalent)** | **~$0** at this scale (also 50,000 MAU free), then roughly **$0.23/MAU** — ~8× Core beyond the free band | Consumer apps needing Identity Protection, risk-based Conditional Access, and adaptive MFA on customer accounts | Buys nothing this cycle: **MFA and Conditional Access are explicitly out of scope** (§16.15), and the "Stay signed in?" suppression that would need a CA session policy is out of scope too. Pure future-optionality with no current consumer. |
 
----
+**Recommendation: subscription-linked External ID tenant on the Core tier**, linked
+to subscription `9ba6633f-058c-4269-8b0f-086ab331ef26`, resource group
+`rg-todo-demo`, country/region **United States**.
 
-## 5. Open questions / risks
+Reasoning:
 
-1. **Dead config cleanup — the old password path becomes orphaned.** Once `todo-api`
-   cuts to Entra auth, the `todo-db-connection` Container Apps secret and the
-   password-based connection string are **dead config**. They must be actively removed
-   from the `todo-api` Container App (not just left dangling) so a stale
-   password-bearing secret doesn't linger in the deployed app. The admin password itself
-   stays only for server provisioning/break-glass (dual-auth, §3d); it is no longer an
-   app runtime credential.
+- Every capability §16 actually requires — self-service sign-up, phone as a custom
+  collectable attribute, email+password, Google federation, PKCE SPA + validated API
+  audience — is a **Core** feature. Premium's differentiators map 1:1 onto things
+  §16.15 puts out of scope, so the upgrade would be paying (eventually) for
+  capability the design forbids using.
+- Both tiers are **$0 at demo scale** thanks to the 50k free MAU band, so this is
+  not a cost decision *today* — it is a decision about which tier the tenant is
+  provisioned as, and Core keeps the future bill 8× lower if the demo ever grows.
+- The trial tenant is rejected as the primary path because the entire §16.11
+  bootstrap (tenant, two app registrations, custom attribute, user flow, Google IdP,
+  optional claims, admin consent) would have to be redone from scratch in 30 days,
+  and the `users` rows keyed on `oid` would be orphaned when the directory dies.
+  Keep it as the documented fallback only, per assumption A1.
+- Linking to `rg-todo-demo` keeps the one-RG convention and avoids an orphaned
+  billable tenant.
 
-2. **Cutover sequencing on a LIVE app (highest risk).** This is a running production app
-   on `main`, not a fresh bootstrap. If the env flips to `Postgres__UseEntraAuth=true`
-   **before** the in-DB principal exists and is granted (step 4B), the backend loses DB
-   connectivity — and because migrations run at startup (§3.4), a cold-started replica
-   could fail its startup `Migrate()`. Safe order:
-   **(i)** deploy the Postgres Entra-auth server change + set the Entra admin →
-   **(ii)** run `pgaadauth_create_principal` + grants (4B) →
-   **(iii)** grant `Monitoring Metrics Publisher` (4C) + provision the AI component
-   with `DisableLocalAuth: true` →
-   **(iv)** *only then* update `todo-api`: set `Postgres__UseEntraAuth=true`, swap
-   `ConnectionStrings__TodoDb` to the passwordless value, add
-   `APPLICATIONINSIGHTS_CONNECTION_STRING`, and drop the `todo-db-connection` secret.
-   Doing (iv) before (ii) is the concrete outage scenario to avoid. A single revision
-   flip with all of (iv) at once (rather than piecemeal) is cleanest.
-
-3. **`DisableLocalAuth: true` ordering.** If local auth is disabled on the AI component
-   **before** the `Monitoring Metrics Publisher` grant (4C) propagates, telemetry
-   ingestion **silently fails** (403) — the app still runs (exporter errors are
-   non-fatal) but no traces land. Grant the role first (or accept a brief gap while RBAC
-   propagates, which can take a few minutes). This is telemetry-only risk, not an app-availability risk.
-
-4. **`Trust Server Certificate=true` remains** in the connection string — it encrypts
-   but skips CA verification (MITM-susceptible). Unchanged from today and **out of this
-   cycle's scope**; the production hardening (`SslMode=VerifyFull` + Azure Postgres CA)
-   is already flagged in prior review/`changes.md`. Noted so it isn't assumed fixed here.
-
-5. **Postgres role name coupling.** The passwordless `Username=` must exactly match the
-   principal name created in 4B (the MI's name). A mismatch fails auth. Whoever runs 4B
-   and whoever sets the connection string must agree on the exact managed-identity name —
-   worth a single documented source of truth in `infra/README.md`.
-
-6. **Key Vault — deliberately NOT proposed (§6 below).** Flagging only so a reviewer who
-   expected one knows its absence is intentional, not an omission.
+**Open decision for the approver (not a SKU, but it belongs with this one):**
+§16.5.1 permits devops to author an *optional, reference-only*
+`infra/bootstrap/externalid-tenant.bicep` documenting the preview
+`ciamDirectories` resource, excluded from CD and labelled "human, `az login` as a
+user, run once". **Recommendation: skip it.** It cannot be used by the pipeline, a
+failed/orphaned `ciamDirectories` resource is awkward to clean up, and a Bicep file
+that must never be deployed is a trap for the next reader. The portal runbook in
+§16.11 is the supported path and is already written. Say the word if you'd rather
+have it as reference material.
 
 ---
 
-## 6. Key Vault — not provisioned (agree with the spec)
+## 3. Changed, but no SKU/tier decision to make (listed for completeness)
 
-I **agree** with §13.6's conclusion: after this cycle, every application credential is
-covered by managed identity / Entra (Postgres via MI token; App Insights via MI + local
-auth disabled; ACR pull via MI; CI/CD via OIDC). **Zero application runtime secrets
-remain**, so nothing reaches the "cannot use managed identity" branch that would require
-Key Vault. Provisioning `kv-todo-demo` now would add a resource and per-operation cost to
-hold nothing. The Key Vault pattern stays **specified for the future** (§13.6) — the
-first future secret that genuinely cannot use MI triggers it — but it is correctly **not
-instantiated** this cycle. No disagreement.
+These are config-only and cost **$0**. No approval needed on tier grounds; they are
+here so the diff is complete and nothing is smuggled in during INFRA-APPLY.
+
+| Item | Change | Cost |
+|---|---|---|
+| `todo-api` Container App | Five new **plain, non-secret** env vars (`AzureAd__Instance`, `AzureAd__TenantId`, `AzureAd__ClientId`, `AzureAd__Audience`, `AzureAd__Scopes`) fed by new non-`@secure()` top-level Bicep params. `ConnectionStrings__TodoDb` and `APPLICATIONINSIGHTS_CONNECTION_STRING` untouched. | $0 |
+| `todo-api` scale/size | **No change** — 0–3 replicas, 0.25 vCPU / 0.5 GiB. §16.10 notes each authenticated request adds one indexed single-row `SELECT`, which is noise at demo scale. | $0 |
+| `frontend/Dockerfile` | Four new `ARG`/`ENV` pairs (`VITE_ENTRA_TENANT_SUBDOMAIN`, `VITE_ENTRA_TENANT_ID`, `VITE_ENTRA_SPA_CLIENT_ID`, `VITE_API_SCOPE`) | $0 |
+| `ci.yml` / `cd.yml` / `azure-pipelines.yml` | Pass the four values as `--build-arg` from GitHub repo **variables** (public identifiers, deliberately not secrets); dummy values are fine in CI's build-validation step | $0 |
+| Log Analytics / App Insights | No config change. Slight extra trace volume from the new endpoints and `users` query; well inside demo noise on PAYG 30-day retention. | ~$0 |
+| Postgres Flexible Server | **No change at all.** The `users` table arrives via an EF Core migration applied by the existing startup `Migrate()` over the existing passwordless `NpgsqlDataSource`. No new connection string, no new auth path, no server setting. | $0 |
+
+**Estimated incremental cost of this entire cycle: ≈ $0.00/month** (Key Vault
+Standard at a handful of operations per year, External ID within the 50k free MAU
+band, no compute or SKU change anywhere). Estimate only, region- and
+usage-dependent.
 
 ---
 
-## Status
+## 4. Two things the approver should know before INFRA-APPLY
 
-**PROPOSE mode — proposal ready, waiting on SKU/decision sign-off.** No file under
-`infra/`, `.github/workflows/`, or `azure-pipelines.yml` was created or modified, and
-no Azure resource, role assignment, or credential was touched. On approval (App Insights
-workspace-based reuse of `log-todo-demo`; the four decision points in §3 — recommendations:
-100% sampling, Entra **group** admin, **manual** role grant, **dual-auth** Postgres, **no**
-daily cap), Mode 2 will author `infra/modules/appinsights.bicep`, the Postgres Entra-auth +
-`todo-api` env changes, the `Monitoring Metrics Publisher` grant, and the `infra/README.md`
-manual-bootstrap additions, then validate with `az deployment group what-if` / `validate`
-only (never apply).
+Neither changes the SKU choices; both will shape how the Bicep is written, so
+flagging them now rather than discovering them mid-apply.
+
+1. **Bicep alone will not configure the running app.** `cd.yml` builds and pushes
+   images and runs `az containerapp update` — it does **not** run
+   `az deployment group create`. So the five `AzureAd__*` env vars must ALSO be
+   applied imperatively (§16.12 item 6) before or with the image that needs them.
+   The backend fails fast at startup if any of the five is missing (§16.7.1), which
+   is by design but means a mis-ordered deploy produces a revision that never
+   becomes healthy. The INFRA-APPLY pass will put both paths — Bicep *and* the
+   imperative `az containerapp update` + rollback command — into `infra.md`.
+
+2. **The Bicep params for those env vars have no values until the human bootstrap
+   runs.** The external tenant ID, subdomain and API client ID are produced by
+   §16.11 steps 1–3, which happen in the portal. `main.parameters.json` therefore
+   cannot be filled in at authoring time. I intend to give the new params
+   empty-string defaults and document that the Bicep must not be applied with them
+   blank — but flagging it because it is the kind of thing that silently deploys a
+   broken revision if nobody notices. If you would rather the params be **required**
+   (no default), so a blank deploy fails loudly at ARM validation instead of at
+   container startup, say so and I'll author it that way.
+
+---
+
+## Approval requested
+
+- [ ] **Key Vault: Standard** (RBAC auth, soft-delete 7d, purge protection off,
+      public network, no role assignments or secret values in IaC)
+- [ ] **Entra External ID: subscription-linked, Core tier, US region**, trial
+      tenant as fallback only
+- [ ] Skip the reference-only `infra/bootstrap/externalid-tenant.bicep` (or ask for
+      it explicitly)
+- [ ] New Bicep params for the `AzureAd__*` values: **empty-string defaults**
+      (or ask for **required, no default**)
+
+Nothing under `infra/` will be created or edited until these are confirmed.

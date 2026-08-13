@@ -2,6 +2,7 @@
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
   "contentVersion": "1.0.0.0",
   "_comment": "Dev/demo NON-SECRET parameters only. postgresAdminPassword is @secure() and is supplied at deploy time from a GitHub Actions secret / Azure Pipelines secret variable (PGADMIN_PASSWORD) via -p postgresAdminPassword=... — NEVER committed here. Image tags default to a public placeholder and are overridden by CD with the real ACR image (todo-api:<sha> / todo-web:<sha>). postgresLocation/postgresServerName are pinned to where Postgres was actually bootstrapped (see infra/README.md and the bootstrap-deploy-fixes commit) — Postgres location and name are immutable after creation, so these must stay fixed for every future deploy (including CD) or it will conflict with the existing server. The postgresEntraAdmin* values are NON-SECRET identity metadata (an object ID and a UPN are not credentials, so they belong here) approved by the user in chat 2026-07-28; they set the Postgres Microsoft Entra administrator for managed-identity DB auth (§13.4).",
+  "_comment_entra_external_id": "specs §16 (Entra External ID end-user auth). externalTenantSubdomain / externalTenantId / apiClientId / apiScopeName are NON-SECRET PUBLIC IDENTIFIERS (a tenant subdomain, a tenant GUID, an app-registration client ID, a scope name) — not credentials, so they correctly live in this committed file. THE THREE BLANK ONES MUST BE FILLED IN BY A HUMAN before this template is applied: their values are produced by the §16.11 portal bootstrap (create the External ID tenant, then the todo-api-app and todo-web-spa app registrations), which no agent and no service principal can run. DO NOT APPLY THIS TEMPLATE WHILE THEY ARE BLANK — todo-api validates the AzureAd__* settings at startup and fails fast (§16.7.1), so a blank apply rolls a todo-api revision that never becomes healthy. See infra/README.md Phase 5.",
   "parameters": {
     "location": {
       "value": "eastus"
@@ -32,6 +33,18 @@
     },
     "databaseName": {
       "value": "tododb"
+    },
+    "externalTenantSubdomain": {
+      "value": ""
+    },
+    "externalTenantId": {
+      "value": ""
+    },
+    "apiClientId": {
+      "value": ""
+    },
+    "apiScopeName": {
+      "value": "Todos.ReadWrite"
     },
     "apiMinReplicas": {
       "value": 0

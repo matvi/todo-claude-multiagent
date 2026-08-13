@@ -5,7 +5,9 @@ using System.Diagnostics;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -85,6 +87,15 @@ public class ObservabilityTestFactory : WebApplicationFactory<Program>
     /// </summary>
     public string? AppInsightsConnectionString { get; set; }
 
+    public ObservabilityTestFactory()
+    {
+        // Must run before this factory ever triggers host creation. AddTodoAuthentication
+        // reads AzureAd:* eagerly in Program.cs's top-level statements, before
+        // ConfigureWebHost/ConfigureAppConfiguration below ever run — see
+        // TestAzureAdEnvironment's doc comment.
+        TestAzureAdEnvironment.EnsureConfigured();
+    }
+
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
@@ -120,6 +131,16 @@ public class ObservabilityTestFactory : WebApplicationFactory<Program>
             services.AddDbContext<TodoDbContext>(options =>
                 options.UseInMemoryDatabase(DatabaseName));
 
+            // Same test authentication scheme as TodoApiFactory (specs §16.18 item 22):
+            // this host's requests need an authenticated principal to reach /api/todos
+            // (used by Request_ProducesValidTraceId_AndCorrelatesLogRecordToSameTrace),
+            // and swapping the default scheme avoids ever dialling a real JWKS endpoint.
+            services
+                .AddAuthentication(TestAuthHandler.SchemeName)
+                .AddScheme<AuthenticationSchemeOptions, TestAuthHandler>(
+                    TestAuthHandler.SchemeName,
+                    _ => { });
+
             // Inject a marker log line into the middleware pipeline (without
             // touching Program.cs) so we have a deterministic, in-request
             // ILogger call to check for trace correlation.
@@ -138,6 +159,19 @@ public class ObservabilityTestFactory : WebApplicationFactory<Program>
             services.ConfigureOpenTelemetryTracerProvider((_, tracing) =>
                 tracing.AddProcessor(new ListCapturingProcessor(ExportedActivities)));
         });
+    }
+
+    /// <summary>
+    /// Attaches a default valid test bearer token to every client this factory creates
+    /// (same rationale as <see cref="TodoApiFactory.ConfigureClient"/>), so the pre-existing
+    /// <c>/api/todos</c> / <c>/health</c> calls in this file keep working unmodified.
+    /// </summary>
+    protected override void ConfigureClient(HttpClient client)
+    {
+        base.ConfigureClient(client);
+
+        client.DefaultRequestHeaders.Authorization =
+            new AuthenticationHeaderValue("Bearer", TestToken.Valid().Encode());
     }
 
     private sealed class MarkerLoggingStartupFilter : IStartupFilter

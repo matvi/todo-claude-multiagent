@@ -379,3 +379,179 @@ decision** (recorded as such — this was not discovered by an agent).
     Bicep — lessons §2c). Any DB/auth change must be expressed as an imperative
     `az containerapp update` runbook step as well as in Bicep, or it will never
     take effect.
+
+---
+
+## 2026-08-12 — End-user authentication & authorization (Entra External ID + Postgres roles)
+
+Branch `pipeline/entra-external-id-auth`. See specs.md **§16**. Removes the "no auth"
+out-of-scope item from §8. **Does NOT supersede §14** — the application's Postgres
+connection stays Entra/managed-identity-only and passwordless; §16 adds *end-user*
+identity on top of it.
+
+- **Services added/changed:** One new **Microsoft Entra External ID (CIAM) external
+  tenant** — a *separate directory* from the workforce tenant `6ce2ff72-…`, linked to
+  subscription `9ba6633f-…` / `rg-todo-demo` — containing two app registrations
+  (`todo-api-app` = protected API exposing scope `Todos.ReadWrite`; `todo-web-spa` =
+  public SPA client, PKCE, no secret), one sign-up/sign-in user flow, a custom
+  `phoneNumber` attribute, and Google as a federated identity provider. One new Azure
+  resource: **Key Vault** (`kv-todo-…`, RBAC-authorization, eastus) used **only** as
+  a custodial store for the Google OAuth client secret. New `users` table in the
+  existing `tododb`. `todo-api` gains JWT bearer validation + a claims transformation;
+  `todo-web` gains MSAL React + react-router. External prerequisite outside Azure: a
+  **Google Cloud OAuth Web client**. Cost delta ≈ **$0** (External ID free ≤50k MAU;
+  KV a few operations/year).
+- **Key decisions (with rationale):**
+  - *Product = **Entra External ID external tenant**, never Azure AD B2C* (legacy,
+    being retired; its `b2clogin.com` / `p=B2C_1_*` patterns must not be copied).
+    Consumer identities are deliberately kept **out of the workforce tenant** that
+    holds the subscription and the managed identities.
+  - ***Entra proves identity; Postgres decides permissions.*** Role lives in
+    `users.role` (`'User'`/`'Admin'`, CHECK-constrained) and is **re-derived from the
+    DB on every request** by a scoped `IClaimsTransformation`, which also **strips
+    every inbound `role`/`roles` claim** before adding its own. Rejected Entra app
+    roles/groups: promoting a user would need Graph *write* into the external tenant,
+    and a workforce-tenant managed identity **cannot authenticate to another tenant**,
+    so it would have required a stored client secret — contradicting §13/§14.
+  - *Identity key is the **`oid`** claim, never `sub`.* `sub` is pairwise (different
+    per application), so keying on it would split one human across rows. Missing
+    `oid`, or `tid` ≠ the configured tenant ⇒ 401, no fallback.
+  - *First-login provisioning is **lazy, server-side get-or-create** inside the same
+    transformation* (unique index on `entra_object_id` + 23505 re-read for the
+    multi-replica race), **not** a `POST /api/auth/provision` endpoint the client could
+    skip. `role` on insert is always the server-side literal `'User'`. **No "first user
+    becomes Admin" rule** (land-grab escalation); the first Admin is a one-time human
+    `UPDATE users SET role='Admin'` via psql as the Postgres Entra admin.
+  - *Secure-by-default authorization*: `FallbackPolicy = RequireAuthenticatedUser`,
+    with `/health` the single explicit `AllowAnonymous` carve-out. Never
+    `ValidateIssuer/Audience/Lifetime = false`; the External ID authority-vs-issuer
+    host mismatch (`<sub>.ciamlogin.com` vs `<tenantId>.ciamlogin.com`) is fixed with
+    explicit `ValidIssuers` if needed, never by disabling validation.
+  - ***Key Vault reconciliation of the "put the connection string in KV" request:***
+    since §14 the Postgres connection string holds **no credential**, so it stays a
+    plain env var — that half of the request is **not applicable by design**, and
+    moving a non-secret into KV would regress §14. The Google client secret **is** a
+    real secret from a third party that **cannot** use Entra auth → the sanctioned
+    Key Vault fallback. It is consumed by **Entra External ID**, not by our apps, so
+    **no application identity is granted any role on the vault** (deliberate deviation
+    from the literal request; least privilege). KV uses **Entra RBAC only** — no
+    access policies, no vault keys, no SAS.
+  - *Application runtime secrets remain **zero**.* Tenant IDs, client IDs, authority
+    URLs and scope names are **public identifiers** → plain env vars on `todo-api`
+    (`AzureAd__*`) and Vite **build args** on `todo-web`; never Container Apps secrets.
+  - *`todos` gets **no** owner column.* Per-user todo ownership is a separate feature,
+    explicitly out of scope; "add auth" must not be read as "todos become per-user".
+  - *SPA*: MSAL redirect flows, `knownAuthorities` required for `*.ciamlogin.com`,
+    **`sessionStorage`** token cache (XSS blast radius), `ssoSilent` → interactive
+    fallback, and a "Continue with Google" button using `domain_hint=google.com` that
+    **must degrade gracefully** if External ID ignores the hint. Client-side route
+    hiding is UX only — the API is the enforcement point.
+  - *There is **no built-in phone attribute** in External ID* (built-ins are city,
+    country, displayName, email, givenName, jobTitle, postalCode, state,
+    streetAddress, surname). Phone is a **custom directory-extension attribute**, so
+    its claim name is tenant-specific (`extension_<appId>_phoneNumber`) — the API
+    resolves it by config key or `_phoneNumber` suffix match, never a hard-coded GUID.
+- **Constraints future features must respect:**
+  - **The external tenant is not IaC-able in any practical sense.** The
+    `Microsoft.AzureActiveDirectory/ciamDirectories` type is preview, creates only an
+    empty directory, and **cannot be deployed by the CD service principal or a managed
+    identity** (interactive user with Tenant Creator required). The Microsoft Graph
+    Bicep extension targets **the deploying credential's tenant** (our workforce
+    tenant) and MI-as-federated-credential is workforce-only, so app registrations,
+    user flows, custom attributes, the Google IdP, optional claims and admin consent
+    are **Portal/Graph, human-run**. Never hand these to devops as Bicep tasks.
+  - **Never trust a client-supplied role**, and never cache the role in the token.
+    Any new authorization check re-derives the role from Postgres.
+  - **New endpoints are authenticated by default** (fallback policy). Adding
+    `[AllowAnonymous]` requires an explicit, reviewed justification.
+  - **No application identity may be granted a Key Vault role** for the Google secret.
+    If a *future* app secret is unavoidable, use the §13.6 pattern (Container Apps
+    Key Vault reference + `Key Vault Secrets User` on the Container App MI) and record
+    it in this file.
+  - The `users` table is reached over the **same single Entra `NpgsqlDataSource`**
+    from §14 — no second connection string, no second DB auth path, ever.
+  - **`users` now holds PII** (email, display name, phone). Never log it, never put it
+    in telemetry dimensions; log the `oid` when a user must be identified.
+  - The frontend image is now **environment-specific** (tenant/client IDs are baked at
+    build time), extending the existing build-arg ordering constraint and complicating
+    §15's "promote the exact image" model for `todo-web` (backend stays promotable).
+  - Auth env vars must be applied **imperatively** (`az containerapp update`) as well
+    as in Bicep — CD does not apply Bicep (lessons §2c) and the API now **fails fast**
+    without them.
+  - Roles stay exactly **two** (`User`, `Admin`). Adding a third is a spec change, not
+    an implementation detail.
+
+---
+
+## 2026-08-12 — Entra External ID auth: spec verification pass (§16 revision)
+
+Same branch `pipeline/entra-external-id-auth`, same feature as the 2026-08-12 entry
+above — this is a **second architect pass** that verified the already-written §16
+against the partially-implemented code on disk and closed the gaps it found. It
+**does not reverse** any decision in the entry above; every decision there stands.
+
+- **Services added/changed:** **None.** No new Azure resource, SKU, region or cost
+  delta beyond what the previous entry already recorded (External ID external
+  tenant + `kv-todo-…` Key Vault, both ≈ $0). This pass changed `.pipeline/specs.md`
+  only.
+- **Key decisions (with rationale):**
+  - *`AzureAd:Scopes` is a **fail-fast required** key* (five required keys, not
+    four). It is what `[RequiredScope]` binds to, so a blank value would silently
+    disable the scope check — an invisible security downgrade. `Instance` must also
+    parse as an absolute **https** URI and `TenantId` as a GUID.
+  - *Scope enforcement is explicit and applies to **every** authenticated
+    controller.* `[RequiredScope(RequiredScopesConfigurationKey = "AzureAd:Scopes")]`
+    goes on `TodosController` **as well as** `UsersController`. Audience validation
+    alone does not prove the delegated permission was granted; a token for this
+    audience without `Todos.ReadWrite` would otherwise reach `/api/todos`.
+    Insufficient scope ⇒ **403**, not 401. `TodosController` therefore changes by
+    **attributes only** — §3.5's payload contract is untouched.
+  - *`AuthOutcomeMiddleware` is a specified, named component* sitting between
+    `UseAuthentication()` and `UseAuthorization()`. The claims transformation
+    **marks** a bad principal (`todo:auth_failure`) rather than throwing;
+    the middleware maps `invalid_principal` ⇒ **401** and
+    `role_source_unavailable` ⇒ **503** (fail closed), skips `IAllowAnonymous`
+    endpoints so `/health` can never be taken down by a broken token, and is the
+    **only** place that mapping exists. Reason: `RequireAuthenticatedUser()` is
+    satisfied by any validated token, so a wrong-`tid`/no-`oid` principal would
+    otherwise pass the fallback policy as "authenticated with no role".
+  - *PII column widths are bounded at the API edge, not the DB.* `email`,
+    `display_name`, `phone_number` stay unbounded `text` (never truncate an
+    IdP-supplied value); `PUT /api/users/me` enforces `displayName` ≤ 256 and
+    `phoneNumber` ≤ 64 via data annotations ⇒ `400 ValidationProblemDetails`.
+  - *Explicit supersession map added to the document header*, because §1/§7/§8/§9.2
+    still said "no authentication". Those statements are now marked historical;
+    **multi-tenancy stays out of scope** (only the auth half of the §8 bullet moved
+    in). Restated in the header that **§16 does not supersede §14**: end-user
+    identity and the app's own DB connection are different concerns.
+  - *Backend file inventory + `todo:` claim-type table are now in the spec*, so the
+    ten `Auth/*.cs` files are specified artifacts rather than undocumented code the
+    reviewer has to judge without a reference.
+- **Payments / PCI — verified, and deliberately NOT designed for:** this pass was
+  asked to scope how end-user identity interacts with "existing payment/PCI-relevant
+  data access". **Verified against the whole source tree and §1–§14: this
+  application has no payment processing, no checkout/order flow, no cardholder
+  data, no payment provider integration, and no payment endpoint or column.** The
+  PCI DSS material in the repo `README.md` describes the *pipeline's engineering
+  standards*, not this app's scope. No payment surface was invented. Instead §16.10
+  records **forward constraints** binding on whoever adds payments later: no
+  cardholder data in `tododb` (processor tokenization only, never PAN/CVV even
+  encrypted); `Admin` must **not** implicitly grant payment/CDE access (a payment
+  feature brings its own policy, re-derived from Postgres); no `[AllowAnonymous]`
+  on payment endpoints; payment-provider credentials follow the **§13.6 Key Vault
+  reference pattern** (Container Apps KV reference + `Key Vault Secrets User` on the
+  Container App MI) — which is a *different* pattern from §16.6's custodial-only
+  vault; and payment data never enters logs or telemetry.
+- **Constraints future features must respect:**
+  - **Adding a controller means adding `[RequiredScope(...)]`**, not just relying on
+    the fallback policy. Reviewers check for it.
+  - **The auth-outcome → HTTP status mapping lives in exactly one place**
+    (`AuthOutcomeMiddleware`). Never re-map it in a controller, filter, or exception
+    handler, and never let a role-lookup failure degrade to a default role.
+  - **`AzureAd:*` keys stay plain, non-secret env vars and stay fail-fast.** Do not
+    add a default/fallback value that would let the API boot without auth config.
+  - **`Admin` means exactly two endpoints** (`GET /api/users`,
+    `PATCH /api/users/{id}/role`). It is not a general "elevated" role; do not
+    attach unrelated privileges to it.
+  - The payment forward-constraints above are binding if a payments feature is ever
+    specified; that feature is a **new cycle**, not an extension of this one.

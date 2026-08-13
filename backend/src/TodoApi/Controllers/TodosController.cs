@@ -1,14 +1,36 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Identity.Web.Resource;
 using TodoApi.Data;
 using TodoApi.Dtos;
 using TodoApi.Models;
 
 namespace TodoApi.Controllers;
 
+/// <summary>
+/// Todo CRUD. Payload contracts are unchanged from specs §3.5 — this cycle changes
+/// <b>attributes only</b> (§16.7.2a).
+///
+/// <para>
+/// Todos remain a single shared list visible to every authenticated user: there is
+/// deliberately no per-user ownership in this cycle (§16.4.3).
+/// </para>
+///
+/// <para>
+/// <c>[Authorize]</c> is redundant with the authorization fallback policy but states the
+/// intent locally. <c>[RequiredScope]</c> is <b>not</b> redundant: audience validation only
+/// proves the token was minted for this API, not that the user consented to the delegated
+/// permission. Without it a token for this audience but without <c>Todos.ReadWrite</c>
+/// would still reach these endpoints. The required scope is read from configuration
+/// (<c>AzureAd:Scopes</c>) rather than hard-coded. Insufficient scope ⇒ 403.
+/// </para>
+/// </summary>
 [ApiController]
 [Route("api/todos")]
 [Produces("application/json")]
+[Authorize]
+[RequiredScope(RequiredScopesConfigurationKey = "AzureAd:Scopes")]
 public class TodosController : ControllerBase
 {
     private readonly TodoDbContext _db;
