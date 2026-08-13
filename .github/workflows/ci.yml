@@ -1,21 +1,50 @@
 # CI — build / test / lint validation only. NO Azure login, NO image push,
 # NO deploy. Credential-free so it runs safely on any PR (incl. forks).
 # This is the REQUIRED status check for branch protection on `main` (specs §11.7).
+#
+# Triggers: every push and every PR, on ANY branch — this only validates code, so
+# there is no reason to restrict it to `main`.
+#
+# Every command below is copied from what the engineer and tester actually ran
+# (.pipeline/changes.md, .pipeline/tests.md — 164/164 backend, 60/60 frontend).
+# There is deliberately NO frontend lint step: `frontend/package.json` defines no
+# `lint` script (changes.md 2026-07-24 pass records that decision), and inventing
+# one here would be a command nobody has ever run. `npm run build` is `tsc && vite
+# build`, so type-checking IS enforced.
 
 name: CI
 
 on:
+  push:
+    branches: ['**']
   pull_request:
-    branches: [main]
+    branches: ['**']
   workflow_dispatch: {}
 
-# Cancel superseded runs on the same PR/branch.
+# Cancel superseded runs of the SAME event type on the same branch/PR.
+# `github.event_name` is part of the key on purpose: a PR branch inside this repo
+# fires both a `push` and a `pull_request` run for the same SHA. Both are pure
+# validation (no Azure login, no push, no deploy), so the duplicate costs runner
+# minutes only — whereas sharing a key would have one event cancel the other and
+# report a cancelled required status check on the PR.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
+
+# Dummy, syntactically-valid Entra identity values for build validation only
+# (sanctioned by specs §16.12 item 4 and .pipeline/infra-proposal.md). CI never
+# deploys, so nothing here reaches a user; the real values are repository
+# variables consumed by cd.yml. They are public identifiers either way, never
+# secrets (specs §16.6(3)).
+env:
+  CI_VITE_API_BASE_URL: https://todo-api.placeholder.local
+  CI_VITE_ENTRA_TENANT_SUBDOMAIN: ci-placeholder
+  CI_VITE_ENTRA_TENANT_ID: 00000000-0000-0000-0000-000000000000
+  CI_VITE_ENTRA_SPA_CLIENT_ID: 11111111-1111-1111-1111-111111111111
+  CI_VITE_API_SCOPE: api://11111111-1111-1111-1111-111111111111/Todos.ReadWrite
 
 jobs:
   backend:
@@ -54,12 +83,18 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - name: Install (clean)
         run: npm ci
-      # A placeholder VITE_API_BASE_URL is fine for a build-check; the real value
-      # is baked by the CD workflow at deploy time.
+      # Placeholder identity values are fine for a build-check; the real ones are
+      # baked by the CD workflow at deploy time from repository variables.
+      # They are passed anyway so `tsc` type-checks authConfig.ts against a
+      # populated `import.meta.env` shape rather than an all-empty one.
       - name: Build (tsc + vite build)
         run: npm run build
         env:
-          VITE_API_BASE_URL: https://todo-api.placeholder.local
+          VITE_API_BASE_URL: ${{ env.CI_VITE_API_BASE_URL }}
+          VITE_ENTRA_TENANT_SUBDOMAIN: ${{ env.CI_VITE_ENTRA_TENANT_SUBDOMAIN }}
+          VITE_ENTRA_TENANT_ID: ${{ env.CI_VITE_ENTRA_TENANT_ID }}
+          VITE_ENTRA_SPA_CLIENT_ID: ${{ env.CI_VITE_ENTRA_SPA_CLIENT_ID }}
+          VITE_API_SCOPE: ${{ env.CI_VITE_API_SCOPE }}
       - name: Test (vitest run)
         run: npm test
       # NOTE: no `npm audit` gate here — the known esbuild/vite 5 dev-toolchain
@@ -72,10 +107,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build backend image
         run: docker build -f backend/src/TodoApi/Dockerfile -t todo-api:ci ./backend
-      - name: Build frontend image (dummy build-arg)
+      # All five build args are exercised so the Dockerfile's ARG/ENV plumbing
+      # (frontend/Dockerfile, specs §16.12 item 3) is validated here rather than
+      # first discovered during a deploy. Dummy values — CI pushes nothing.
+      - name: Build frontend image (dummy build-args)
         run: |
           docker build -f frontend/Dockerfile \
-            --build-arg VITE_API_BASE_URL=https://todo-api.placeholder.local \
+            --build-arg VITE_API_BASE_URL="$CI_VITE_API_BASE_URL" \
+            --build-arg VITE_ENTRA_TENANT_SUBDOMAIN="$CI_VITE_ENTRA_TENANT_SUBDOMAIN" \
+            --build-arg VITE_ENTRA_TENANT_ID="$CI_VITE_ENTRA_TENANT_ID" \
+            --build-arg VITE_ENTRA_SPA_CLIENT_ID="$CI_VITE_ENTRA_SPA_CLIENT_ID" \
+            --build-arg VITE_API_SCOPE="$CI_VITE_API_SCOPE" \
             -t todo-web:ci ./frontend
 
   iac:

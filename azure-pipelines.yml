@@ -1,12 +1,19 @@
-# Azure DevOps equivalent of the GitHub Actions CI + CD (specs §11.10).
+# Azure DevOps equivalent of the GitHub Actions CI + CD, pointed at the GitHub
+# repo `matvi/todo-claude-multiagent` (specs §11.10).
 #
-# TRIGGERS ARE DISABLED ON PURPOSE. GitHub Actions is the primary/auto-triggering
-# system for this repo (specs §9.8 / §11.10). Leaving BOTH systems auto-triggering
-# would double every build and, worse, race two deploys onto the same Container
-# App revision. This file is kept behavior-equivalent and ready to flip on if the
-# team standardizes on Azure DevOps later: change `trigger`/`pr` below to
-# `trigger: { branches: { include: [main] } }` and `pr: { branches: { include:
-# [main] } }`, and disable the GitHub Actions workflows.
+# TRIGGERS ARE DISABLED ON PURPOSE — this pipeline is MANUAL-ONLY (`trigger: none`,
+# `pr: none`). GitHub Actions is the primary/auto-triggering system for this repo
+# (specs §9.8 / §11.10). Leaving BOTH systems auto-triggering would double every
+# build and, worse, race two deploys onto the same Container App revision. This
+# file is kept behavior-equivalent and ready to flip on if the team standardizes
+# on Azure DevOps later:
+#   1. change `trigger`/`pr` below to
+#      `trigger: { branches: { include: [main] } }` / `pr: { branches: { include: [main] } }`
+#      (Azure DevOps has no "PR was merged" trigger; a CI trigger on `main` fires on
+#      the merge commit, which is the closest equivalent to the GitHub CD gate, and
+#      the branch-protection/PR review remains the actual approval),
+#   2. set the four ENTRA_* pipeline variables listed below,
+#   3. DISABLE the GitHub Actions workflows in the same change — never both.
 trigger: none
 pr: none
 
@@ -17,6 +24,21 @@ variables:
   azureServiceConnection: 'todo-demo-arm'
   resourceGroup: 'rg-todo-demo'
   location: 'eastus'
+  # Delegated scope exposed by the todo-api app registration; must match
+  # `apiScopeName` in infra/main.parameters.json and todo-api's AzureAd__Scopes.
+  apiScopeName: 'Todos.ReadWrite'
+  # Dummy identity values for the CI build-validation stage only (never deployed).
+  ciEntraTenantSubdomain: 'ci-placeholder'
+  ciEntraTenantId: '00000000-0000-0000-0000-000000000000'
+  ciEntraSpaClientId: '11111111-1111-1111-1111-111111111111'
+  ciApiScope: 'api://11111111-1111-1111-1111-111111111111/Todos.ReadWrite'
+  #
+  # The CD stage additionally requires these PLAIN (non-secret) pipeline variables
+  # — public identifiers from the §16.11 human tenant bootstrap, the exact
+  # counterparts of the GitHub repository variables of the same names. Define them
+  # as pipeline variables or in a non-secret variable group; NEVER as secrets, and
+  # never inline in this file:
+  #   ENTRA_TENANT_SUBDOMAIN, ENTRA_TENANT_ID, ENTRA_SPA_CLIENT_ID, ENTRA_API_CLIENT_ID
 
 stages:
   # ======================= CI (build / test / lint) =======================
@@ -58,6 +80,10 @@ stages:
             displayName: Build (tsc + vite build)
             env:
               VITE_API_BASE_URL: https://todo-api.placeholder.local
+              VITE_ENTRA_TENANT_SUBDOMAIN: $(ciEntraTenantSubdomain)
+              VITE_ENTRA_TENANT_ID: $(ciEntraTenantId)
+              VITE_ENTRA_SPA_CLIENT_ID: $(ciEntraSpaClientId)
+              VITE_API_SCOPE: $(ciApiScope)
           - script: npm test
             workingDirectory: frontend
             displayName: Test (vitest run)
@@ -69,9 +95,14 @@ stages:
         steps:
           - script: docker build -f backend/src/TodoApi/Dockerfile -t todo-api:ci ./backend
             displayName: Build backend image
+          # All five build args exercised, dummy values — CI pushes nothing.
           - script: >
               docker build -f frontend/Dockerfile
               --build-arg VITE_API_BASE_URL=https://todo-api.placeholder.local
+              --build-arg VITE_ENTRA_TENANT_SUBDOMAIN=$(ciEntraTenantSubdomain)
+              --build-arg VITE_ENTRA_TENANT_ID=$(ciEntraTenantId)
+              --build-arg VITE_ENTRA_SPA_CLIENT_ID=$(ciEntraSpaClientId)
+              --build-arg VITE_API_SCOPE=$(ciApiScope)
               -t todo-web:ci ./frontend
             displayName: Build frontend image
 
@@ -111,6 +142,14 @@ stages:
                 - checkout: self
                 - task: AzureCLI@2
                   displayName: Build/push images + update apps (infra deployed manually — see infra/README.md)
+                  # Plain (non-secret) identity variables, surfaced to the script.
+                  # An UNDEFINED Azure DevOps variable expands to the literal
+                  # "$(NAME)", so the preflight below treats that form as unset.
+                  env:
+                    ENTRA_TENANT_SUBDOMAIN: $(ENTRA_TENANT_SUBDOMAIN)
+                    ENTRA_TENANT_ID: $(ENTRA_TENANT_ID)
+                    ENTRA_SPA_CLIENT_ID: $(ENTRA_SPA_CLIENT_ID)
+                    ENTRA_API_CLIENT_ID: $(ENTRA_API_CLIENT_ID)
                   inputs:
                     azureSubscription: $(azureServiceConnection)
                     scriptType: bash
@@ -118,6 +157,42 @@ stages:
                     inlineScript: |
                       set -euo pipefail
                       SHA="$(Build.SourceVersion)"
+
+                      # 0. PREFLIGHT — identity plumbing must be complete before
+                      #    anything is built or rolled (mirrors cd.yml).
+                      missing=()
+                      for v in ENTRA_TENANT_SUBDOMAIN ENTRA_TENANT_ID ENTRA_SPA_CLIENT_ID ENTRA_API_CLIENT_ID; do
+                        val="${!v:-}"
+                        case "$val" in ''|'$('*) missing+=("$v");; esac
+                      done
+                      if [ ${#missing[@]} -gt 0 ]; then
+                        echo "##vso[task.logissue type=error]Missing pipeline variable(s): ${missing[*]}. Public identifiers from the §16.11 tenant bootstrap — define them as PLAIN (non-secret) variables. Without them the deployed SPA renders 'sign-in is not configured'."
+                        exit 1
+                      fi
+                      API_SCOPE="api://${ENTRA_API_CLIENT_ID}/$(apiScopeName)"
+
+                      #    The backend fails fast at startup unless all five
+                      #    AzureAd__* env vars are already on todo-api; CD does
+                      #    not apply Bicep and does not set them (a human runs
+                      #    the imperative step — .pipeline/infra.md Path B).
+                      ENV_JSON=$(az containerapp show -n todo-api -g "$(resourceGroup)" \
+                        --query "properties.template.containers[0].env" -o json)
+                      missing=()
+                      for k in AzureAd__Instance AzureAd__TenantId AzureAd__ClientId AzureAd__Audience AzureAd__Scopes; do
+                        val=$(echo "$ENV_JSON" | jq -r --arg k "$k" '.[] | select(.name==$k) | .value // ""')
+                        [ -n "$val" ] || missing+=("$k")
+                      done
+                      if [ ${#missing[@]} -gt 0 ]; then
+                        echo "##vso[task.logissue type=error]todo-api is missing/blank env var(s): ${missing[*]}. Deploying now would roll a revision that never becomes healthy (specs §16.7.1). Run the az containerapp update --set-env-vars step in .pipeline/infra.md (Path B) first."
+                        exit 1
+                      fi
+
+                      # 0b. Rollback targets, captured before anything rolls.
+                      PREV_API_REV=$(az containerapp revision list -n todo-api -g "$(resourceGroup)" \
+                        --query "[?properties.active]|[0].name" -o tsv)
+                      PREV_WEB_REV=$(az containerapp revision list -n todo-web -g "$(resourceGroup)" \
+                        --query "[?properties.active]|[0].name" -o tsv)
+                      echo "rollback targets: todo-api=$PREV_API_REV todo-web=$PREV_WEB_REV"
 
                       # 1. Look up the already-provisioned ACR (infra is deployed
                       #    manually, once — see infra/README.md).
@@ -156,9 +231,16 @@ stages:
                       API_FQDN=$(az containerapp show -n todo-api -g "$(resourceGroup)" \
                         --query "properties.configuration.ingress.fqdn" -o tsv)
 
-                      # 3. Frontend SECOND: bake backend FQDN, deploy, read FQDN.
+                      # 3. Frontend SECOND: bake backend FQDN + the four PUBLIC
+                      #    Entra identifiers (specs §16.12 item 4), deploy, read
+                      #    FQDN. None of these is a secret: the SPA is a public
+                      #    client using PKCE and has no client secret at all.
                       docker build -f frontend/Dockerfile \
                         --build-arg VITE_API_BASE_URL="https://$API_FQDN" \
+                        --build-arg VITE_ENTRA_TENANT_SUBDOMAIN="$ENTRA_TENANT_SUBDOMAIN" \
+                        --build-arg VITE_ENTRA_TENANT_ID="$ENTRA_TENANT_ID" \
+                        --build-arg VITE_ENTRA_SPA_CLIENT_ID="$ENTRA_SPA_CLIENT_ID" \
+                        --build-arg VITE_API_SCOPE="$API_SCOPE" \
                         -t "$ACR_LOGIN/todo-web:$SHA" ./frontend
                       docker push "$ACR_LOGIN/todo-web:$SHA"
                       az containerapp update -n todo-web -g "$(resourceGroup)" \
@@ -172,3 +254,7 @@ stages:
 
                       echo "Backend:  https://$API_FQDN"
                       echo "Frontend: https://$WEB_FQDN"
+                      echo "Rollback (both together, specs §16.16):"
+                      echo "  az containerapp revision activate -g $(resourceGroup) -n todo-api --revision $PREV_API_REV"
+                      echo "  az containerapp revision activate -g $(resourceGroup) -n todo-web --revision $PREV_WEB_REV"
+                      echo "Reminder: https://$WEB_FQDN must be a registered SPA redirect URI on todo-web-spa (specs §16.11)."
