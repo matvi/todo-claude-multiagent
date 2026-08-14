@@ -964,3 +964,374 @@ decision, not something this change can or should pre-empt.
   `Azure.Monitor.OpenTelemetry.AspNetCore` 1.6.0, `Swashbuckle.AspNetCore` 10.2.3,
   `Microsoft.AspNetCore.OpenApi` 10.0.0. No package was added, removed, or upgraded here,
   and I am aware of no CVE affecting these versions.
+
+---
+
+# Implementation Changes — End-user authentication with Microsoft Entra External ID (2026-08-12)
+
+Implements **specs §16** on branch `pipeline/entra-external-id-auth`. End users now
+sign up / sign in through an Entra External ID (CIAM) tenant; **Entra proves who the
+caller is, PostgreSQL decides what they may do**.
+
+Substantial parts of the backend `Auth/` layer, `UsersController`, the `AppUser`/
+`UserRole` models, the user DTOs and the `TodoDbContext` mapping were already present
+on disk (uncommitted) when this pass started. That work was reviewed line by line,
+kept where it matched the current spec, corrected where it did not, and **completed** —
+it was not rewritten or duplicated.
+
+## Summary
+
+**Backend (`backend/src/TodoApi`)**
+
+- Added the `Microsoft.Identity.Web` package and wired it in `Program.cs`:
+  `AddTodoAuthentication()` (JWT bearer validation bound to the `AzureAd` section,
+  fail-fast config validation) + `AddTodoAuthorization()` (fallback policy
+  `RequireAuthenticatedUser()`, `AdminOnly` policy, scoped `IClaimsTransformation`
+  and `IUserProvisioningService`).
+- Middleware order is now exactly §16.7.6:
+  `UseCors → UseAuthentication → UseAuthOutcome → UseAuthorization → /health
+  (AllowAnonymous) → MapControllers`. `/health` carries an explicit
+  `.AllowAnonymous()` because the fallback policy otherwise authenticates everything.
+- **Closed the authorization hole flagged by the architect:** `TodosController` now
+  carries `[Authorize]` **and**
+  `[RequiredScope(RequiredScopesConfigurationKey = "AzureAd:Scopes")]`, matching
+  `UsersController`. Previously a token minted for this audience but **without**
+  `scp = Todos.ReadWrite` would have reached `/api/todos`. Attributes only — routes,
+  DTOs, payloads, status codes and ordering are untouched (§16.15).
+- Fail-fast startup validation covers all **five** required keys (`Instance`,
+  `TenantId`, `ClientId`, `Audience`, `Scopes`) and names every missing one, plus
+  shape checks: `Instance` must be an absolute **https** URI, `TenantId` must parse as
+  a GUID. `Users:PhoneClaimName` stays optional, as required.
+- Generated the additive EF migration **`AddUsers`** (`users` table, unique index
+  `ix_users_entra_object_id`, `ck_users_role` CHECK, role stored as text). It does not
+  touch `todos`; `todos` gains no `owner_id` and no FK (§16.4.3).
+- Auth-outcome mapping verified: `invalid_principal` → **401** +
+  `WWW-Authenticate: Bearer`, `role_source_unavailable` → **503**, both as
+  `ProblemDetails`, both skipped for `IAllowAnonymous` endpoints.
+
+**Frontend (`frontend/`)**
+
+- Added `@azure/msal-browser`, `@azure/msal-react` and `react-router-dom`; new
+  `authConfig.ts` (PKCE public client, `knownAuthorities` for `*.ciamlogin.com`,
+  `sessionStorage` cache), `main.tsx` bootstrap (`initialize()` →
+  `handleRedirectPromise()` → register the API token provider → render).
+- New `Root.tsx` shell: `AuthGate` (silent SSO, then `LoginScreen` with
+  "Sign in / Sign up" and "Continue with Google" via `domain_hint`), `UserProvider`
+  (`GET /api/users/me` once), router with `/` (todos) and `/admin`
+  (`RequireAdmin` + `AdminPage`), nav with the admin link hidden for non-admins and a
+  sign-out action.
+- `api.ts` gained `configureApiAuth(getToken, onUnauthorized?)`, bearer-token
+  attachment, the four user endpoints, and 401 handling that drops the session back to
+  the login screen instead of retry-looping. With no provider configured it behaves
+  exactly as before — **all 37 pre-existing frontend tests pass unchanged**.
+- `frontend/Dockerfile` gained the four `VITE_ENTRA_*` / `VITE_API_SCOPE`
+  `ARG`/`ENV` pairs next to `VITE_API_BASE_URL`.
+
+## Files changed / created
+
+**Backend — completed or corrected this pass**
+
+| File | Purpose |
+|---|---|
+| `backend/src/TodoApi/Program.cs` | **CHANGED** — registers auth/authorization; §16.7.6 middleware order; `/health` explicitly anonymous |
+| `backend/src/TodoApi/TodoApi.csproj` | **CHANGED** — added `Microsoft.Identity.Web` 4.14.2 |
+| `backend/src/TodoApi/Controllers/TodosController.cs` | **CHANGED (attributes only)** — `[Authorize]` + `[RequiredScope(...)]`; closes the scope gap |
+| `backend/src/TodoApi/appsettings.json` | **CHANGED** — documents the `AzureAd` and `Users` keys (all blank; blank ⇒ fail fast) |
+| `backend/src/TodoApi/Auth/EntraAuthOptions.cs` | Binds + validates the `AzureAd` section; five-key fail fast, https/GUID shape checks |
+| `backend/src/TodoApi/Auth/AuthenticationRegistration.cs` | `AddTodoAuthentication` / `AddTodoAuthorization`; hardens token validation; missing `Microsoft.AspNetCore.Authentication` using added |
+| `backend/src/TodoApi/Auth/RoleClaimsTransformation.cs` | Per-request role re-derivation from Postgres, inbound-role stripping, fail-closed marking (using fixed) |
+| `backend/src/TodoApi/Auth/AuthOutcomeMiddleware.cs` | Marker → 401/503 mapping; `ProblemDetails` writing fixed to use `Results.Problem(...)` |
+| `backend/src/TodoApi/Auth/UserProvisioningService.cs` + `IUserProvisioningService.cs` | Lazy get-or-create of the caller's row; role always the server-side literal `User` |
+| `backend/src/TodoApi/Auth/ProfileClaimsReader.cs` | `oid`/`tid`/email/name/phone extraction (no authorization influence) |
+| `backend/src/TodoApi/Auth/ClaimsPrincipalExtensions.cs`, `TodoClaimTypes.cs`, `UserProfileOptions.cs` | Read helpers, `todo:`-namespaced claim constants, `Users` options |
+| `backend/src/TodoApi/Controllers/UsersController.cs` | `GET/PUT /api/users/me`, `GET /api/users`, `PATCH /api/users/{id}/role` with self-demotion / last-admin guards and an audit log line |
+| `backend/src/TodoApi/Models/AppUser.cs`, `Models/UserRole.cs` | `users` entity + the two roles (stored as text) |
+| `backend/src/TodoApi/Dtos/UserResponse.cs`, `UpdateUserProfileRequest.cs`, `UpdateUserRoleRequest.cs` | Response shape and the two write DTOs (mass-assignment guard) |
+| `backend/src/TodoApi/Data/TodoDbContext.cs` | **CHANGED** — `DbSet<AppUser>` + `users` mapping (additive) |
+| `backend/src/TodoApi/Migrations/20260812224117_AddUsers*.cs`, `TodoDbContextModelSnapshot.cs` | **NEW** — additive `AddUsers` migration |
+
+**Frontend**
+
+| File | Purpose |
+|---|---|
+| `frontend/src/authConfig.ts` | **NEW** — MSAL config, login requests, `isAuthConfigured` |
+| `frontend/src/main.tsx` | **CHANGED** — MSAL init/redirect handling, token-provider registration, config-error screen |
+| `frontend/src/Root.tsx` | **NEW** — auth gate + router + nav shell |
+| `frontend/src/auth/AuthGate.tsx` | **NEW** — silent SSO once, then the login screen |
+| `frontend/src/auth/LoginScreen.tsx` | **NEW** — sign in / sign up + "Continue with Google" |
+| `frontend/src/auth/tokenProvider.ts` | **NEW** — `acquireTokenSilent` with redirect fallback |
+| `frontend/src/auth/authSession.ts` | **NEW** — carries "the API returned 401" from the API client into React |
+| `frontend/src/auth/UserContext.tsx` | **NEW** — `GET /api/users/me` once; `{user, role, loading, error, reload}` |
+| `frontend/src/auth/RequireAdmin.tsx` | **NEW** — not-authorized panel; issues no admin API call |
+| `frontend/src/pages/AdminPage.tsx` | **NEW** — user list + promote/demote |
+| `frontend/src/api.ts` | **CHANGED** — `configureApiAuth`, bearer attachment, 401 hook, user endpoints |
+| `frontend/src/types.ts`, `src/vite-env.d.ts`, `src/index.css` | **CHANGED** — user types, new env var typings, auth/admin styles |
+| `frontend/package.json`, `package-lock.json` | **CHANGED** — MSAL + router dependencies |
+| `frontend/Dockerfile`, `frontend/.env.development` | **CHANGED** — four new public build args / dev variables |
+
+**Docs**
+
+| File | Purpose |
+|---|---|
+| `README.dev.md` | **CHANGED** — local auth env vars, updated API surface table, new frontend build args |
+| `.env.example` | **CHANGED** — the five `AzureAd__*` (+ optional `Users__PhoneClaimName`) and four `VITE_*` identity variables, all blank |
+
+`App.tsx`, `useTodos.ts` and the todo components are **unchanged**: `App` is still the
+todo screen, which is also why every existing frontend test keeps passing.
+
+## Verification performed locally
+
+- `dotnet build TodoApi.sln -c Release` → **succeeded, 0 warnings, 0 errors**
+  (.NET SDK 10.0.400 installed locally for this pass; the machine only had 9.x).
+- `dotnet ef migrations add AddUsers` → generated; reviewed: `users` only, no change
+  to `todos`.
+- **Ran the API** with dummy (syntactically valid, non-existent) tenant identifiers:
+  - `GET /health` → **200**;
+  - `GET /health` with a garbage bearer token → **200** (the `AllowAnonymous` skip
+    holds — a bad client cannot take the probe down);
+  - `GET /api/todos` with no token → **401** + `WWW-Authenticate: Bearer`;
+  - `GET /api/users/me` with no token → **401**;
+  - CORS preflight (`OPTIONS`, `Origin: http://localhost:5173`,
+    `Access-Control-Request-Headers: authorization`) → **204** with
+    `Access-Control-Allow-Headers: authorization` — answered before authentication.
+- **Resolved `JwtBearerOptions` inspected at runtime** (throwaway harness, deleted):
+  `RequireHttpsMetadata=True`, `ValidateIssuer` / `ValidateAudience` /
+  `ValidateLifetime` / `ValidateIssuerSigningKey` all `True`, `ClockSkew = 00:05:00`,
+  `ValidAudiences = [api://<api-client-id>, <api-client-id>]`,
+  `ValidIssuers = [https://<subdomain>.ciamlogin.com/<tid>/v2.0,
+  https://<tid>.ciamlogin.com/<tid>/v2.0]`, authority built from `Instance`+`TenantId`.
+- **Fail-fast guards exercised**: blank `AzureAd:Scopes` → throws naming it;
+  `Instance = http://…` → throws (TLS required); non-GUID `TenantId` → throws.
+- **`RoleClaimsTransformation` behaviour smoke-checked** with a stubbed provisioning
+  service (throwaway harness, deleted): inbound `roles=Admin` + `ClaimTypes.Role=Admin`
+  with a DB row of `User` ⇒ principal is **User** with exactly **one** role claim and
+  no raw `roles` claim; DB `Admin` ⇒ `IsInRole("Admin")`; a second `TransformAsync` on
+  the same principal ⇒ **one** DB lookup, one role claim; wrong `tid` ⇒
+  `invalid_principal`, no role; missing `oid` ⇒ `invalid_principal`, no row created;
+  provisioning throws ⇒ `role_source_unavailable`, no role claim (fail closed);
+  anonymous principal returned untouched; phone claim resolved both by `_phoneNumber`
+  suffix and by configured claim name.
+- Frontend: `npm run build` (tsc + vite) → **succeeded**; `npm test` → **37/37 pass,
+  unchanged**; `npm audit --omit=dev` → **0 vulnerabilities**.
+
+## Deviations from specs.md (and why)
+
+1. **`useAccessToken` hook → `createAccessTokenProvider(pca)` factory** (§16.9.3 names
+   a hook). Registering the token provider from a component effect is a real bug:
+   React runs **child** effects before **parent** effects, so `useTodos` and
+   `GET /api/users/me` would fire their first request before the provider existed —
+   every page load would start with a spurious 401 and bounce to the login screen.
+   The provider is therefore built in `main.tsx` before the first render. Same MSAL
+   calls (`acquireTokenSilent` → `acquireTokenRedirect` on
+   `InteractionRequiredAuthError`), same public `configureApiAuth` contract.
+2. **`configureApiAuth` takes an optional second argument** (`onUnauthorized`). The
+   spec's signature is `configureApiAuth(getToken)`; the 401→login-screen requirement
+   in the same section needs a channel out of the framework-agnostic API client. The
+   second parameter is optional, so the spec's call shape still compiles.
+3. **A build without the `VITE_ENTRA_*` values renders an explicit "sign-in is not
+   configured" screen** instead of the app. The spec does not say what an unconfigured
+   bundle should do; silently rendering an app whose every call 401s is the wrong
+   failure mode. This mirrors the backend's fail-fast posture.
+4. **`RequiredScopeAttribute` is imported from `Microsoft.Identity.Web.Resource`**, not
+   `Microsoft.Identity.Web` — that is where the type lives in Microsoft.Identity.Web 4.x.
+   Behaviour is exactly as specified (403 on insufficient scope, key bound to
+   `AzureAd:Scopes`).
+5. **`AuthOutcomeMiddleware` writes its ProblemDetails via `Results.Problem(...)`**
+   rather than a hand-built `WriteAsJsonAsync` overload (which does not exist with that
+   argument shape in .NET 10). Same RFC 7807 body and `application/problem+json`
+   content type, produced by the framework's own serializer.
+6. **`.github/workflows/*.yml` and `azure-pipelines.yml` were NOT edited.** §16.12
+   item (4) assigns the frontend `--build-arg` plumbing to the **devops** agent, and
+   the infra pass that added the Key Vault and the five `AzureAd__*` Container App env
+   vars has not yet covered it. `frontend/Dockerfile` (item 3) *is* done here because
+   it is frontend source. **This is a hard delivery dependency: until CD passes
+   `VITE_ENTRA_TENANT_SUBDOMAIN`, `VITE_ENTRA_TENANT_ID`, `VITE_ENTRA_SPA_CLIENT_ID`
+   and `VITE_API_SCOPE` as build args, the deployed SPA will render the
+   "sign-in is not configured" screen.**
+
+## Assumptions made (spec silent or ambiguous)
+
+1. **`Microsoft.Identity.Web` 4.14.2** — the current release; the spec names the package
+   but not a version. It ships a `net10.0` target, so no downlevel shim is used.
+2. **`react-router-dom` 7.18.2**, not 6.x: the 6.x line (and 7.x up to 7.17.0) carries
+   two moderate advisories (open redirect via backslash in `<Link>`/`useNavigate`, and
+   `deserializeErrors()` during SSR hydration). `npm audit --omit=dev` is clean on
+   7.18.2, and the router API used here
+   (`BrowserRouter`/`Routes`/`Route`/`Link`/`Navigate`) is identical.
+3. **`@azure/msal-browser` 4.x + `@azure/msal-react` 3.x** — the versions compatible
+   with the installed React 18 and with CIAM authorities.
+4. **Sign-out uses `logoutRedirect()`** (a full IdP sign-out). The spec specifies the
+   login UX but not sign-out; a local-only cache clear would silently re-SSO on the
+   next load, which is confusing.
+5. **The admin table's "Make User" button is disabled for your own row.** The server
+   returns 409 anyway (§16.8); this just avoids inviting the error.
+6. **`appsettings.json` lists the `AzureAd`/`Users` keys with empty values** for
+   discoverability. Empty is treated as missing, so this does not weaken the fail-fast
+   guard, and no real identifier is committed.
+7. **`GET /api/users/me` re-reads the row** rather than reusing the row the claims
+   transformation just loaded — one extra indexed single-row read on two endpoints, in
+   exchange for the controller not depending on transformation internals.
+
+## Known limitations / TODOs
+
+- **The existing backend test suite does not pass against the new pipeline: 34 of 81
+  tests fail** because `WebApplicationFactory` now boots an app that (a) requires the
+  five `AzureAd:*` settings and (b) authenticates every endpoint. This is exactly the
+  work spec §16.18 item 22 assigns to the **tester agent**: extend `TodoApiFactory` with
+  the `AzureAd:*` in-memory configuration and a test authentication scheme plus a
+  stubbed role source. Nothing in the implementation blocks it — configuration is
+  injectable and every collaborator (`IUserProvisioningService`, `IClaimsTransformation`,
+  `TodoDbContext`) is an interface resolved from DI. `TodoDbContextRegistrationTests`
+  and `EntraTokenPasswordProviderTests` are untouched by this cycle.
+- **Nothing here is verified end to end against a live tenant.** The external tenant,
+  the two app registrations, the user flow, the `phoneNumber` custom attribute and the
+  Google IdP are all human/portal work (§16.11, §16.13). Assumptions A2–A6 and A8
+  (`oid` present and stable, phone collection on Google sign-up, `domain_hint` routing,
+  the issuer/authority host mismatch, optional claims in the **access** token, `scp`
+  present) remain **unverified**; each degrades safely (null profile fields, or a
+  fail-closed 401/403), never into an open door.
+- The **issuer validator installed by `Microsoft.Identity.Web` is an `IssuerValidator`
+  delegate** (`AadIssuerValidator`), which also consults `ValidIssuers` as templates —
+  the two concrete External ID issuer strings added here are belt-and-braces for the
+  documented `IDX10205` gotcha. If a real token still fails, the remedy is more
+  `ValidIssuers` entries; **disabling issuer validation is never acceptable.**
+- **Swagger UI has no sign-in affordance**, so in Development it can only exercise
+  `/health` without a manually pasted token. Out of scope this cycle.
+- Role lookup is **not cached** (deliberate, §16.7.3): revocation is immediate, at the
+  cost of one indexed read per authenticated request.
+- The repo root still contains an untracked `dotnet-install.sh` left by an earlier
+  pass; it is unrelated to this change and was not added or committed by me.
+
+## How to run it
+
+```bash
+# 1. Postgres (local, trust auth, no password — §14.6)
+docker compose up -d
+
+# 2. Backend (from backend/src/TodoApi). The five values are PUBLIC identifiers from
+#    the human-run tenant bootstrap (§16.11); the API refuses to start without them.
+export AzureAd__Instance=https://<tenant-subdomain>.ciamlogin.com/
+export AzureAd__TenantId=<external-tenant-guid>
+export AzureAd__ClientId=<todo-api-app-client-id>
+export AzureAd__Audience=api://<todo-api-app-client-id>
+export AzureAd__Scopes=Todos.ReadWrite
+dotnet run                      # http://localhost:8080  (/health is anonymous)
+
+# 3. Frontend (from frontend) — fill the VITE_ENTRA_* values in .env.development first
+npm install
+npm run dev                     # http://localhost:5173
+
+# Build / test
+dotnet build backend/TodoApi.sln -c Release
+cd frontend && npm run build && npm test
+```
+
+Container images: see `README.dev.md` — the frontend image now needs four extra
+`--build-arg` values and must be rebuilt whenever any of them changes.
+
+## Security & PCI DSS scope
+
+**Payment / cardholder data: none. This application has no payment functionality.**
+There is no checkout, order, invoice or payment endpoint; no payment-provider
+integration; no PAN, CVV, track data, or any payment-related column, table or log field
+anywhere in the backend, frontend, database or infrastructure. Specs §16.10 records the
+same finding, verified against the full source tree. **This change therefore adds
+nothing to PCI DSS scope, and no part of the system is in a cardholder data
+environment.** The two roles carry no payment meaning: `Admin` grants exactly
+`GET /api/users` and `PATCH /api/users/{id}/role`, nothing else.
+
+*If payments are ever added*, specs §16.10 records binding forward constraints and this
+implementation is consistent with them: card entry must be delegated to a PCI-compliant
+processor's hosted fields / client-side tokenization so only a token ever reaches the
+server (never storing PAN, CVV or track data, even encrypted); `Admin` must **not**
+implicitly grant payment access — a payment feature adds its own policy, re-derived
+server-side from Postgres exactly as `RoleClaimsTransformation` does; no payment
+endpoint may be `[AllowAnonymous]` (the fallback policy already makes authentication the
+default, so an omission fails closed); and a processor's API credentials — a third-party
+secret that cannot use Entra auth — would follow the §13.6 Container Apps **Key Vault
+reference** pattern with `Key Vault Secrets User` on the app's managed identity, *not*
+the custodial-only vault introduced in §16.6.
+
+**Secrets and service-to-service authentication**
+
+- **Application runtime secrets: still zero.** The five `AzureAd__*` settings and the
+  four `VITE_*` build args are public identifiers (URLs, GUIDs, a scope name), so they
+  are plain env vars / build args — never Container Apps secrets, never Key Vault.
+  Neither app registration has a client secret: the SPA is a public client using
+  authorization code + **PKCE**, and the API only *validates* tokens against the
+  tenant's public JWKS.
+- **The new Key Vault is custodial only.** No code in this change reads from it, and no
+  application identity (`todo-api`'s or `todo-web`'s) is granted any role on it. The
+  Google OAuth client secret it holds is consumed by Entra External ID, not by us, and
+  is written by a human whose own Entra identity authenticates to the vault — no vault
+  access key, no SAS token.
+- **`todo-api` → PostgreSQL is unchanged (§14):** one passwordless connection string,
+  one Entra/managed-identity code path, `Ssl Mode=Require`. The `users` table is read
+  and written over that same `NpgsqlDataSource`. No second connection, no second auth
+  path, no password anywhere.
+- No credential-shaped value appears in source, config, workflow files, the Dockerfiles,
+  `.env.example`, `README.dev.md` or this document — placeholders only.
+
+**OWASP posture of this change**
+
+- **Broken access control — the headline fix.** The API was fully anonymous; every
+  endpoint except `/health` now requires a validated token *and*
+  `scp = Todos.ReadWrite`. The `[RequiredScope]` gap on `TodosController` (present in
+  the code found on disk) is closed — that was a genuine hole, since a token minted for
+  this audience without the delegated scope would have reached `/api/todos`. Deny by
+  default is structural: the authorization **fallback policy** authenticates any
+  endpoint that does not explicitly opt out. Authorization data is **never** taken from
+  the client: inbound `role`/`roles`/`ClaimTypes.Role` claims are stripped before the
+  single role claim is written from the database row (verified by the smoke check
+  above). Admin endpoints additionally require the `AdminOnly` policy, re-derived per
+  request, so a demotion takes effect on the caller's **next** request with no
+  re-login. Hiding the admin nav link is UX only — stated in code comments and here.
+- **Identification & authentication failures.** No password handling, hashing, reset or
+  lockout logic lives in this codebase: the hosted Microsoft user flow owns all of it.
+  Token validation is delegated to `Microsoft.Identity.Web`; signature, issuer,
+  audience, lifetime and signing-key validation are all on, `RequireHttpsMetadata` is
+  true, `ClockSkew` is the 5-minute default, and audience validation is what makes the
+  SPA's **ID token** unusable against the API. The tenant (`tid`) is re-checked in the
+  claims transformation as defence in depth. Identity is keyed on `oid` only — never
+  `sub` (pairwise), `email` or `preferred_username` (mutable, re-assignable).
+- **Cryptographic failures / data in transit.** Every hop is TLS: browser→ACA ingress,
+  browser→`ciamlogin.com`, API→JWKS, API→Postgres. `Instance` is rejected at startup if
+  it is not `https://`. The only non-TLS URI in the design is the loopback dev redirect
+  `http://localhost:5173/`.
+- **Security misconfiguration.** Missing or blank auth configuration fails startup
+  loudly rather than silently serving unauthenticated traffic. CORS keeps its exact
+  origin allow-list (no `AllowAnyOrigin`, no `AllowCredentials` — the token is a header,
+  not a cookie). No debug endpoint, no default credential, no verbose error body:
+  401/403/503 bodies are generic `ProblemDetails` that never echo a claim, a token, or
+  which check failed.
+- **Injection.** EF Core parameterized queries only; no raw SQL, no string-built
+  predicates. The single hand-written SQL statement in the design (the one-time admin
+  promotion) is human-run in psql, per spec.
+- **Insecure deserialization / mass assignment.** `PUT /api/users/me` binds a dedicated
+  DTO with exactly two properties (`displayName`, `phoneNumber`); `role`, `email`, `id`
+  and `entraObjectId` have no bindable surface, so sending them changes nothing.
+  `PATCH /api/users/{id}/role` accepts only the exact strings `User`/`Admin`
+  (case-sensitive, matching the DB CHECK constraint) — anything else is a 400.
+- **XSS.** All rendering is React's default text interpolation; no
+  `dangerouslySetInnerHTML` anywhere. Tokens are cached in `sessionStorage` rather than
+  `localStorage` to shrink the blast radius of any future XSS (they die with the tab).
+- **Security logging and monitoring.** Provisioning (`oid` only), role changes (actor
+  `oid`, target id, old/new role) and refused authenticated callers (method + path only)
+  are logged. **No token, `Authorization` header, email, phone or display name is ever
+  logged**, and the `users` PII is deliberately kept out of telemetry dimensions.
+- **Availability / fail-closed.** If Postgres is unreachable the role cannot be
+  determined, so the request is refused with **503** — never "assume `User`", and
+  categorically never "assume `Admin`". `/health` is unaffected, so Container Apps does
+  not restart-loop.
+- **Risks I could not close from application code:** everything inside the external
+  tenant (admin consent, the user flow, the Google IdP, optional claims) and the Key
+  Vault role assignment are human/portal steps (§16.11 / §16.13); until they are done
+  the app is fail-closed but non-functional. Deploy ordering is also a real, accepted
+  risk: the moment the new backend is live the old frontend image gets 401 on every
+  call, so backend and frontend must be rolled together with both revision names
+  captured for rollback (§16.16).
+- **Dependency versions added this cycle:** `Microsoft.Identity.Web` **4.14.2**
+  (backend); `@azure/msal-browser` **4.30.0**, `@azure/msal-react` **3.0.29**,
+  `react-router-dom` **7.18.2** (frontend). `npm audit --omit=dev` reports **0
+  vulnerabilities**, and I am aware of no CVE affecting these versions. Pre-existing
+  package versions are unchanged.

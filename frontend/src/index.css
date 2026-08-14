@@ -185,3 +185,86 @@ body {
   gap: 0.5rem;
   width: 100%;
 }
+
+/* ---- Auth shell, login screen and admin view (specs §16.9) ---- */
+
+.shell__nav {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.shell__nav a {
+  color: var(--primary);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.shell__nav a:hover {
+  text-decoration: underline;
+}
+
+.shell__spacer {
+  flex: 1;
+}
+
+.shell__user {
+  color: var(--muted);
+  font-size: 0.9rem;
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.login__lead {
+  color: var(--muted);
+  margin: 0 0 1.5rem;
+}
+
+.login__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-width: 20rem;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.panel--warning {
+  background: #fffbeb;
+  border-color: #fde68a;
+}
+
+.panel h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+}
+
+.admin__table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.admin__table th,
+.admin__table td {
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.9rem;
+}
+
+.admin__table tbody tr:last-child td {
+  border-bottom: none;
+}

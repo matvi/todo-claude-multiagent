@@ -1,4 +1,9 @@
-# CD — deploy to Azure Container Apps on merge to `main` (specs §11.5).
+# CD — deploy to Azure Container Apps on a MERGED PR into `main` (specs §11.5).
+#
+# The trigger is `pull_request: [closed]` + `if: merged == true`, NOT `push: main`.
+# The human reviewing and merging the PR is this pipeline's approval gate, so the
+# deploy is bound to that exact event. A direct push to `main` (only possible if
+# branch protection is off) deliberately deploys NOTHING.
 # Auth: OIDC / workload identity federation via azure/login@v2 — NO stored
 # client secret. Uses GitHub *variables* AZURE_CLIENT_ID / AZURE_TENANT_ID /
 # AZURE_SUBSCRIPTION_ID (no credential material).
@@ -17,9 +22,9 @@
 name: CD
 
 on:
-  push:
+  pull_request:
+    types: [closed]
     branches: [main]
-  workflow_dispatch: {}
 
 # One deploy at a time; never let overlapping merges race a Container App revision.
 concurrency:
@@ -32,16 +37,63 @@ permissions:
 
 env:
   RESOURCE_GROUP: rg-todo-demo
+  # Image tag = the merge commit on `main`. On a `pull_request` event `github.sha`
+  # is the ephemeral test-merge commit, which is NOT what landed on main.
+  IMAGE_TAG: ${{ github.event.pull_request.merge_commit_sha }}
+  # The delegated scope name exposed by the todo-api app registration. Must match
+  # `apiScopeName` in infra/main.parameters.json and the AzureAd__Scopes env var on
+  # todo-api (specs §16.12 items 2/4). Overridable via a repo variable.
+  API_SCOPE_NAME: ${{ vars.ENTRA_API_SCOPE_NAME || 'Todos.ReadWrite' }}
 
 jobs:
   deploy:
     name: Build & deploy images to Azure Container Apps
     runs-on: ubuntu-latest
+    # Closing a PR without merging must never deploy.
+    if: github.event.pull_request.merged == true
     # A GitHub Environment lets deployments show in history and lets a
     # required-reviewer rule be added later without editing this workflow.
     environment: production
     steps:
+      # Check out the actual merge commit on `main`, not the (now stale)
+      # refs/pull/N/merge ref that a closed pull_request event defaults to.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      # ------------------------------------------------------------------
+      # Preflight — fail BEFORE touching Azure if the identity plumbing is
+      # incomplete. Both checks below guard failure modes the engineer and the
+      # early infra pass flagged explicitly:
+      #  * missing repo variables  -> the SPA bundle is built with blank
+      #    VITE_ENTRA_* values and renders "sign-in is not configured"
+      #    (changes.md deviation 3 / item 6);
+      #  * missing AzureAd__* env vars on todo-api -> the new backend revision
+      #    fails startup validation (§16.7.1) and never goes healthy.
+      # Neither is something CD may fix by itself: the values come from the
+      # human-run §16.11 tenant bootstrap, and applying them is the documented
+      # imperative step in .pipeline/infra.md ("Path B"). CD only refuses to
+      # ship a broken deploy.
+      # ------------------------------------------------------------------
+      - name: Preflight — required Entra repository variables are set
+        env:
+          ENTRA_TENANT_SUBDOMAIN: ${{ vars.ENTRA_TENANT_SUBDOMAIN }}
+          ENTRA_TENANT_ID: ${{ vars.ENTRA_TENANT_ID }}
+          ENTRA_SPA_CLIENT_ID: ${{ vars.ENTRA_SPA_CLIENT_ID }}
+          ENTRA_API_CLIENT_ID: ${{ vars.ENTRA_API_CLIENT_ID }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for v in ENTRA_TENANT_SUBDOMAIN ENTRA_TENANT_ID ENTRA_SPA_CLIENT_ID ENTRA_API_CLIENT_ID; do
+            [ -n "${!v:-}" ] || missing+=("$v")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing GitHub repository variable(s): ${missing[*]}."\
+                 "These are PUBLIC identifiers from the §16.11 tenant bootstrap — set them with"\
+                 "\`gh variable set <NAME> --body <value>\` (repository VARIABLES, not secrets)."\
+                 "Without them the deployed SPA renders 'sign-in is not configured'." >&2
+            exit 1
+          fi
 
       - name: Azure login (OIDC, no secret)
         uses: azure/login@v2
@@ -49,6 +101,32 @@ jobs:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # ------------------------------------------------------------------
+      # Preflight 2 — the five AzureAd__* env vars must ALREADY be on todo-api.
+      # CD does not apply Bicep and deliberately does not set them itself: they
+      # come from the human-run imperative step (.pipeline/infra.md "Path B" /
+      # specs §16.12 item 6). Read-only check; it changes nothing.
+      # ------------------------------------------------------------------
+      - name: Preflight — todo-api already carries the five AzureAd__* env vars
+        run: |
+          set -euo pipefail
+          ENV_JSON=$(az containerapp show -n todo-api -g "$RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env" -o json)
+          missing=()
+          for k in AzureAd__Instance AzureAd__TenantId AzureAd__ClientId AzureAd__Audience AzureAd__Scopes; do
+            val=$(echo "$ENV_JSON" | jq -r --arg k "$k" '.[] | select(.name==$k) | .value // ""')
+            [ -n "$val" ] || missing+=("$k")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::todo-api is missing/blank env var(s): ${missing[*]}."\
+                 "The backend fails fast at startup without all five (specs §16.7.1), so deploying"\
+                 "now would roll a revision that never becomes healthy. A human must run the"\
+                 "\`az containerapp update --set-env-vars AzureAd__*\` step in .pipeline/infra.md"\
+                 "(Path B) BEFORE or WITH this deploy." >&2
+            exit 1
+          fi
+          echo "All five AzureAd__* env vars present."
 
       # ------------------------------------------------------------------
       # 0. Look up the already-provisioned ACR (infra is deployed manually,
@@ -96,22 +174,38 @@ jobs:
       #      az acr build --registry <name> --image todo-api:<tag> \
       #        --file backend/src/TodoApi/Dockerfile ./backend
       # ------------------------------------------------------------------
+      # Record the currently-active revisions BEFORE anything rolls, so the
+      # rollback target is in the run log even if the deploy goes wrong. Both
+      # apps must roll back together (specs §16.16): the moment the auth-aware
+      # backend is live, an older frontend image 401s on every call.
+      - name: Capture rollback targets (read-only)
+        id: rollback
+        run: |
+          set -euo pipefail
+          API_REV=$(az containerapp revision list -n todo-api -g "$RESOURCE_GROUP" \
+            --query "[?properties.active]|[0].name" -o tsv)
+          WEB_REV=$(az containerapp revision list -n todo-web -g "$RESOURCE_GROUP" \
+            --query "[?properties.active]|[0].name" -o tsv)
+          echo "api_rev=$API_REV" >> "$GITHUB_OUTPUT"
+          echo "web_rev=$WEB_REV" >> "$GITHUB_OUTPUT"
+          echo "rollback targets: todo-api=$API_REV todo-web=$WEB_REV"
+
       - name: Build & push backend image (todo-api)
         run: |
           set -euo pipefail
           az acr login --name "${{ steps.infra.outputs.acr_name }}"
           docker build \
             -f backend/src/TodoApi/Dockerfile \
-            -t "${{ steps.infra.outputs.acr_login_server }}/todo-api:${{ github.sha }}" \
+            -t "${{ steps.infra.outputs.acr_login_server }}/todo-api:${{ env.IMAGE_TAG }}" \
             ./backend
-          docker push "${{ steps.infra.outputs.acr_login_server }}/todo-api:${{ github.sha }}"
+          docker push "${{ steps.infra.outputs.acr_login_server }}/todo-api:${{ env.IMAGE_TAG }}"
 
       - name: Update backend Container App
         id: api
         run: |
           set -euo pipefail
           az containerapp update -n todo-api -g "$RESOURCE_GROUP" \
-            --image "${{ steps.infra.outputs.acr_login_server }}/todo-api:${{ github.sha }}"
+            --image "${{ steps.infra.outputs.acr_login_server }}/todo-api:${{ env.IMAGE_TAG }}"
           FQDN=$(az containerapp show -n todo-api -g "$RESOURCE_GROUP" \
             --query "properties.configuration.ingress.fqdn" -o tsv)
           echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
@@ -122,24 +216,43 @@ jobs:
       #    Same `docker build`/`docker push` workaround as the backend step
       #    above (ACR Tasks / `az acr build` is disallowed on this
       #    subscription) — revert to `az acr build` once upgraded.
+      #
+      #    The four VITE_ENTRA_* / VITE_API_SCOPE values (specs §16.12 item 4)
+      #    come from GitHub repository VARIABLES, not secrets: a tenant
+      #    subdomain, a tenant GUID, a public-client id and a scope string are
+      #    public identifiers that ship in the SPA bundle by necessity. The SPA
+      #    is a public client using PKCE and has no client secret at all.
+      #    VITE_API_SCOPE is composed from ENTRA_API_CLIENT_ID + the scope name,
+      #    exactly as specs §16.12 item 4 prescribes.
       # ------------------------------------------------------------------
-      - name: Build & push frontend image (todo-web) with backend FQDN baked
+      - name: Build & push frontend image (todo-web) with backend FQDN + identity baked
+        env:
+          ENTRA_TENANT_SUBDOMAIN: ${{ vars.ENTRA_TENANT_SUBDOMAIN }}
+          ENTRA_TENANT_ID: ${{ vars.ENTRA_TENANT_ID }}
+          ENTRA_SPA_CLIENT_ID: ${{ vars.ENTRA_SPA_CLIENT_ID }}
+          ENTRA_API_CLIENT_ID: ${{ vars.ENTRA_API_CLIENT_ID }}
         run: |
           set -euo pipefail
+          API_SCOPE="api://${ENTRA_API_CLIENT_ID}/${API_SCOPE_NAME}"
+          echo "Baking VITE_API_SCOPE=$API_SCOPE"
           az acr login --name "${{ steps.infra.outputs.acr_name }}"
           docker build \
             -f frontend/Dockerfile \
             --build-arg VITE_API_BASE_URL="https://${{ steps.api.outputs.fqdn }}" \
-            -t "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}" \
+            --build-arg VITE_ENTRA_TENANT_SUBDOMAIN="$ENTRA_TENANT_SUBDOMAIN" \
+            --build-arg VITE_ENTRA_TENANT_ID="$ENTRA_TENANT_ID" \
+            --build-arg VITE_ENTRA_SPA_CLIENT_ID="$ENTRA_SPA_CLIENT_ID" \
+            --build-arg VITE_API_SCOPE="$API_SCOPE" \
+            -t "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ env.IMAGE_TAG }}" \
             ./frontend
-          docker push "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}"
+          docker push "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ env.IMAGE_TAG }}"
 
       - name: Update frontend Container App
         id: web
         run: |
           set -euo pipefail
           az containerapp update -n todo-web -g "$RESOURCE_GROUP" \
-            --image "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ github.sha }}"
+            --image "${{ steps.infra.outputs.acr_login_server }}/todo-web:${{ env.IMAGE_TAG }}"
           FQDN=$(az containerapp show -n todo-web -g "$RESOURCE_GROUP" \
             --query "properties.configuration.ingress.fqdn" -o tsv)
           echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
@@ -158,5 +271,17 @@ jobs:
             echo "## Deploy complete"
             echo "- Backend  (todo-api): https://${{ steps.api.outputs.fqdn }}"
             echo "- Frontend (todo-web): https://${{ steps.web.outputs.fqdn }}"
-            echo "- Image tag: \`${{ github.sha }}\`"
+            echo "- Image tag (merge commit): \`${{ env.IMAGE_TAG }}\`"
+            echo "- Merged PR: #${{ github.event.pull_request.number }}"
+            echo ""
+            echo "### Rollback (both apps together — specs §16.16)"
+            echo '```bash'
+            echo "az containerapp revision activate -g $RESOURCE_GROUP -n todo-api --revision ${{ steps.rollback.outputs.api_rev }}"
+            echo "az containerapp revision activate -g $RESOURCE_GROUP -n todo-web --revision ${{ steps.rollback.outputs.web_rev }}"
+            echo '```'
+            echo ""
+            echo "### Human check after the first auth deploy"
+            echo "The SPA redirect URI \`https://${{ steps.web.outputs.fqdn }}\` must be registered on the"
+            echo "\`todo-web-spa\` app registration in the external tenant (specs §16.11) — sign-in fails with"
+            echo "AADSTS50011 until it is. Nothing in CD can do this."
           } >> "$GITHUB_STEP_SUMMARY"

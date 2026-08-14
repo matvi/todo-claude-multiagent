@@ -7,11 +7,12 @@
 //   Postgres Standard_B1ms | ACA Consumption | ACR Basic
 //   todo-web min1/max2 | todo-api min0/max3
 //
-// Provisions exactly the 8 approved resources:
+// Provisions exactly the 9 approved resources:
 //   1. ACR (Basic)                     5. todo-api Container App (backend)
 //   2. Log Analytics workspace (30d)   6. todo-web Container App (frontend)
 //   3. ACA managed environment         7. Postgres Flexible Server (B1ms)
 //   4. tododb database                 8. + AllowAzureServices firewall rule
+//   9. Key Vault (Standard, RBAC) — custodial only, §16.6
 // (the RG itself is #0, created manually.)
 //
 // NOTE: the AcrPull role assignment for each Container App's managed identity
@@ -49,6 +50,10 @@ param appInsightsName string = 'appi-${namePrefix}'
 @description('Container Apps managed environment name.')
 param acaEnvironmentName string = 'cae-${namePrefix}'
 
+@description('Key Vault name — globally unique, max 24 chars. "kv-todo-" (8) + 12 chars of uniqueSuffix = 20.')
+@maxLength(24)
+param keyVaultName string = toLower('kv-todo-${take(uniqueSuffix, 12)}')
+
 @description('PostgreSQL administrator login.')
 param postgresAdminUser string = 'todoadmin'
 
@@ -76,6 +81,32 @@ param postgresEntraAdminTenantId string
 
 @description('Logical database name.')
 param databaseName string = 'tododb'
+
+// --- Microsoft Entra External ID (end-user auth, §16) -----------------------
+// ALL FOUR ARE NON-SECRET PUBLIC IDENTIFIERS, deliberately NOT @secure():
+// a tenant ID, a tenant subdomain, an app-registration client ID and a scope
+// name are identifiers, not credentials. They are shipped in the SPA bundle by
+// necessity and are plain env vars on the API — never a Container Apps secret,
+// never Key Vault (§16.6 (3)). `todo-api` still holds ZERO secrets.
+//
+// ⚠️ EMPTY DEFAULTS ARE INTENTIONAL BUT DANGEROUS TO DEPLOY (approved choice,
+// user 2026-08-12). Their real values do not exist until a human completes the
+// §16.11 portal bootstrap (external tenant + the two app registrations), which
+// cannot be automated. DO NOT apply this template with them blank against the
+// live app: `todo-api` fails fast at startup when any AzureAd__* is missing
+// (§16.7.1), so a blank apply produces a revision that never goes healthy.
+// Fill main.parameters.json in first. See infra/README.md Phase 5.
+@description('External ID tenant subdomain, e.g. "contosotodo" from contosotodo.ciamlogin.com. NON-SECRET. Blank until the §16.11 human bootstrap runs.')
+param externalTenantSubdomain string = ''
+
+@description('External ID tenant GUID. NON-SECRET. Blank until the §16.11 human bootstrap runs.')
+param externalTenantId string = ''
+
+@description('Client ID (GUID) of the `todo-api-app` app registration in the external tenant. NON-SECRET. Blank until the §16.11 human bootstrap runs.')
+param apiClientId string = ''
+
+@description('Name of the scope exposed by `todo-api-app` (specs §16.5.2 fixes this at "Todos.ReadWrite"). NON-SECRET. Supplied via main.parameters.json.')
+param apiScopeName string = ''
 
 @description('Backend image. Public placeholder for the first (bootstrap) deploy; CD overrides with the real ACR image tag.')
 param todoApiImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
@@ -135,6 +166,25 @@ module appinsights 'modules/appinsights.bicep' = {
   }
 }
 
+// --- 9. Key Vault (Standard, RBAC auth) — CUSTODIAL ONLY (§16.6) -----------
+//        NEW this cycle. Holds exactly one secret: the Google OAuth client
+//        secret, written ONCE BY A HUMAN (`az keyvault secret set`) and read by
+//        Microsoft Entra External ID at IdP-configuration time. NO application
+//        identity gets a role on it — not todo-api's, not todo-web's — and no
+//        secret VALUE and no role assignment appear anywhere in this IaC.
+//        The human operator grants themself `Key Vault Secrets Officer`
+//        out-of-band (infra/README.md Phase 5), same convention as AcrPull.
+module keyVault 'modules/keyvault.bicep' = {
+  name: 'keyVault'
+  params: {
+    name: keyVaultName
+    location: location
+    sku: 'standard'
+    softDeleteRetentionInDays: 7
+    enablePurgeProtection: false
+  }
+}
+
 // --- 3. Container Apps managed environment (Consumption) --------------------
 module acaEnv 'modules/acaEnvironment.bicep' = {
   name: 'acaEnvironment'
@@ -182,6 +232,15 @@ var todoDbConnectionString = 'Host=${postgres.outputs.fqdn};Port=5432;Database=$
 // it doesn't exist yet, and the revision hangs until "Operation expired".
 var todoWebUsesAcr = startsWith(todoWebImage, registry.outputs.loginServer)
 var todoApiUsesAcr = startsWith(todoApiImage, registry.outputs.loginServer)
+
+// --- Entra External ID values derived for todo-api (§16.7.1) ----------------
+// Composed rather than passed whole so the authority/audience FORMAT lives in
+// one reviewable place instead of being retyped into a params file. The
+// `empty(...)` guards keep a blank input blank: composing unconditionally would
+// turn an unset subdomain into the plausible-looking but broken
+// "https://.ciamlogin.com/", hiding a misconfiguration behind a well-formed URL.
+var azureAdInstance = empty(externalTenantSubdomain) ? '' : 'https://${externalTenantSubdomain}.ciamlogin.com/'
+var azureAdAudience = empty(apiClientId) ? '' : 'api://${apiClientId}'
 
 // --- 6. Frontend Container App (todo-web) — deployed first so its FQDN is ---
 //        known when the backend's CORS allow-list is set below.
@@ -241,6 +300,31 @@ module todoApi 'modules/containerApp.bicep' = {
         name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
         value: appinsights.outputs.connectionString
       }
+      // --- Entra External ID token validation (§16.7.1) — NEW this cycle ---
+      // Five PLAIN, NON-SECRET env vars. Public identifiers only: no client
+      // secret exists for either app registration (the SPA is a public client
+      // using PKCE; the API only validates tokens). The zero-Container-Apps-
+      // secrets invariant (§13.3) is preserved exactly.
+      {
+        name: 'AzureAd__Instance'
+        value: azureAdInstance
+      }
+      {
+        name: 'AzureAd__TenantId'
+        value: externalTenantId
+      }
+      {
+        name: 'AzureAd__ClientId'
+        value: apiClientId
+      }
+      {
+        name: 'AzureAd__Audience'
+        value: azureAdAudience
+      }
+      {
+        name: 'AzureAd__Scopes'
+        value: apiScopeName
+      }
     ]
   }
 }
@@ -260,3 +344,10 @@ output postgresServerName string = postgres.outputs.serverName
 // Publisher" role grant (needs the component's resource id as the scope).
 output appInsightsName string = appinsights.outputs.name
 output appInsightsId string = appinsights.outputs.id
+// Key Vault identifiers — needed by the human who (a) grants themself
+// `Key Vault Secrets Officer` on this scope and (b) runs `az keyvault secret
+// set --vault-name <name> --name google-oauth-client-secret`. Neither action is
+// ever performed by an agent or by CI/CD. No secret value is ever an output.
+output keyVaultName string = keyVault.outputs.name
+output keyVaultId string = keyVault.outputs.id
+output keyVaultUri string = keyVault.outputs.vaultUri

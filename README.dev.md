@@ -57,12 +57,24 @@ scripts/
 
 2. **Backend** — from `backend/src/TodoApi`:
    ```bash
+   # Entra External ID identifiers (specs §16.7.1). All five are PUBLIC identifiers,
+   # not secrets. The API refuses to start if any is missing or blank — an API that
+   # boots without auth configuration serves unauthenticated traffic.
+   export AzureAd__Instance=https://<tenant-subdomain>.ciamlogin.com/
+   export AzureAd__TenantId=<external-tenant-guid>
+   export AzureAd__ClientId=<todo-api-app-client-id>
+   export AzureAd__Audience=api://<todo-api-app-client-id>
+   export AzureAd__Scopes=Todos.ReadWrite
    dotnet run
    ```
+   - Values come from the human-run tenant bootstrap (`infra/README.md`, specs §16.11).
+     Use `dotnet user-secrets` instead of `export` if you prefer; **never** commit them
+     into `appsettings*.json`.
    - Migrations are applied automatically at startup. To apply manually instead:
      `dotnet ef database update`.
    - API: <http://localhost:8080>  •  Swagger: <http://localhost:8080/swagger>
-   - Health: <http://localhost:8080/health> → `{"status":"ok"}`
+   - Health: <http://localhost:8080/health> → `{"status":"ok"}` (anonymous; every other
+     endpoint needs `Authorization: Bearer <access token>`).
    - Dev connection string + CORS (`http://localhost:5173`) come from
      `appsettings.Development.json`.
 
@@ -71,20 +83,29 @@ scripts/
    npm install
    npm run dev
    ```
-   SPA: <http://localhost:5173> (reads `VITE_API_BASE_URL` from `.env.development`).
+   SPA: <http://localhost:5173> (reads `VITE_API_BASE_URL` and the four
+   `VITE_ENTRA_*` / `VITE_API_SCOPE` values from `.env.development` — fill those in
+   with the same tenant identifiers as above; `http://localhost:5173/` must be
+   registered as a redirect URI on the `todo-web-spa` app registration). With them
+   blank the SPA renders "sign-in is not configured" instead of a broken app.
 
 ## API surface
 
-Base path `/api/todos`, JSON camelCase.
+JSON camelCase. Everything except `/health` requires a valid Entra External ID access
+token whose `scp` contains `Todos.ReadWrite` (specs §16.8).
 
-| Method | Path              | Success | Notes                          |
-|--------|-------------------|---------|--------------------------------|
-| GET    | `/api/todos`      | 200     | `TodoResponse[]`, newest first |
-| GET    | `/api/todos/{id}` | 200     | 404 if not found               |
-| POST   | `/api/todos`      | 201     | `Location` header; 400 on validation |
-| PUT    | `/api/todos/{id}` | 200     | 404 / 400                      |
-| DELETE | `/api/todos/{id}` | 204     | 404 if not found               |
-| GET    | `/health`         | 200     | probe                          |
+| Method | Path                     | Auth        | Success | Notes                          |
+|--------|--------------------------|-------------|---------|--------------------------------|
+| GET    | `/api/todos`             | user        | 200     | `TodoResponse[]`, newest first |
+| GET    | `/api/todos/{id}`        | user        | 200     | 404 if not found               |
+| POST   | `/api/todos`             | user        | 201     | `Location` header; 400 on validation |
+| PUT    | `/api/todos/{id}`        | user        | 200     | 404 / 400                      |
+| DELETE | `/api/todos/{id}`        | user        | 204     | 404 if not found               |
+| GET    | `/api/users/me`          | user        | 200     | caller's profile + role        |
+| PUT    | `/api/users/me`          | user        | 200     | `displayName` / `phoneNumber` only |
+| GET    | `/api/users`             | **Admin**   | 200     | 403 for a `User`               |
+| PATCH  | `/api/users/{id}/role`   | **Admin**   | 200     | 400 / 404 / 409 guards         |
+| GET    | `/health`                | anonymous   | 200     | probe                          |
 
 ## Build the container images
 
@@ -92,9 +113,14 @@ Base path `/api/todos`, JSON camelCase.
 # Backend (build context = backend/)
 docker build -f backend/src/TodoApi/Dockerfile -t todo-api ./backend
 
-# Frontend (bake the API URL at build time)
+# Frontend (bake the API URL and the identity identifiers at build time)
 docker build -f frontend/Dockerfile \
-  --build-arg VITE_API_BASE_URL=http://localhost:8080 -t todo-web ./frontend
+  --build-arg VITE_API_BASE_URL=http://localhost:8080 \
+  --build-arg VITE_ENTRA_TENANT_SUBDOMAIN=<tenant-subdomain> \
+  --build-arg VITE_ENTRA_TENANT_ID=<external-tenant-guid> \
+  --build-arg VITE_ENTRA_SPA_CLIENT_ID=<spa-client-id> \
+  --build-arg VITE_API_SCOPE=api://<api-client-id>/Todos.ReadWrite \
+  -t todo-web ./frontend
 ```
 
 Both containers listen on port 8080.

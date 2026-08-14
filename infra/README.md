@@ -20,6 +20,25 @@ Postgres **Standard_B1ms** · ACA **Consumption** · ACR **Basic** ·
 | `modules/acaEnvironment.bicep` | Container Apps managed environment (Consumption). |
 | `modules/postgres.bicep` | Postgres Flexible Server (Burstable B1ms, PG16, 32 GiB, no HA, LRS backup) + `tododb` database + "allow Azure services" firewall rule + **dual-auth (`activeDirectoryAuth` + `passwordAuth`) and the Entra `administrators` child resource**. |
 | `modules/containerApp.bicep` | Reusable single Container App (system-assigned identity, ingress, secrets, scale). Used for `todo-api` and `todo-web`. |
+| `modules/keyvault.bicep` | **Key Vault** (Standard, `enableRbacAuthorization: true`, soft-delete 7d, purge protection **off**, public network). **Custodial only** — see the rule below. No secret values, no role assignments, no access policies in Bicep. |
+
+## Key Vault: the custodial-secret rule (specs §16.6)
+
+The vault exists for **one** value: the **Google OAuth client secret**, which is
+issued by Google — a third party with no Entra relationship — and therefore
+cannot be replaced by a managed identity. That is the one §13.6 fallback case.
+
+**Who reads it: Microsoft Entra External ID, once, at IdP-configuration time, and
+the human who pastes it in. No application of ours, ever.**
+
+> **NEITHER `todo-api`'s NOR `todo-web`'s managed identity is granted any role on
+> this vault, and none ever should be.** The original request asked for "the API's
+> managed identity gets read permission". The API has no use for a Google
+> credential, and granting it would create an exfiltration path for zero benefit.
+> This is a deliberate, documented deviation from the literal request.
+
+Consequently the app's **zero-runtime-secrets** posture is unchanged: `todo-api`
+still has **no Container Apps secrets** and reads **nothing** from Key Vault.
 
 ## Image / ordering model
 
@@ -293,6 +312,103 @@ Because `DisableLocalAuth: true` is set on the component, this grant is what let
 `todo-api` publish telemetry at all — without it, ingestion is rejected (403) and
 traces silently never land (the app itself keeps running).
 
+### Phase 5 — Entra External ID + Key Vault (this cycle, `pipeline/entra-external-id-auth`)
+
+> **Run once, by a human. No agent runs any command here.** Approved decisions
+> (user, 2026-08-12): **Key Vault Standard**; **External ID tenant
+> subscription-linked, Core tier, United States**; the `AzureAd__*` Bicep params
+> get **empty-string defaults**.
+>
+> Almost all of this feature is *unavoidably* human work (specs §16.13): the
+> External ID tenant, both app registrations, the user flow, the custom
+> `phoneNumber` attribute, the Google IdP, optional claims, admin consent, the
+> Google Cloud OAuth client, every RBAC role assignment and every secret value.
+> **Bicep's entire share of this feature is one Key Vault and five plain env
+> vars.** Do not ask an agent to do the rest — it cannot.
+
+**(0) Register the Key Vault resource provider — verified NOT registered on this
+subscription (2026-08-12).** Provider registration is a **subscription-scope**
+operation, so the RG-scoped CD service principal (Contributor on `rg-todo-demo`
+only) **cannot** do it. A subscription Owner runs it once, or the very first
+deploy that touches Key Vault fails with `MissingSubscriptionRegistration`:
+
+```bash
+az provider register -n Microsoft.KeyVault
+az provider show -n Microsoft.KeyVault --query registrationState -o tsv   # wait for "Registered"
+```
+
+**(A) Bootstrap the external tenant (Portal — specs §16.11 steps 1–5, 7–9, 11–12).**
+Create the subscription-linked External ID tenant (**Core**, **United States**,
+subscription `9ba6633f-058c-4269-8b0f-086ab331ef26`, RG `rg-todo-demo`), then the
+`todo-api-app` and `todo-web-spa` app registrations, the `SignUpSignIn` user flow,
+the `phoneNumber` custom attribute, the Google IdP, optional claims and admin
+consent. **Country/region is immutable after creation — pick US deliberately.**
+
+Record these three values; the rest of Phase 5 needs them:
+
+```bash
+EXT_SUBDOMAIN="<tenant-subdomain>"    # from <subdomain>.ciamlogin.com
+EXT_TENANT_ID="<external-tenant-guid>"
+API_CLIENT_ID="<todo-api-app client id>"
+```
+
+**(B) Custody the Google client secret (after the vault exists).** The vault is
+created by the Bicep in this cycle; the secret **value** is written only by a
+human, never by an agent and never by CI/CD:
+
+```bash
+KV_NAME=$(az deployment group show -g rg-todo-demo -n main \
+  --query properties.outputs.keyVaultName.value -o tsv)
+
+# Grant YOURSELF (a human) data-plane access. Agents never create role
+# assignments (§11.6); needs User Access Administrator/Owner.
+ME=$(az ad signed-in-user show --query id -o tsv)
+KV_ID=$(az keyvault show -n "$KV_NAME" -g rg-todo-demo --query id -o tsv)
+az role assignment create --assignee "$ME" \
+  --role "Key Vault Secrets Officer" --scope "$KV_ID"
+
+# Write the value Google issued. NEVER commit it, never paste it into IaC.
+az keyvault secret set --vault-name "$KV_NAME" \
+  --name google-oauth-client-secret --value "<paste from Google Cloud console>"
+```
+
+**Do NOT** grant `todo-api` or `todo-web` any role on this vault (see the
+custodial-secret rule above).
+
+**(C) Get the five `AzureAd__*` env vars onto the running `todo-api`.**
+
+> **CD does not apply Bicep** (see "Image / ordering model"). Editing
+> `main.bicep` therefore changes **nothing** on the running app by itself. The env
+> vars must be applied **before or with** the image that needs them: `todo-api`
+> validates all five at startup and fails fast (§16.7.1), so a mis-ordered deploy
+> produces a revision that never becomes healthy.
+
+Preferred for a live app — imperative, surgical, instantly reversible:
+
+```bash
+RG=rg-todo-demo; APP=todo-api
+# Capture the rollback target BEFORE changing anything.
+PREV_REV=$(az containerapp revision list -g $RG -n $APP \
+  --query "[?properties.active]|[0].name" -o tsv); echo "rollback target: $PREV_REV"
+
+az containerapp update -g $RG -n $APP --set-env-vars \
+  "AzureAd__Instance=https://${EXT_SUBDOMAIN}.ciamlogin.com/" \
+  "AzureAd__TenantId=${EXT_TENANT_ID}" \
+  "AzureAd__ClientId=${API_CLIENT_ID}" \
+  "AzureAd__Audience=api://${API_CLIENT_ID}" \
+  "AzureAd__Scopes=Todos.ReadWrite"
+
+# Roll back if the new revision misbehaves:
+az containerapp revision activate -g $RG -n $APP --revision "$PREV_REV"
+```
+
+**(D) Keep the Bicep and reality in sync.** Fill the three blank values into
+`infra/main.parameters.json` (`externalTenantSubdomain`, `externalTenantId`,
+`apiClientId`) so the next full apply does not wipe what step C set. **Applying
+the template while they are blank sets all five env vars to empty strings and
+breaks `todo-api` startup** — the empty defaults exist so the file is authorable
+before the tenant exists, not because a blank deploy is safe.
+
 ### Branch protection on `main` (repo-admin action — human)
 
 Settings → Branches → add a rule for `main`:
@@ -316,13 +432,39 @@ convention, not enforced by GitHub.
 > B and C BEFORE the first full apply — see the **CUTOVER SEQUENCING** callout in
 > Phase 4. Steady-state (once bootstrapped) this caveat no longer applies.
 
+> ## ⚠️ A PLAIN FULL APPLY WILL ROLL BOTH APPS BACK TO THE PLACEHOLDER IMAGE
+> Confirmed by `what-if` on 2026-08-12 against the live RG. `todoApiImage` /
+> `todoWebImage` default to `mcr.microsoft.com/k8se/quickstart:latest` and are
+> **not** pinned in `main.parameters.json` (by design — CD sets the real tags
+> imperatively and never applies Bicep). So an unqualified apply reports:
+>
+> ```
+> ~ image: acrtododemo…azurecr.io/todo-api:<sha> => mcr.microsoft.com/k8se/quickstart:latest
+> ~ image: acrtododemo…azurecr.io/todo-web:<sha> => mcr.microsoft.com/k8se/quickstart:latest
+> ```
+>
+> i.e. **it takes the real application down and replaces it with the Azure
+> quickstart page**, and also drops the ACR `registries` block (the
+> `todoApiUsesAcr`/`todoWebUsesAcr` guards go false for a non-ACR image). Always
+> pin the currently-running tags, and always run `what-if` first and read the
+> `image:` lines before applying:
+>
+> ```bash
+> CUR_API=$(az containerapp show -g rg-todo-demo -n todo-api \
+>   --query "properties.template.containers[0].image" -o tsv)
+> CUR_WEB=$(az containerapp show -g rg-todo-demo -n todo-web \
+>   --query "properties.template.containers[0].image" -o tsv)
+> # ...then add:  --parameters todoApiImage="$CUR_API" todoWebImage="$CUR_WEB"
+> ```
+
 ```bash
 read -rs PGPWD; export PGPWD
 az deployment group create \
   --resource-group rg-todo-demo \
   --template-file infra/main.bicep \
   --parameters infra/main.parameters.json \
-  --parameters postgresAdminPassword="$PGPWD"
+  --parameters postgresAdminPassword="$PGPWD" \
+  --parameters todoApiImage="$CUR_API" todoWebImage="$CUR_WEB"
 
 # Dry-run alternatives (no changes applied):
 az deployment group validate --resource-group rg-todo-demo \
